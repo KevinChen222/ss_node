@@ -4,8 +4,8 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.1"
-export DEFAULT_SNI="apple.com"
+export SCRIPT_VERSION="20-kevin.4"
+export DEFAULT_SNI="www.icloud.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -14,8 +14,8 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本从用户自己的仓库更新；可选中转组件固定到已审计的上游提交。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/d450bb83e09f32333848ee2f2694cc98097000bb"
-ADVANCED_RELAY_SHA256="1f04f65db783fecd24a5f5acf8907a5e185e97314771d9a5d9c3381729894d5b"
-PARSER_SHA256="308c90a7a8d494e9fb6f1e6acc9b7f655faaefd34faa27be1775700cdae2b3e9"
+ADVANCED_RELAY_SHA256="d1ed761dc586a5354ce428e53cc01ea9bdebdb018ae305de3081cef1df6ea48f"
+PARSER_SHA256="ef2e78d59314c3a1a9a2ed8f1835cdd1aa5f66845f573729887af92a15f95698"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -133,15 +133,21 @@ _get_ip() { _get_public_ip; } # 别名兼容
 
 # Reality SNI 只在当前脚本进程中扫描一次，避免批量创建时重复联网探测。
 REALITY_SNI_SCAN_DONE=false
-REALITY_SNI_SCANNED=""
+REALITY_SNI_DOMAINS=()
+REALITY_SNI_LATENCIES=()
 SELECTED_REALITY_SNI="$DEFAULT_SNI"
 
 _scan_reality_sni_once() {
-    [ "$REALITY_SNI_SCAN_DONE" = "true" ] && return 0
+    if [ "$REALITY_SNI_SCAN_DONE" = "true" ]; then
+        [ "${#REALITY_SNI_DOMAINS[@]}" -gt 0 ]
+        return
+    fi
     REALITY_SNI_SCAN_DONE=true
 
-    local candidate
+    local candidate start_ms end_ms latency_ms
+    local results=""
     local candidates=(
+        "www.icloud.com"
         "www.microsoft.com"
         "www.amazon.com"
         "www.nvidia.com"
@@ -149,33 +155,53 @@ _scan_reality_sni_once() {
         "www.cloudflare.com"
     )
 
-    _info "正在扫描一个可用的 TLS 1.3 Reality SNI 候选域名..."
+    _info "正在扫描 TLS 1.3 Reality SNI 候选域名并测量握手延迟..."
     for candidate in "${candidates[@]}"; do
+        start_ms=$(date +%s%3N 2>/dev/null)
         if timeout 5 openssl s_client -connect "${candidate}:443" -servername "$candidate" -tls1_3 -brief </dev/null 2>&1 | grep -q 'TLSv1.3'; then
-            REALITY_SNI_SCANNED="$candidate"
-            _success "扫描到可用候选域名: ${candidate}"
-            return 0
+            end_ms=$(date +%s%3N 2>/dev/null)
+            if [[ "$start_ms" =~ ^[0-9]+$ && "$end_ms" =~ ^[0-9]+$ ]] && [ "$end_ms" -ge "$start_ms" ]; then
+                latency_ms=$((end_ms - start_ms))
+            else
+                latency_ms=99999
+            fi
+            results+="${latency_ms}"$'\t'"${candidate}"$'\n'
         fi
     done
 
-    _warning "本次未扫描到额外候选域名，将使用默认 apple.com。"
-    return 1
+    local sorted_latency sorted_domain
+    while IFS=$'\t' read -r sorted_latency sorted_domain; do
+        [ -z "$sorted_domain" ] && continue
+        REALITY_SNI_LATENCIES+=("$sorted_latency")
+        REALITY_SNI_DOMAINS+=("$sorted_domain")
+    done < <(printf '%s' "$results" | sort -n -k1,1)
+
+    if [ "${#REALITY_SNI_DOMAINS[@]}" -eq 0 ]; then
+        _warning "本次未扫描到可用候选域名，回车仍将使用默认 ${DEFAULT_SNI}。"
+        return 1
+    fi
+    _success "扫描完成，共发现 ${#REALITY_SNI_DOMAINS[@]} 个 TLS 1.3 候选域名。"
 }
 
 _select_reality_sni() {
     _scan_reality_sni_once || true
     SELECTED_REALITY_SNI="$DEFAULT_SNI"
 
-    echo "请选择 Reality 伪装域名/SNI:"
-    echo "  1) ${DEFAULT_SNI} (默认)"
-    if [ -n "$REALITY_SNI_SCANNED" ]; then
-        echo "  2) ${REALITY_SNI_SCANNED} (本机扫描结果)"
-        local sni_choice
-        read -p "请选择 [1-2] (默认: 1): " sni_choice
-        [ "$sni_choice" = "2" ] && SELECTED_REALITY_SNI="$REALITY_SNI_SCANNED"
-    else
-        _info "没有额外扫描结果，已选择 ${DEFAULT_SNI}。"
+    echo "请选择 Reality 伪装域名/SNI（扫描结果按 TLS 握手延迟从低到高排序）:"
+    echo "  回车) ${DEFAULT_SNI} (默认)"
+    local i
+    for i in "${!REALITY_SNI_DOMAINS[@]}"; do
+        printf '  %d) %s (%s ms)\n' "$((i + 1))" "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_LATENCIES[$i]}"
+    done
+
+    local sni_choice
+    read -p "请输入候选编号，或直接回车使用 ${DEFAULT_SNI}: " sni_choice
+    if [[ "$sni_choice" =~ ^[0-9]+$ ]] && [ "$sni_choice" -ge 1 ] && [ "$sni_choice" -le "${#REALITY_SNI_DOMAINS[@]}" ]; then
+        SELECTED_REALITY_SNI="${REALITY_SNI_DOMAINS[$((sni_choice - 1))]}"
+    elif [ -n "$sni_choice" ]; then
+        _warning "编号无效，已使用默认 ${DEFAULT_SNI}。"
     fi
+    _info "已选择 Reality SNI: ${SELECTED_REALITY_SNI}"
 }
 
 # 系统环境检测
@@ -2407,7 +2433,7 @@ _show_node_link() {
             local sni=$(echo "$2" | xargs)
             [[ -z "$sni" ]] && sni="$DEFAULT_SNI"
             
-            url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=chrome&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=firefox&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
             ;;
         "vless-ws-tls")
             # 参数: uuid, sni, ws_path, skip_verify
@@ -2457,7 +2483,7 @@ _show_node_link() {
         "any-reality")
             # 参数: password, sni, public_key, short_id
             local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
-            url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+            url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=firefox&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
             ;;
         "shadowsocks")
             # 参数: method, password
@@ -3215,7 +3241,7 @@ _create_anytls_tls_node() {
             "server": $s,
             "port": ($p|tonumber),
             "password": $pw,
-            "client-fingerprint": "chrome",
+            "client-fingerprint": "firefox",
             "udp": true,
             "idle-session-check-interval": 30,
             "idle-session-timeout": 30,
@@ -3291,7 +3317,7 @@ _create_anyreality_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=firefox&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
     local meta_json
     meta_json=$(jq -n \
         --arg type "any-reality" \
@@ -3465,7 +3491,7 @@ _add_vless_reality() {
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\"}}" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
-        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
+        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"firefox","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     _add_node_to_yaml "$proxy_json"
     _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id"
@@ -4093,7 +4119,7 @@ _view_nodes() {
                     local pk=$(jq -r --arg t "$tag" '.[$t].publicKey // empty' "$METADATA_FILE")
                     local sid=$(jq -r --arg t "$tag" '.[$t].shortId // empty' "$METADATA_FILE")
                     local sn="$tls_sn"
-                    local fp="chrome"
+                    local fp="firefox"
                     url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=${fp}&type=tcp&flow=${flow}&sni=${sn}&sid=${sid}#$(_url_encode "$display_name")"
                 elif [ "$transport_type" == "ws" ]; then
                     # ws_path 已在上方合并提取
@@ -4988,17 +5014,9 @@ _update_script() {
         return 1
     fi
     
-    # 进阶组件固定到已审计提交，并在执行前校验内容。
-    local script_name
-    for script_name in advanced_relay.sh parser.sh; do
-        _ensure_component_script "$script_name" || return 1
-    done
-    
-    # 更新 yq 工具（如果缺失或版本过旧）
-    _install_yq
-    
-    _success "所有脚本组件已更新至最新版 (v${downloaded_version})！"
-    _info "请重新运行脚本以应用所有变更："
+    # 当前 Bash 进程仍持有旧版本的组件固定值；组件改由新脚本在进入进阶功能时校验。
+    _success "主脚本已更新至 v${downloaded_version}。"
+    _info "请重新运行脚本应用新版本；进入 [17] 时会自动校验并下载进阶组件："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     exit 0
 }
