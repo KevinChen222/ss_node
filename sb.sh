@@ -4,18 +4,18 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.4"
+export SCRIPT_VERSION="20-kevin.5"
 export DEFAULT_SNI="www.icloud.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-# 主脚本从用户自己的仓库更新；可选中转组件固定到已审计的上游提交。
+# 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
-COMPONENT_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/d450bb83e09f32333848ee2f2694cc98097000bb"
-ADVANCED_RELAY_SHA256="d1ed761dc586a5354ce428e53cc01ea9bdebdb018ae305de3081cef1df6ea48f"
-PARSER_SHA256="ef2e78d59314c3a1a9a2ed8f1835cdd1aa5f66845f573729887af92a15f95698"
+COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
+ADVANCED_RELAY_SHA256="394bfb8d4231c92759cb8056f627e86a4847a83877397954f530ce2d6a38b6fe"
+PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -1995,7 +1995,7 @@ _create_service_files() {
 # 每天 03:17（服务器本地时间）清空一次本脚本产生的运行日志。
 _cleanup_runtime_logs() {
     local log
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE" /tmp/singbox_argo_*.log; do
+    for log in "$LOG_FILE" "$ARGO_LOG_FILE" "${SINGBOX_DIR}/relay_operations.log" /tmp/singbox_argo_*.log; do
         [ -f "$log" ] && : > "$log"
     done
 }
@@ -5070,7 +5070,7 @@ _do_update_singbox() {
 
 # --- 进阶功能 (子脚本) ---
 _advanced_features() {
-    # advanced_relay.sh 会调用 parser.sh；两者都必须来自固定提交并通过校验。
+    # advanced_relay.sh 会调用 parser.sh；两者都必须来自同仓库并通过固定哈希校验。
     _ensure_component_script "parser.sh" || return 1
     _ensure_component_script "advanced_relay.sh" || return 1
     bash "${SINGBOX_DIR}/advanced_relay.sh"
