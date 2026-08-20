@@ -9,8 +9,13 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
 DEFAULT_SNI="www.icloud.com"
+DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 DEFAULT_FINGERPRINT="firefox"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
+REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
+REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
+REALITL_SCANNER_BIN="${REALITL_SCANNER_DIR}/RealiTLScanner"
+REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
 
 # sing-box 1.12+ 废弃配置兼容环境变量，与 sb.sh 保持一致。
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -95,11 +100,176 @@ _get_public_ip() {
     echo "$ip"
 }
 
-# Reality SNI 在一次运行中只扫描一次，并按 TLS 1.3 握手延迟排序。
+# Reality SNI 与握手目标必须分开保存：扫描结果是“证书域名 + 邻居 IP”。
 REALITY_SNI_SCAN_DONE=false
 REALITY_SNI_DOMAINS=()
 REALITY_SNI_LATENCIES=()
-SELECTED_REALITY_SNI="$DEFAULT_SNI"
+REALITY_SNI_TARGETS=()
+SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
+SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
+SELECTED_REALITY_HANDSHAKE_PORT=443
+REALITY_PROBE_ERROR=""
+REALITY_PROBE_LATENCY=""
+REALITY_PROBE_HTTP_STATUS=""
+
+_is_valid_ipv4() {
+    local ip="$1" a b c d
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r a b c d <<< "$ip"
+    for a in "$a" "$b" "$c" "$d"; do
+        [ "$((10#$a))" -le 255 ] 2>/dev/null || return 1
+    done
+}
+
+_ipv4_to_int() {
+    local a b c d
+    _is_valid_ipv4 "$1" || return 1
+    IFS='.' read -r a b c d <<< "$1"
+    printf '%u\n' "$(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))"
+}
+
+_ipv4_in_cidr() {
+    local ip_int network_int prefix mask
+    ip_int=$(_ipv4_to_int "$1") || return 1
+    network_int=$(_ipv4_to_int "${2%/*}") || return 1
+    prefix="${2#*/}"
+    [ "$prefix" -ge 0 ] 2>/dev/null && [ "$prefix" -le 32 ] 2>/dev/null || return 1
+    if [ "$prefix" -eq 0 ]; then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    [ $((ip_int & mask)) -eq $((network_int & mask)) ]
+}
+
+_is_cloudflare_ipv4() {
+    local ip="$1" cidr
+    local ranges=(
+        "173.245.48.0/20" "103.21.244.0/22" "103.22.200.0/22" "103.31.4.0/22"
+        "141.101.64.0/18" "108.162.192.0/18" "190.93.240.0/20" "188.114.96.0/20"
+        "197.234.240.0/22" "198.41.128.0/17" "162.158.0.0/15" "104.16.0.0/13"
+        "104.24.0.0/14" "172.64.0.0/13" "131.0.72.0/22"
+    )
+    for cidr in "${ranges[@]}"; do
+        _ipv4_in_cidr "$ip" "$cidr" && return 0
+    done
+    return 1
+}
+
+_target_uses_cloudflare() {
+    local target="$1" ip
+    if _is_valid_ipv4 "$target"; then
+        _is_cloudflare_ipv4 "$target"
+        return
+    fi
+    while read -r ip; do
+        [ -z "$ip" ] && continue
+        _is_cloudflare_ipv4 "$ip" && return 0
+    done < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
+    return 1
+}
+
+_is_valid_reality_domain() {
+    local domain="${1,,}" label
+    local labels=()
+    [ "${#domain}" -le 253 ] || return 1
+    [[ "$domain" == *.* ]] || return 1
+    [[ "$domain" != *..* && "$domain" != .* && "$domain" != *. && "$domain" != *"*"* ]] || return 1
+    IFS='.' read -r -a labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [ "${#label}" -ge 1 ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    done
+    return 0
+}
+
+_install_realitlscanner() {
+    if [ -x "$REALITL_SCANNER_BIN" ] && [ -r "$REALITL_SCANNER_MARKER" ] && \
+       [ "$(tr -d '\r\n ' < "$REALITL_SCANNER_MARKER")" = "$REALITL_SCANNER_COMMIT" ]; then
+        return 0
+    fi
+    if [ ! -x /usr/local/bin/sb ]; then
+        _error "找不到 /usr/local/bin/sb，无法安全编译 RealiTLScanner。"
+        _warn "请先安装/更新同仓库的 sb.sh。"
+        return 1
+    fi
+    bash /usr/local/bin/sb install-realitlscanner
+}
+
+_probe_reality_target() {
+    local target="$1" sni="$2" connect_target curl_result curl_headers curl_meta appconnect
+    local tls_output
+    REALITY_PROBE_ERROR=""
+    REALITY_PROBE_LATENCY=""
+    REALITY_PROBE_HTTP_STATUS=""
+
+    _target_uses_cloudflare "$target" && {
+        REALITY_PROBE_ERROR="目标 IP 属于 Cloudflare 公开网段"
+        return 1
+    }
+    connect_target="${target}:443"
+    [[ "$target" == *:* ]] && connect_target="[${target}]:443"
+    tls_output=$(timeout 7 openssl s_client -connect "$connect_target" -servername "$sni" \
+        -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1) || true
+    printf '%s' "$tls_output" | grep -q 'TLSv1.3' || {
+        REALITY_PROBE_ERROR="未协商 TLS 1.3"
+        return 1
+    }
+    printf '%s' "$tls_output" | grep -q 'ALPN protocol: h2' || {
+        REALITY_PROBE_ERROR="未协商 HTTP/2 (h2)"
+        return 1
+    }
+    printf '%s' "$tls_output" | grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' || {
+        REALITY_PROBE_ERROR="证书与 SNI 不匹配或证书链无效"
+        return 1
+    }
+
+    local curl_args=(-sS -I --noproxy '*' --connect-timeout 4 --max-time 8)
+    _is_valid_ipv4 "$target" && curl_args+=(--resolve "${sni}:443:${target}")
+    curl_result=$(curl "${curl_args[@]}" -w $'\nSB_REALITY:%{http_code}\t%{time_appconnect}' \
+        "https://${sni}/" 2>/dev/null) || {
+        REALITY_PROBE_ERROR="HTTPS 请求失败"
+        return 1
+    }
+    curl_meta=$(printf '%s\n' "$curl_result" | awk -F: '/^SB_REALITY:/{v=$2} END{print v}')
+    curl_headers=$(printf '%s\n' "$curl_result" | sed '/^SB_REALITY:/d')
+    IFS=$'\t' read -r REALITY_PROBE_HTTP_STATUS appconnect <<< "$curl_meta"
+    [[ "$REALITY_PROBE_HTTP_STATUS" =~ ^3[0-9][0-9]$ ]] && {
+        REALITY_PROBE_ERROR="根路径返回 HTTP ${REALITY_PROBE_HTTP_STATUS} 跳转"
+        return 1
+    }
+    [[ "$REALITY_PROBE_HTTP_STATUS" =~ ^[245][0-9][0-9]$ ]] || {
+        REALITY_PROBE_ERROR="无法确认根路径 HTTP 状态"
+        return 1
+    }
+    printf '%s\n' "$curl_headers" | grep -qi '^server:[[:space:]]*cloudflare' && {
+        REALITY_PROBE_ERROR="HTTP 响应由 Cloudflare 提供"
+        return 1
+    }
+    REALITY_PROBE_LATENCY=$(awk -v t="$appconnect" 'BEGIN { printf "%.0f", t * 1000 }')
+    [[ "$REALITY_PROBE_LATENCY" =~ ^[0-9]+$ ]] || REALITY_PROBE_LATENCY=99999
+    return 0
+}
+
+_is_safe_reality_scan_cidr() {
+    local value="$1" ip prefix
+    [[ "$value" == */* ]] || return 1
+    ip="${value%/*}"; prefix="${value#*/}"
+    _is_valid_ipv4 "$ip" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] && [ "$prefix" -ge 24 ] && [ "$prefix" -le 32 ]
+}
+
+_first_exact_cert_domain() {
+    local target="$1" cert_info domain
+    cert_info=$(timeout 6 openssl s_client -connect "${target}:443" -showcerts </dev/null 2>/dev/null | \
+        openssl x509 -noout -ext subjectAltName 2>/dev/null) || return 1
+    while read -r domain; do
+        domain="${domain#DNS:}"
+        domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+        _is_valid_reality_domain "$domain" && { printf '%s\n' "$domain"; return 0; }
+    done < <(printf '%s\n' "$cert_info" | grep -oE 'DNS:[^,[:space:]]+')
+    return 1
+}
 
 _scan_reality_sni_once() {
     if [ "$REALITY_SNI_SCAN_DONE" = "true" ]; then
@@ -108,64 +278,142 @@ _scan_reality_sni_once() {
     fi
     REALITY_SNI_SCAN_DONE=true
 
-    local candidate start_ms end_ms latency_ms
-    local results=""
-    local candidates=(
-        "www.icloud.com"
-        "www.microsoft.com"
-        "www.amazon.com"
-        "www.nvidia.com"
-        "www.samsung.com"
-        "www.cloudflare.com"
-    )
+    _install_realitlscanner || return 1
+    local public_ipv4 default_cidr="" scan_cidr
+    public_ipv4=$(_get_public_ip 2>/dev/null || true)
+    if _is_valid_ipv4 "$public_ipv4"; then
+        IFS='.' read -r _scan_a _scan_b _scan_c _scan_d <<< "$public_ipv4"
+        default_cidr="${_scan_a}.${_scan_b}.${_scan_c}.0/24"
+    fi
+    _warn "上游建议在本地而非云 VPS 扫描；本脚本限制为最多 /24、16 线程、3 秒单目标超时。"
+    read -r -p "请输入扫描 IPv4 CIDR [${default_cidr:-例如 203.0.113.0/24}]: " scan_cidr
+    scan_cidr="${scan_cidr:-$default_cidr}"
+    if ! _is_safe_reality_scan_cidr "$scan_cidr"; then
+        _error "扫描范围必须是 IPv4 CIDR，且前缀长度为 /24-/32。"
+        return 1
+    fi
 
-    _info "正在扫描 TLS 1.3 Reality SNI 候选域名并测量握手延迟..."
-    for candidate in "${candidates[@]}"; do
-        start_ms=$(date +%s%3N 2>/dev/null)
-        if timeout 5 openssl s_client -connect "${candidate}:443" -servername "$candidate" -tls1_3 -brief </dev/null 2>&1 | grep -q 'TLSv1.3'; then
-            end_ms=$(date +%s%3N 2>/dev/null)
-            if [[ "$start_ms" =~ ^[0-9]+$ && "$end_ms" =~ ^[0-9]+$ ]] && [ "$end_ms" -ge "$start_ms" ]; then
-                latency_ms=$((end_ms - start_ms))
-            else
-                latency_ms=99999
+    local temp_dir csv_file scan_log scan_status
+    temp_dir=$(mktemp -d /tmp/sb-reality-scan.XXXXXX) || return 1
+    csv_file="${temp_dir}/out.csv"; scan_log="${temp_dir}/scan.log"
+    _info "正在使用 RealiTLScanner 扫描 ${scan_cidr}:443..."
+    timeout 180 "$REALITL_SCANNER_BIN" -addr "$scan_cidr" -port 443 -thread 16 -timeout 3 \
+        -out "$csv_file" > "$scan_log" 2>&1
+    scan_status=$?
+    [ "$scan_status" -eq 124 ] && _warn "扫描达到 180 秒上限，将使用已获得的结果。"
+
+    local results="" target origin candidate remainder key
+    local seen=" "
+    if [ -s "$csv_file" ]; then
+        while IFS=',' read -r target origin candidate remainder; do
+            target=$(printf '%s' "$target" | tr -d '\r ')
+            candidate=$(printf '%s' "$candidate" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
+            _is_valid_ipv4 "$target" || continue
+            [[ "$candidate" == \*.* ]] && candidate=$(_first_exact_cert_domain "$target" 2>/dev/null || true)
+            _is_valid_reality_domain "$candidate" || continue
+            key="${target}|${candidate}"
+            [[ "$seen" == *" ${key} "* ]] && continue
+            seen+="${key} "
+            if _probe_reality_target "$target" "$candidate"; then
+                results+="${REALITY_PROBE_LATENCY}"$'\t'"${candidate}"$'\t'"${target}"$'\n'
             fi
-            results+="${latency_ms}"$'\t'"${candidate}"$'\n'
-        fi
-    done
+        done < <(tail -n +2 "$csv_file")
+    fi
+    [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
 
-    local sorted_latency sorted_domain
-    while IFS=$'\t' read -r sorted_latency sorted_domain; do
+    local sorted_latency sorted_domain sorted_target
+    while IFS=$'\t' read -r sorted_latency sorted_domain sorted_target; do
         [ -z "$sorted_domain" ] && continue
         REALITY_SNI_LATENCIES+=("$sorted_latency")
         REALITY_SNI_DOMAINS+=("$sorted_domain")
+        REALITY_SNI_TARGETS+=("$sorted_target")
+        [ "${#REALITY_SNI_DOMAINS[@]}" -ge 20 ] && break
     done < <(printf '%s' "$results" | sort -n -k1,1)
 
     if [ "${#REALITY_SNI_DOMAINS[@]}" -eq 0 ]; then
-        _warn "本次未扫描到可用候选域名，回车仍将使用默认 ${DEFAULT_SNI}。"
+        _warn "本次未找到同时满足 TLS 1.3、H2、不跳转、证书匹配且非 Cloudflare 的候选。"
         return 1
     fi
-    _success "扫描完成，共发现 ${#REALITY_SNI_DOMAINS[@]} 个 TLS 1.3 候选域名。"
+    _success "扫描与复核完成，共保留 ${#REALITY_SNI_DOMAINS[@]} 个候选。"
 }
 
 _select_reality_sni() {
-    _scan_reality_sni_once || true
-    SELECTED_REALITY_SNI="$DEFAULT_SNI"
+    SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
+    SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
+    SELECTED_REALITY_HANDSHAKE_PORT=443
 
-    echo "请选择 Reality 伪装域名/SNI（扫描结果按 TLS 握手延迟从低到高排序）:"
-    echo "  回车) ${DEFAULT_SNI} (默认)"
+    echo "Reality 目标优先使用你自己控制的、真实可访问的 HTTPS 域名。"
+    read -r -p "你是否有符合条件的自有域名？[y/N]: " own_domain_choice
+    if [[ "$own_domain_choice" == "y" || "$own_domain_choice" == "Y" ]]; then
+        echo "  DNS/HTTPS 配置要求："
+        echo "  1) 为该域名配置 A/AAAA/CNAME，指向一个真实 HTTPS 源站。"
+        echo "  2) 使用 DNS only，不要开启 Cloudflare 代理/CDN。"
+        echo "  3) 源站证书必须匹配该域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
+        echo "  4) 不要把它只指向当前 Reality 公网监听端口；连接 VPS 的域名应与 Reality SNI 分开。"
+        local own_domain
+        read -r -p "请输入自有 Reality 目标域名: " own_domain
+        own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
+        if _is_valid_reality_domain "$own_domain" && _probe_reality_target "$own_domain" "$own_domain"; then
+            SELECTED_REALITY_SNI="$own_domain"
+            SELECTED_REALITY_HANDSHAKE_SERVER="$own_domain"
+            _success "自有域名已通过 TLS/H2/跳转/Cloudflare 复核。"
+            _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:443"
+            return 0
+        fi
+        _warn "自有域名未通过复核：${REALITY_PROBE_ERROR:-域名格式无效}。将转入扫描/默认选择。"
+    fi
+
+    local scan_choice
+    read -r -p "是否使用 XTLS/RealiTLScanner 扫描邻近 IP？[Y/n]: " scan_choice
+    if [[ "$scan_choice" != "n" && "$scan_choice" != "N" ]]; then
+        _scan_reality_sni_once || true
+    fi
+
+    echo "请选择 Reality SNI（候选已按 TLS 延迟从低到高排序）:"
+    echo "  回车) ${DEFAULT_REALITY_SNI} (默认，AMD ROCm / Amazon CloudFront，非 Cloudflare)"
     local i
     for i in "${!REALITY_SNI_DOMAINS[@]}"; do
-        printf '  %d) %s (%s ms)\n' "$((i + 1))" "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_LATENCIES[$i]}"
+        printf '  %d) %s (目标 %s:443, %s ms)\n' "$((i + 1))" \
+            "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_TARGETS[$i]}" "${REALITY_SNI_LATENCIES[$i]}"
     done
 
     local sni_choice
-    read -p "请输入候选编号，或直接回车使用 ${DEFAULT_SNI}: " sni_choice
+    read -r -p "请输入候选编号，或回车使用 ${DEFAULT_REALITY_SNI}: " sni_choice
     if [[ "$sni_choice" =~ ^[0-9]+$ ]] && [ "$sni_choice" -ge 1 ] && [ "$sni_choice" -le "${#REALITY_SNI_DOMAINS[@]}" ]; then
         SELECTED_REALITY_SNI="${REALITY_SNI_DOMAINS[$((sni_choice - 1))]}"
+        SELECTED_REALITY_HANDSHAKE_SERVER="${REALITY_SNI_TARGETS[$((sni_choice - 1))]}"
     elif [ -n "$sni_choice" ]; then
-        _warn "编号无效，已使用默认 ${DEFAULT_SNI}。"
+        _warn "编号无效，已使用默认 ${DEFAULT_REALITY_SNI}。"
     fi
-    _info "已选择 Reality SNI: ${SELECTED_REALITY_SNI}"
+    if [ "$SELECTED_REALITY_SNI" = "$DEFAULT_REALITY_SNI" ]; then
+        if ! _probe_reality_target "$DEFAULT_REALITY_SNI" "$DEFAULT_REALITY_SNI"; then
+            _warn "默认目标当前复核失败：${REALITY_PROBE_ERROR}；建议返回后重新扫描。"
+            local force_default
+            read -r -p "仍要继续使用该默认目标？[y/N]: " force_default
+            [[ "$force_default" == "y" || "$force_default" == "Y" ]] || return 1
+        fi
+    fi
+    _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:443"
+}
+
+_validate_reality_no_self_loop() {
+    local listen_port="$1" target="$2" public_ip target_ip
+    [ "$listen_port" = "443" ] || return 0
+    public_ip=$(_get_public_ip 2>/dev/null || true)
+    _is_valid_ipv4 "$public_ip" || return 0
+    if _is_valid_ipv4 "$target"; then
+        [ "$target" = "$public_ip" ] || return 0
+    else
+        while read -r target_ip; do
+            [ "$target_ip" = "$public_ip" ] && {
+                _error "Reality 握手目标 ${target}:443 解析回本机，与入站 443 形成自连接回环。"
+                return 1
+            }
+        done < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
+        return 0
+    fi
+    _error "Reality 握手目标 ${target}:443 就是本机公网 IP，与入站 443 形成自连接回环。"
+    return 1
 }
 
 # 端口冲突检测 (与主脚本 singbox.sh 保持一致，区分 TCP/UDP)
@@ -781,7 +1029,9 @@ _landing_config() {
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                     sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .servername // .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
-                [[ -z "$sni" || "$sni" == "null" ]] && sni="$DEFAULT_SNI"
+                if [[ -z "$sni" || "$sni" == "null" ]]; then
+                    [ "$reality_enabled" = "true" ] && sni="$DEFAULT_REALITY_SNI" || sni="$DEFAULT_SNI"
+                fi
 
                 local utls_json
                 utls_json=$(jq -n --arg fp "$DEFAULT_FINGERPRINT" '{enabled:true,fingerprint:$fp}')
@@ -1192,9 +1442,11 @@ _finalize_relay_setup() {
     done
     
     local entrance_sni="$DEFAULT_SNI"
+    local entrance_handshake_server="$DEFAULT_REALITY_SNI"
     if [ "$relay_type" == "vless-reality" ]; then
-        _select_reality_sni
+        _select_reality_sni || return 1
         entrance_sni="$SELECTED_REALITY_SNI"
+        entrance_handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
     else
         read -p "  请输入中转机入口 SNI (回车默认 ${DEFAULT_SNI}): " entrance_sni
         [[ -z "$entrance_sni" ]] && entrance_sni="$DEFAULT_SNI"
@@ -1240,6 +1492,7 @@ _finalize_relay_setup() {
     local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
     
     if [ "$relay_type" == "vless-reality" ]; then
+        _validate_reality_no_self_loop "$listen_port" "$entrance_handshake_server" || return 1
         local uuid=$($SINGBOX_BIN generate uuid)
         keypair=$($SINGBOX_BIN generate reality-keypair)
         local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
@@ -1249,8 +1502,8 @@ _finalize_relay_setup() {
         # 默认开启 XTLS-Vision 流控
         local flow="xtls-rprx-vision"
 
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" \
-            '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg hs "$entrance_handshake_server" --arg pk "$pk" --arg sid "$sid" \
+            '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
              
         link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=${DEFAULT_FINGERPRINT}&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
@@ -2997,7 +3250,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║           (v16-kevin.1)               ║"
+        echo "  ║           (v16-kevin.2)               ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
