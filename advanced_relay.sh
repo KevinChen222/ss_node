@@ -247,7 +247,8 @@ _probe_reality_target() {
     connect_target="${target}:${target_port}"
     [[ "$target" == *:* ]] && connect_target="[${target}]:${target_port}"
     tls_output=$(timeout 7 openssl s_client -connect "$connect_target" -servername "$sni" \
-        -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1) || true
+        -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1 | \
+        LC_ALL=C tr -d '\000') || true
     printf '%s' "$tls_output" | grep -q 'TLSv1.3' || {
         REALITY_PROBE_ERROR="未协商 TLS 1.3"
         return 1

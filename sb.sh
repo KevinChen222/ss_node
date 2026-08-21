@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.9"
+export SCRIPT_VERSION="20-kevin.10"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -15,7 +15,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="d345f722a28ed82622880e20acfc758660dd644a4f4d58f93620ca3eaa4cf96f"
+ADVANCED_RELAY_SHA256="73f3f7522a74b16a070ae0137bc91a2bfbb7e4ee430ec016ab991e521e53ce32"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
@@ -484,6 +484,9 @@ _install_managed_nginx_config() {
 
 _ensure_local_origin_dependencies() {
     _info "正在安装/检查 Nginx 与证书依赖..."
+    if ! command -v nginx >/dev/null 2>&1; then
+        _warn "首次安装 Nginx 时包管理器可能数分钟没有输出，请勿重复运行或中断脚本。"
+    fi
     if command -v apk >/dev/null 2>&1; then
         _pkg_install nginx dcron || return 1
     elif command -v apt-get >/dev/null 2>&1; then
@@ -492,6 +495,7 @@ _ensure_local_origin_dependencies() {
         _pkg_install nginx cronie || return 1
     fi
     command -v nginx >/dev/null 2>&1 || { _error "Nginx 安装失败。"; return 1; }
+    _success "Nginx 与证书依赖已就绪。"
     install -d -m 755 "$NGINX_CONF_DIR" "$NGINX_CERT_DIR" "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
     install -d -m 700 "$NGINX_BACKUP_DIR" || return 1
     _ensure_nginx_conf_d_include
@@ -590,14 +594,19 @@ _acme_ecc_cert_is_usable() {
     local domain="$1" info cert_path
     [ -x "$SB_ACME_SH" ] || return 1
     info=$("$SB_ACME_SH" --info -d "$domain" --ecc 2>/dev/null || true)
-    cert_path=$(printf '%s\n' "$info" | sed -n "s/^Le_RealFullChainPath='\(.*\)'$/\1/p" | head -n 1)
+    cert_path=$(printf '%s\n' "$info" | sed -n 's/^Le_RealFullChainPath=//p' | head -n 1)
+    cert_path=${cert_path#\'}
+    cert_path=${cert_path%\'}
     [ -n "$cert_path" ] && [ -s "$cert_path" ] && openssl x509 -in "$cert_path" -checkend 604800 -noout >/dev/null 2>&1
 }
 
 _acme_record_uses_webroot() {
-    local domain="$1" info
+    local domain="$1" info webroot
     info=$("$SB_ACME_SH" --info -d "$domain" --ecc 2>/dev/null || true)
-    printf '%s\n' "$info" | grep -Fq "$ACME_WEBROOT"
+    webroot=$(printf '%s\n' "$info" | sed -n 's/^Le_Webroot=//p' | head -n 1)
+    webroot=${webroot#\'}
+    webroot=${webroot%\'}
+    [ "$webroot" = "$ACME_WEBROOT" ]
 }
 
 _issue_local_origin_certificate() {
@@ -689,7 +698,18 @@ EOF_REALITY_ORIGIN
     _install_managed_nginx_config "$tmp" "$origin_conf" "$marker" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 
-    if ! _probe_reality_target "$REALITY_LOCAL_ORIGIN_HOST" "$domain" "$REALITY_LOCAL_ORIGIN_PORT"; then
+    local probe_ok=false probe_attempt
+    for probe_attempt in 1 2 3 4 5; do
+        if _probe_reality_target "$REALITY_LOCAL_ORIGIN_HOST" "$domain" "$REALITY_LOCAL_ORIGIN_PORT"; then
+            probe_ok=true
+            break
+        fi
+        if [ "$probe_attempt" -lt 5 ]; then
+            [ "$probe_attempt" -eq 1 ] && _info "Nginx 正在切换到新的 HTTPS 配置，稍候重试本机源站探测..."
+            sleep 1
+        fi
+    done
+    if [ "$probe_ok" != true ]; then
         _error "本机 HTTPS 源站复核失败: ${REALITY_PROBE_ERROR}"
         return 1
     fi
@@ -756,7 +776,8 @@ _probe_reality_target() {
     connect_target="${target}:${target_port}"
     [[ "$target" == *:* ]] && connect_target="[${target}]:${target_port}"
     tls_output=$(timeout 7 openssl s_client -connect "$connect_target" -servername "$sni" \
-        -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1) || true
+        -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1 | \
+        LC_ALL=C tr -d '\000') || true
     printf '%s' "$tls_output" | grep -q 'TLSv1.3' || {
         REALITY_PROBE_ERROR="未协商 TLS 1.3"
         return 1
@@ -4855,13 +4876,42 @@ _add_vless_reality() {
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"firefox","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     _add_node_to_yaml "$proxy_json"
     if [ "$router_mode" = true ]; then
+        if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" >/dev/null 2>&1 || \
+           ! _manage_service restart; then
+            _error "Sing-box 新配置未能启动，正在撤销新节点。"
+            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+            _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
+            _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+            _manage_service restart >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        local listener_ready=false listener_attempt
+        for listener_attempt in 1 2 3 4 5; do
+            if _check_port_occupied "$backend_port" tcp; then
+                listener_ready=true
+                break
+            fi
+            sleep 1
+        done
+        if [ "$listener_ready" != true ]; then
+            _error "Sing-box 未监听 Reality 回环端口 ${backend_port}，正在撤销新节点。"
+            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+            _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
+            _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+            _manage_service restart >/dev/null 2>&1 || true
+            return 1
+        fi
+
         if ! _sni_router_register_reality sb "$tag" "$server_name" "$backend_port"; then
             _error "HAProxy Reality 路由登记失败，正在撤销新节点。"
             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
             _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
             _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+            _manage_service restart >/dev/null 2>&1 || true
             return 1
         fi
+        ADD_NODE_SERVICE_RESTARTED=true
         _info "公网 443 -> HAProxy -> 127.0.0.1:${backend_port} -> Sing-box Reality"
     fi
     _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
@@ -7209,6 +7259,7 @@ _batch_create_nodes() {
 _show_add_node_menu() {
     local needs_restart=false
     local action_result
+    ADD_NODE_SERVICE_RESTARTED=false
     [ -z "$server_ip" ] && _init_server_ip
     clear
     echo -e "${CYAN}"
@@ -7267,7 +7318,7 @@ _show_add_node_menu() {
         needs_restart=true
     fi
 
-    if [ "$needs_restart" = true ]; then
+    if [ "$needs_restart" = true ] && [ "${ADD_NODE_SERVICE_RESTARTED:-false}" != true ]; then
         _info "配置已更新"
         _manage_service "restart"
     fi
