@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.11"
+export SCRIPT_VERSION="20-kevin.12"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -21,6 +21,7 @@ REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
 REALITL_SCANNER_BIN="${REALITL_SCANNER_DIR}/RealiTLScanner"
 REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
+GREATFIRE_API_BASE="https://zh.greatfire.org"
 GO_MIN_VERSION="1.21"
 GO_TOOLCHAIN_DIR="${REALITL_SCANNER_DIR}/go-toolchain"
 GO_TOOLCHAIN_MARKER="${GO_TOOLCHAIN_DIR}/.managed-by-singbox-lite"
@@ -174,12 +175,21 @@ REALITY_SNI_SCAN_DONE=false
 REALITY_SNI_DOMAINS=()
 REALITY_SNI_LATENCIES=()
 REALITY_SNI_TARGETS=()
+REALITY_SNI_CHINA_STATUSES=()
 SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
 SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
 SELECTED_REALITY_HANDSHAKE_PORT=443
 REALITY_PROBE_ERROR=""
 REALITY_PROBE_LATENCY=""
 REALITY_PROBE_HTTP_STATUS=""
+REALITY_CHINA_CHECK_ENABLED=false
+GREATFIRE_RESULT_CODE=2
+GREATFIRE_RESULT_LABEL="未验证"
+GREATFIRE_RESULT_LAST_TESTED=""
+GREATFIRE_CACHE_DOMAINS=()
+GREATFIRE_CACHE_CODES=()
+GREATFIRE_CACHE_LABELS=()
+GREATFIRE_CACHE_LAST_TESTED=()
 
 _is_valid_ipv4() {
     local ip="$1" a b c d
@@ -821,6 +831,183 @@ _probe_reality_target() {
     return 0
 }
 
+# GreatFire 的判定来自中国大陆探针与境外对照点；它只能提供风险证据，不能保证
+# 所有省份、运营商和时刻都可达。返回值：0=未发现屏蔽，1=已知高风险，2=无结论。
+_greatfire_fetch_verdict() {
+    local domain="$1" response headline stale conclusions last_tested
+    GREATFIRE_RESULT_CODE=2
+    GREATFIRE_RESULT_LABEL="无大陆侧数据"
+    GREATFIRE_RESULT_LAST_TESTED=""
+
+    response=$(curl -fsS --connect-timeout 5 --max-time 12 --retry 1 --retry-delay 1 \
+        -H 'Accept: application/json' \
+        -H "User-Agent: singbox-lite/${SCRIPT_VERSION} gfw-check" \
+        "${GREATFIRE_API_BASE}/api/url/https/${domain}" 2>/dev/null) || return 2
+    jq -e 'type == "object" and (.headline | type == "string")' \
+        >/dev/null 2>&1 <<< "$response" || return 2
+
+    headline=$(jq -r '.headline' <<< "$response")
+    stale=$(jq -r '.stale // false' <<< "$response")
+    conclusions=$(jq -r '.conclusions // 0' <<< "$response")
+    last_tested=$(jq -r '.last_tested // empty' <<< "$response")
+    if [[ "$last_tested" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]; then
+        GREATFIRE_RESULT_LAST_TESTED="${last_tested%%T*}"
+    fi
+
+    if [ "$stale" = "true" ]; then
+        GREATFIRE_RESULT_LABEL="数据过期"
+        return 2
+    fi
+    case "$headline" in
+        "not blocked")
+            if [[ "$conclusions" =~ ^[0-9]+$ ]] && [ "$conclusions" -gt 0 ]; then
+                GREATFIRE_RESULT_CODE=0
+                GREATFIRE_RESULT_LABEL="历史未屏蔽${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
+                return 0
+            fi
+            GREATFIRE_RESULT_LABEL="数据不足"
+            return 2
+            ;;
+        blocked)
+            GREATFIRE_RESULT_CODE=1
+            GREATFIRE_RESULT_LABEL="已知被屏蔽${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
+            return 1
+            ;;
+        intermittent)
+            GREATFIRE_RESULT_CODE=1
+            GREATFIRE_RESULT_LABEL="存在间歇性干扰${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
+            return 1
+            ;;
+        redirected)
+            GREATFIRE_RESULT_CODE=1
+            GREATFIRE_RESULT_LABEL="大陆侧重定向${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
+            return 1
+            ;;
+        unresolvable)
+            GREATFIRE_RESULT_CODE=1
+            GREATFIRE_RESULT_LABEL="公共 DNS 无法解析"
+            return 1
+            ;;
+        *)
+            GREATFIRE_RESULT_LABEL="数据不足"
+            return 2
+            ;;
+    esac
+}
+
+_greatfire_cached_verdict() {
+    local domain="$1" i result
+    for i in "${!GREATFIRE_CACHE_DOMAINS[@]}"; do
+        if [ "${GREATFIRE_CACHE_DOMAINS[$i]}" = "$domain" ]; then
+            GREATFIRE_RESULT_CODE="${GREATFIRE_CACHE_CODES[$i]}"
+            GREATFIRE_RESULT_LABEL="${GREATFIRE_CACHE_LABELS[$i]}"
+            GREATFIRE_RESULT_LAST_TESTED="${GREATFIRE_CACHE_LAST_TESTED[$i]}"
+            return "$GREATFIRE_RESULT_CODE"
+        fi
+    done
+
+    _greatfire_fetch_verdict "$domain"
+    result=$?
+    GREATFIRE_CACHE_DOMAINS+=("$domain")
+    GREATFIRE_CACHE_CODES+=("$result")
+    GREATFIRE_CACHE_LABELS+=("$GREATFIRE_RESULT_LABEL")
+    GREATFIRE_CACHE_LAST_TESTED+=("$GREATFIRE_RESULT_LAST_TESTED")
+    return "$result"
+}
+
+_greatfire_live_verify() {
+    local domain="$1" payload response state triggered started elapsed last_state="" failures=0
+    payload=$(jq -cn --arg url "https://${domain}" '{url:$url}') || return 2
+    started=$(date +%s)
+    _info "正在请求 GreatFire 中国大陆探针实测 ${domain}；通常需要几十秒，最长等待 150 秒..."
+
+    while true; do
+        elapsed=$(( $(date +%s) - started ))
+        [ "$elapsed" -lt 150 ] || {
+            GREATFIRE_RESULT_CODE=2
+            GREATFIRE_RESULT_LABEL="大陆探针等待超时"
+            return 2
+        }
+        response=$(curl -fsS --connect-timeout 5 --max-time 15 \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            -H "User-Agent: singbox-lite/${SCRIPT_VERSION} gfw-check" \
+            -X POST --data "$payload" "${GREATFIRE_API_BASE}/api/test-now" 2>/dev/null) || {
+            failures=$((failures + 1))
+            if [ "$failures" -ge 3 ]; then
+                GREATFIRE_RESULT_CODE=2
+                GREATFIRE_RESULT_LABEL="大陆探针接口不可用"
+                return 2
+            fi
+            sleep 2
+            continue
+        }
+        failures=0
+        jq -e 'type == "object"' >/dev/null 2>&1 <<< "$response" || {
+            GREATFIRE_RESULT_CODE=2
+            GREATFIRE_RESULT_LABEL="大陆探针返回格式异常"
+            return 2
+        }
+        triggered=$(jq -r '.triggered // false' <<< "$response")
+        state=$(jq -r '.state // "error"' <<< "$response")
+        if [ "$triggered" != "true" ] || [ "$state" = "error" ]; then
+            GREATFIRE_RESULT_CODE=2
+            GREATFIRE_RESULT_LABEL="大陆探针拒绝或无法执行测试"
+            return 2
+        fi
+        if [ "$state" != "$last_state" ]; then
+            case "$state" in
+                waiting_backend) _info "大陆探针任务已提交，正在等待后端..." ;;
+                waiting_cn) _info "境外对照已响应，正在等待中国大陆探针..." ;;
+                partial) _info "已收到部分大陆探针结果，继续等待..." ;;
+            esac
+            last_state="$state"
+        fi
+        case "$state" in
+            done)
+                sleep 1
+                _greatfire_fetch_verdict "$domain"
+                return $?
+                ;;
+            timeout)
+                GREATFIRE_RESULT_CODE=2
+                GREATFIRE_RESULT_LABEL="大陆探针测试超时"
+                return 2
+                ;;
+        esac
+        sleep 2
+    done
+}
+
+_confirm_reality_china_reachability() {
+    local domain="$1" result force_unverified
+    if [ "$REALITY_CHINA_CHECK_ENABLED" != "true" ]; then
+        _warn "${domain} 尚未从中国大陆网络验证；境外 TLS/H2 成功不能证明其未被 GFW 屏蔽。"
+        read -r -p "仍要使用这个未经大陆验证的 SNI？[y/N]: " force_unverified
+        [[ "$force_unverified" == "y" || "$force_unverified" == "Y" ]]
+        return
+    fi
+
+    _greatfire_live_verify "$domain"
+    result=$?
+    case "$result" in
+        0)
+            _success "大陆探针本次判定：未屏蔽。"
+            _warn "该结果只覆盖 GreatFire 当前探针，不能保证所有省份、运营商和未来时刻。"
+            return 0
+            ;;
+        1)
+            _error "已拒绝该 SNI：GreatFire 判定为 ${GREATFIRE_RESULT_LABEL}。"
+            return 1
+            ;;
+        *)
+            _warn "无法取得明确的大陆侧结论：${GREATFIRE_RESULT_LABEL}。"
+            read -r -p "仍要使用这个结果不明确的 SNI？[y/N]: " force_unverified
+            [[ "$force_unverified" == "y" || "$force_unverified" == "Y" ]]
+            return
+            ;;
+    esac
+}
+
 _is_safe_reality_scan_cidr() {
     local value="$1" ip prefix
     [[ "$value" == */* ]] || return 1
@@ -872,7 +1059,8 @@ _scan_reality_sni_once() {
     scan_status=$?
     [ "$scan_status" -eq 124 ] && _warn "扫描达到 180 秒上限，将使用已获得的结果。"
 
-    local results="" target origin candidate remainder key
+    local results="" target origin candidate remainder key china_status
+    local gfw_result gfw_rejected=0
     local seen=" "
     if [ -s "$csv_file" ]; then
         while IFS=',' read -r target origin candidate remainder; do
@@ -884,27 +1072,38 @@ _scan_reality_sni_once() {
             key="${target}|${candidate}"
             [[ "$seen" == *" ${key} "* ]] && continue
             seen+="${key} "
-            if _probe_reality_target "$target" "$candidate"; then
-                results+="${REALITY_PROBE_LATENCY}"$'\t'"${candidate}"$'\t'"${target}"$'\t'"${REALITY_PROBE_HTTP_STATUS}"$'\n'
+            _probe_reality_target "$target" "$candidate" || continue
+            china_status="未验证"
+            if [ "$REALITY_CHINA_CHECK_ENABLED" = "true" ]; then
+                _greatfire_cached_verdict "$candidate"
+                gfw_result=$?
+                china_status="$GREATFIRE_RESULT_LABEL"
+                if [ "$gfw_result" -eq 1 ]; then
+                    gfw_rejected=$((gfw_rejected + 1))
+                    _warn "已过滤大陆侧高风险候选: ${candidate} (${china_status})"
+                    continue
+                fi
             fi
+            results+="${REALITY_PROBE_LATENCY}"$'\t'"${candidate}"$'\t'"${target}"$'\t'"${REALITY_PROBE_HTTP_STATUS}"$'\t'"${china_status}"$'\n'
         done < <(tail -n +2 "$csv_file")
     fi
     [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
 
-    local sorted_latency sorted_domain sorted_target sorted_status
-    while IFS=$'\t' read -r sorted_latency sorted_domain sorted_target sorted_status; do
+    local sorted_latency sorted_domain sorted_target sorted_status sorted_china_status
+    while IFS=$'\t' read -r sorted_latency sorted_domain sorted_target sorted_status sorted_china_status; do
         [ -z "$sorted_domain" ] && continue
         REALITY_SNI_LATENCIES+=("$sorted_latency")
         REALITY_SNI_DOMAINS+=("$sorted_domain")
         REALITY_SNI_TARGETS+=("$sorted_target")
+        REALITY_SNI_CHINA_STATUSES+=("${sorted_china_status:-未验证}")
         [ "${#REALITY_SNI_DOMAINS[@]}" -ge 20 ] && break
     done < <(printf '%s' "$results" | sort -n -k1,1)
 
     if [ "${#REALITY_SNI_DOMAINS[@]}" -eq 0 ]; then
-        _warning "本次未找到同时满足 TLS 1.3、H2、不跳转、证书匹配且非 Cloudflare 的候选。"
+        _warning "本次未找到同时满足 TLS 1.3、H2、不跳转、证书匹配、非 Cloudflare 且未命中大陆高风险判定的候选。"
         return 1
     fi
-    _success "扫描与复核完成，共保留 ${#REALITY_SNI_DOMAINS[@]} 个候选。"
+    _success "扫描与复核完成，共保留 ${#REALITY_SNI_DOMAINS[@]} 个候选；大陆侧高风险过滤 ${gfw_rejected} 个。"
 }
 
 _select_reality_sni() {
@@ -958,36 +1157,67 @@ _select_reality_sni() {
         _warn "自有域名未通过复核：${REALITY_PROBE_ERROR:-域名格式无效}。将转入扫描/默认选择。"
     fi
 
-    local scan_choice
+    local scan_choice greatfire_choice default_china_status="未验证"
+    echo ""
+    _warn "境外 VPS 无法自行证明候选域名在中国大陆可达。"
+    echo "  可选的大陆侧校验会把候选 HTTPS 域名提交给 GreatFire。"
+    echo "  GreatFire 使用中国大陆探针与境外对照点测试，测量结果可能公开；不会提交你的 VPS IP、UUID 或 Reality 密钥。"
+    read -r -p "是否启用 GreatFire 大陆可达性筛查？[Y/n]: " greatfire_choice
+    if [[ "$greatfire_choice" == "n" || "$greatfire_choice" == "N" ]]; then
+        REALITY_CHINA_CHECK_ENABLED=false
+        _warn "已关闭大陆侧校验；选择候选时需要再次明确确认风险。"
+    else
+        REALITY_CHINA_CHECK_ENABLED=true
+    fi
+
     read -r -p "是否使用 XTLS/RealiTLScanner 扫描邻近 IP？[Y/n]: " scan_choice
     if [[ "$scan_choice" != "n" && "$scan_choice" != "N" ]]; then
         _scan_reality_sni_once || true
     fi
 
-    echo "请选择 Reality SNI（候选已按 TLS 延迟从低到高排序）:"
-    echo "  回车) ${DEFAULT_REALITY_SNI} (默认，AMD ROCm / Amazon CloudFront，非 Cloudflare)"
-    local i
-    for i in "${!REALITY_SNI_DOMAINS[@]}"; do
-        printf '  %d) %s (目标 %s:443, %s ms)\n' "$((i + 1))" \
-            "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_TARGETS[$i]}" "${REALITY_SNI_LATENCIES[$i]}"
-    done
+    if [ "$REALITY_CHINA_CHECK_ENABLED" = "true" ]; then
+        _greatfire_cached_verdict "$DEFAULT_REALITY_SNI"
+        default_china_status="$GREATFIRE_RESULT_LABEL"
+    fi
 
-    local sni_choice
-    read -r -p "请输入候选编号，或回车使用 ${DEFAULT_REALITY_SNI}: " sni_choice
-    if [[ "$sni_choice" =~ ^[0-9]+$ ]] && [ "$sni_choice" -ge 1 ] && [ "$sni_choice" -le "${#REALITY_SNI_DOMAINS[@]}" ]; then
-        SELECTED_REALITY_SNI="${REALITY_SNI_DOMAINS[$((sni_choice - 1))]}"
-        SELECTED_REALITY_HANDSHAKE_SERVER="${REALITY_SNI_TARGETS[$((sni_choice - 1))]}"
-    elif [ -n "$sni_choice" ]; then
-        _warning "编号无效，已使用默认 ${DEFAULT_REALITY_SNI}。"
-    fi
-    if [ "$SELECTED_REALITY_SNI" = "$DEFAULT_REALITY_SNI" ]; then
-        if ! _probe_reality_target "$DEFAULT_REALITY_SNI" "$DEFAULT_REALITY_SNI"; then
-            _warn "默认目标当前复核失败：${REALITY_PROBE_ERROR}；建议返回后重新扫描。"
-            local force_default
-            read -r -p "仍要继续使用该默认目标？[y/N]: " force_default
-            [[ "$force_default" == "y" || "$force_default" == "Y" ]] || return 1
+    local i sni_choice force_default
+    while true; do
+        echo "请选择 Reality SNI（候选已按 TLS 延迟从低到高排序）:"
+        echo "  回车) ${DEFAULT_REALITY_SNI} (默认，AMD ROCm / Amazon CloudFront，非 Cloudflare；大陆判定: ${default_china_status})"
+        for i in "${!REALITY_SNI_DOMAINS[@]}"; do
+            printf '  %d) %s (目标 %s:443, %s ms；大陆判定: %s)\n' "$((i + 1))" \
+                "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_TARGETS[$i]}" \
+                "${REALITY_SNI_LATENCIES[$i]}" "${REALITY_SNI_CHINA_STATUSES[$i]:-未验证}"
+        done
+        echo "  0) 取消本次 Reality 节点添加"
+
+        SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
+        SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
+        SELECTED_REALITY_HANDSHAKE_PORT=443
+        read -r -p "请输入候选编号，回车使用 ${DEFAULT_REALITY_SNI}，或输入 0 取消: " sni_choice
+        if [ "$sni_choice" = "0" ]; then
+            _info "已取消本次 Reality 节点添加。"
+            return 1
+        elif [[ "$sni_choice" =~ ^[0-9]+$ ]] && [ "$sni_choice" -ge 1 ] && [ "$sni_choice" -le "${#REALITY_SNI_DOMAINS[@]}" ]; then
+            SELECTED_REALITY_SNI="${REALITY_SNI_DOMAINS[$((sni_choice - 1))]}"
+            SELECTED_REALITY_HANDSHAKE_SERVER="${REALITY_SNI_TARGETS[$((sni_choice - 1))]}"
+        elif [ -n "$sni_choice" ]; then
+            _warning "编号无效，已使用默认 ${DEFAULT_REALITY_SNI}。"
         fi
-    fi
+
+        if [ "$SELECTED_REALITY_SNI" = "$DEFAULT_REALITY_SNI" ] && \
+           ! _probe_reality_target "$DEFAULT_REALITY_SNI" "$DEFAULT_REALITY_SNI"; then
+            _warn "默认目标当前复核失败：${REALITY_PROBE_ERROR}；建议重新选择扫描结果。"
+            read -r -p "仍要继续检查该默认目标的大陆可达性？[y/N]: " force_default
+            if [[ "$force_default" != "y" && "$force_default" != "Y" ]]; then
+                continue
+            fi
+        fi
+        if _confirm_reality_china_reachability "$SELECTED_REALITY_SNI"; then
+            break
+        fi
+        _warn "该候选未通过严格大陆可达性筛查，请重新选择。"
+    done
     _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
 }
 
