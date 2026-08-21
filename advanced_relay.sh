@@ -13,6 +13,9 @@ DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 DEFAULT_FINGERPRINT="firefox"
 REALITY_LOCAL_ORIGIN_HOST="127.0.0.1"
 REALITY_LOCAL_ORIGIN_PORT=8443
+SNI_ROUTER_API_VERSION=1
+SNI_ROUTER_PUBLIC_PORT=443
+SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
@@ -73,6 +76,24 @@ _install_yq() {
     _error "未找到受信任的 yq: $YQ_BINARY"
     _warn "请先运行同仓库中的 sb.sh 安装/修复运行环境。"
     return 1
+}
+
+_sni_router_call() {
+    if [ ! -x /usr/local/bin/sb ]; then
+        _error "未找到 /usr/local/bin/sb，无法使用 HAProxy 443 共享入口。"
+        return 1
+    fi
+    local api
+    api=$(/usr/local/bin/sb sni-router api-version 2>/dev/null) || return 1
+    if [ "$api" != "$SNI_ROUTER_API_VERSION" ]; then
+        _error "sb.sh 的 SNI 路由接口版本不兼容（需要 ${SNI_ROUTER_API_VERSION}，实际 ${api:-unknown}）。"
+        return 1
+    fi
+    /usr/local/bin/sb sni-router "$@"
+}
+
+_sni_router_allocate_backend() {
+    _sni_router_call allocate-backend "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT"
 }
 
 # 核心环境检测 (与主脚本 singbox.sh 保持一致)
@@ -372,7 +393,7 @@ _select_reality_sni() {
             echo "  1) 域名 A/AAAA 已指向本机，且使用 DNS only。"
             echo "  2) 公网 TCP 80 可访问，用于 Let's Encrypt HTTP-01；不需要 Cloudflare Token。"
             echo "  3) Nginx 仅在 127.0.0.1:${REALITY_LOCAL_ORIGIN_PORT} 提供 Reality HTTPS 源站。"
-            echo "  4) 若之后让 Emby Nginx 使用公网 443，Reality 节点请选择其他公网端口。"
+            echo "  4) 若 Reality 与 Emby 都使用公网 443，请启用 HAProxy SNI 分流，并确保两个域名不同。"
             read -r -p "请输入自有域名: " own_domain
             own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
             _is_valid_reality_domain "$own_domain" || { _error "自有域名格式无效。"; return 1; }
@@ -1274,9 +1295,10 @@ _offer_existing_inbound_relay() {
     }
 
     local tags=() types=() ports=() names=() links=()
-    local tag inbound_type listen_port node_name share_link
-    while IFS=$'\t' read -r tag inbound_type listen_port; do
+    local tag inbound_type listen_port listen_address node_name share_link managed_router
+    while IFS=$'\t' read -r tag inbound_type listen_port listen_address; do
         [ -z "$tag" ] && continue
+        managed_router=false
         # 已有专用路由的入口不可再次绑定，否则第一条匹配规则会造成歧义。
         _inbound_has_route "$MAIN_CONFIG_FILE" "$tag" && continue
         _inbound_has_route "$RELAY_CONFIG_FILE" "$tag" && continue
@@ -1286,7 +1308,15 @@ _offer_existing_inbound_relay() {
         if [ -s "$MAIN_METADATA_FILE" ]; then
             node_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$MAIN_METADATA_FILE" 2>/dev/null)
             share_link=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$MAIN_METADATA_FILE" 2>/dev/null)
+            if [ "$listen_address" = "127.0.0.1" ]; then
+                if [ "$(jq -r --arg t "$tag" '.[$t].frontedBy // empty' "$MAIN_METADATA_FILE" 2>/dev/null)" != "haproxy" ]; then
+                    continue
+                fi
+                managed_router=true
+                listen_port=$(jq -r --arg t "$tag" --argjson fallback "$listen_port" '.[$t].publicPort // $fallback' "$MAIN_METADATA_FILE" 2>/dev/null)
+            fi
         fi
+        [ "$listen_address" != "127.0.0.1" ] || [ "$managed_router" = true ] || continue
         [ -z "$node_name" ] && node_name="$tag"
         tags+=("$tag")
         types+=("$inbound_type")
@@ -1297,10 +1327,9 @@ _offer_existing_inbound_relay() {
         .inbounds[]?
         | select((.tag // "") != "")
         | select((.listen_port // 0) > 0)
-        | select((.listen // "::") != "127.0.0.1")
         | select((.tag | startswith("argo-")) | not)
         | select((.tag | test("-hop-[0-9]+$")) | not)
-        | [.tag, (.type // "unknown"), (.listen_port | tostring)]
+        | [.tag, (.type // "unknown"), (.listen_port | tostring), (.listen // "::")]
         | @tsv
     ' "$MAIN_CONFIG_FILE" 2>/dev/null)
 
@@ -1463,10 +1492,26 @@ _finalize_relay_setup() {
     esac
     
     # --- 配置入口详细信息 ---
+    local backend_port=""
+    local inbound_listen="::"
+    local router_mode=false
     while true; do
         read -p "  请输入本机监听端口 (回车随机): " listen_port
         [[ -z "$listen_port" ]] && listen_port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 40001 + 10000 ))
-        
+
+        if [ "$relay_type" = "vless-reality" ] && [ "$listen_port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+            local use_router
+            read -r -p "  是否由 HAProxy 复用公网 443？[Y/n]: " use_router
+            if [[ ! "$use_router" =~ ^[Nn]$ ]]; then
+                _sni_router_call prepare || continue
+                backend_port=$(_sni_router_allocate_backend) || continue
+                inbound_listen="127.0.0.1"
+                router_mode=true
+                _info "公网 443 将由 HAProxy 分流，当前中转入站实际监听 127.0.0.1:${backend_port}。"
+                break
+            fi
+        fi
+
         if _check_port_occupied "$listen_port"; then
             _error "端口 $listen_port 已被系统占用，请重新输入！"
         elif [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" ]]; then
@@ -1481,10 +1526,12 @@ _finalize_relay_setup() {
             _info "端口 $listen_port 可用。"
             break
         else
+            backend_port="$listen_port"
             _info "端口 $listen_port 可用。"
             break
         fi
     done
+    [ -n "$backend_port" ] || backend_port="$listen_port"
     
     local entrance_sni="$DEFAULT_SNI"
     local entrance_handshake_server="$DEFAULT_REALITY_SNI"
@@ -1549,8 +1596,8 @@ _finalize_relay_setup() {
         # 默认开启 XTLS-Vision 流控
         local flow="xtls-rprx-vision"
 
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg hs "$entrance_handshake_server" --arg hp "$entrance_handshake_port" --arg pk "$pk" --arg sid "$sid" \
-            '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":($hp|tonumber)},"private_key":$pk,"short_id":[$sid]}}}')
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$backend_port" --arg listen "$inbound_listen" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg hs "$entrance_handshake_server" --arg hp "$entrance_handshake_port" --arg pk "$pk" --arg sid "$sid" \
+            '{"type":"vless","tag":$t,"listen":$listen,"listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":($hp|tonumber)},"private_key":$pk,"short_id":[$sid]}}}')
              
         link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=${DEFAULT_FINGERPRINT}&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
@@ -1670,15 +1717,39 @@ _finalize_relay_setup() {
         _manage_service restart >/dev/null 2>&1 || true
         return 1
     fi
-    rm -f "${CONFIG_FILE}.bak"
+    if [ "$router_mode" = true ] && ! _sni_router_call register-reality advanced-relay "$inbound_tag" "$entrance_sni" "$backend_port"; then
+        _error "HAProxy Reality 路由登记失败，正在恢复原中转配置。"
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
     _save_nftables_rules
     
     # 3. 存储链接信息与扩展参数清理信息
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
+    local metadata
+    metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
         --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" --arg hop "$port_range" \
-        '{link: $link, created_at: $created, relay_type: $relay_type, landing_type: $landing_type, landing_addr: $landing_addr, node_name: $node_name} | if $hop != "" then .port_hopping = $hop else . end')
-    jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "${LINKS_FILE}.tmp" && mv "${LINKS_FILE}.tmp" "$LINKS_FILE"
+        --argjson public_port "$listen_port" --argjson backend "$backend_port" --argjson routed "$router_mode" \
+        '{link: $link, created_at: $created, relay_type: $relay_type, landing_type: $landing_type, landing_addr: $landing_addr, node_name: $node_name, public_port:$public_port, backend_port:$backend} |
+         if $hop != "" then .port_hopping = $hop else . end |
+         if $routed then .fronted_by="haproxy" | .router_role="reality-default" else . end') || {
+        [ "$router_mode" = true ] && _sni_router_call remove-reality "$inbound_tag" >/dev/null 2>&1 || true
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        _error "中转元数据生成失败，已回滚。"
+        return 1
+    }
+    if ! jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "${LINKS_FILE}.tmp" || \
+       ! mv "${LINKS_FILE}.tmp" "$LINKS_FILE"; then
+        rm -f "${LINKS_FILE}.tmp"
+        [ "$router_mode" = true ] && _sni_router_call remove-reality "$inbound_tag" >/dev/null 2>&1 || true
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        _error "中转元数据写入失败，已回滚。"
+        return 1
+    fi
+    rm -f "${CONFIG_FILE}.bak"
     _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_type}@${dest_addr}:${dest_port}"
     
     # 4. 添加到中转机专用 YAML 配置 (复用上方已获取的 relay_server_ip)
@@ -1716,7 +1787,11 @@ _finalize_relay_setup() {
     echo -e "  节点名称: ${GREEN}$node_name${NC}"
     echo -e "  中转协议: ${CYAN}$relay_type${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
-    echo -e "  本地监听: ${CYAN}$listen_port${NC}"
+    if [ "$router_mode" = true ]; then
+        echo -e "  公网入口: ${CYAN}${listen_port}${NC} -> HAProxy -> ${CYAN}127.0.0.1:${backend_port}${NC}"
+    else
+        echo -e "  本地监听: ${CYAN}$listen_port${NC}"
+    fi
     echo -e "分享链接:"
     echo -e "${CYAN}$link${NC}"
     echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
@@ -1902,6 +1977,15 @@ _delete_relay() {
         read -p "  确认删除所有? (yes/N): " confirm_all
         if [[ "$confirm_all" == "yes" ]]; then
             _info "正在批量删除..."
+
+            local router_tag
+            router_tag=$(jq -r 'to_entries[] | select(.value.fronted_by == "haproxy" and .value.router_role == "reality-default") | .key' "$LINKS_FILE" 2>/dev/null | head -n 1)
+            if [ -n "$router_tag" ]; then
+                _sni_router_call remove-reality "$router_tag" || {
+                    _error "无法注销 HAProxy Reality 后端，已取消批量删除。"
+                    return 1
+                }
+            fi
             
             # 清理中转跳跃端口 nftables 规则
             if [ -f "${RELAY_AUX_DIR}/relay_links.json" ]; then
@@ -1938,9 +2022,25 @@ _delete_relay() {
     local out_tag=$(echo "$selected_rule" | jq -r '.outbound')
     local reuse_existing="false"
     [ -f "$LINKS_FILE" ] && reuse_existing=$(jq -r --arg t "$in_tag" '.[$t].reuse_existing // false' "$LINKS_FILE" 2>/dev/null)
+    local fronted_by=""
+    [ -f "$LINKS_FILE" ] && fronted_by=$(jq -r --arg t "$in_tag" '.[$t].fronted_by // empty' "$LINKS_FILE" 2>/dev/null)
+    local router_sni="" router_backend=""
+    if [ "$fronted_by" = "haproxy" ]; then
+        router_sni=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .tls.server_name // empty' "$CONFIG_FILE")
+        router_backend=$(jq -r --arg t "$in_tag" '.[$t].backend_port // empty' "$LINKS_FILE")
+    fi
     
     _info "正在删除中转链路: $in_tag -> $out_tag ..."
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$in_tag\")) | del(.outbounds[] | select(.tag == \"$out_tag\")) | del(.route.rules[] | select(.inbound == \"$in_tag\"))"
+    if [ "$fronted_by" = "haproxy" ]; then
+        _sni_router_call remove-reality "$in_tag" || {
+            _error "无法注销 HAProxy Reality 后端，中转未删除。"
+            return 1
+        }
+    fi
+    if ! _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$in_tag\")) | del(.outbounds[] | select(.tag == \"$out_tag\")) | del(.route.rules[] | select(.inbound == \"$in_tag\"))"; then
+        [ "$fronted_by" = "haproxy" ] && _sni_router_call register-reality advanced-relay "$in_tag" "$router_sni" "$router_backend" >/dev/null 2>&1 || true
+        return 1
+    fi
     
     # 彻底同步清理：如果还有该端口的残留 outbound (防止手动操作产生垃圾)
     local port_suffix=$(echo "$in_tag" | grep -oE "[0-9]+$")
@@ -2006,10 +2106,16 @@ _modify_relay_port() {
         fi
         local inbound=$(jq -c --arg t "$in_tag" '.inbounds[] | select(.tag == $t)' "$CONFIG_FILE")
         local port=$(echo "$inbound" | jq -r '.listen_port')
+        local public_port="$port"
+        [ -f "$LINKS_FILE" ] && public_port=$(jq -r --arg t "$in_tag" --argjson fallback "$port" '.[$t].public_port // $fallback' "$LINKS_FILE" 2>/dev/null)
         if [ -z "$inbound" ] || [ "$port" == "null" ]; then
             continue
         fi
-        echo -e "    ${GREEN}[$i]${NC} 端口: ${port} [${in_tag}]"
+        if [ "$public_port" != "$port" ]; then
+            echo -e "    ${GREEN}[$i]${NC} 公网: ${public_port} -> 回环: ${port} [${in_tag}]"
+        else
+            echo -e "    ${GREEN}[$i]${NC} 端口: ${port} [${in_tag}]"
+        fi
         rule_list+=("$rule")
         ((i++))
     done <<< "$rules"
@@ -2029,6 +2135,14 @@ _modify_relay_port() {
     local selected_rule=${rule_list[$((choice-1))]}
     local in_tag=$(echo "$selected_rule" | jq -r '.inbound')
     local old_port=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONFIG_FILE")
+    local fronted_by=""
+    [ -f "$LINKS_FILE" ] && fronted_by=$(jq -r --arg t "$in_tag" '.[$t].fronted_by // empty' "$LINKS_FILE" 2>/dev/null)
+    if [ "$fronted_by" = "haproxy" ]; then
+        _warn "该入口由 HAProxy 共享公网 443，回环后端端口不应直接修改。"
+        _info "如需离开 443，请删除并重建该中转入口；落地节点不会受影响。"
+        read -p "  按回车键继续..."
+        return
+    fi
     local current_hop_info=""
     [ -f "$LINKS_FILE" ] && current_hop_info=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE" 2>/dev/null)
     
