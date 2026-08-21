@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.6"
+export SCRIPT_VERSION="20-kevin.7"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -15,12 +15,33 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="c61d29fc39b006c9919016e723e5e007ec6bb3903eb5d8e7de599158aa4ee1ca"
+ADVANCED_RELAY_SHA256="4b57b7dd77fe413218f26977d190a640b95ce5cd35593593fb026a4a016664dd"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
 REALITL_SCANNER_BIN="${REALITL_SCANNER_DIR}/RealiTLScanner"
 REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
+GO_MIN_VERSION="1.21"
+GO_TOOLCHAIN_DIR="${REALITL_SCANNER_DIR}/go-toolchain"
+GO_TOOLCHAIN_MARKER="${GO_TOOLCHAIN_DIR}/.managed-by-singbox-lite"
+
+# 单机自有域名模式与 nginx_proxy/deploy.sh 使用相同的 Nginx/证书目录结构。
+REALITY_LOCAL_ORIGIN_HOST="127.0.0.1"
+REALITY_LOCAL_ORIGIN_PORT=8443
+SB_ROOT_HOME="$(awk -F: '$3 == 0 {print $6; exit}' /etc/passwd 2>/dev/null || true)"
+SB_ROOT_HOME="${SB_ROOT_HOME:-/root}"
+NGINX_ROOT="/etc/nginx"
+NGINX_MAIN_CONF="${NGINX_ROOT}/nginx.conf"
+NGINX_CONF_DIR="${NGINX_ROOT}/conf.d"
+NGINX_CERT_DIR="${NGINX_ROOT}/certs"
+NGINX_BACKUP_DIR="${NGINX_ROOT}/backup"
+ACME_WEBROOT="/var/www/acme-challenge"
+SB_ACME_HOME="${SB_ROOT_HOME}/.acme.sh"
+SB_ACME_SH="${SB_ACME_HOME}/acme.sh"
+SB_ACME_VERSION="3.1.2"
+SB_ACME_ARCHIVE_SHA256="a51511ad0e2912be45125cf189401e4ae776ca1a29d5768f020a1e35a9560186"
+SB_ACME_ARCHIVE_URL="https://github.com/acmesh-official/acme.sh/archive/refs/tags/${SB_ACME_VERSION}.tar.gz"
+SB_ACME_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -219,6 +240,451 @@ _is_valid_reality_domain() {
     return 0
 }
 
+_version_at_least() {
+    local current="${1#go}" required="${2#go}"
+    [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$required" "$current" | sort -V | head -n 1)" = "$required" ]
+}
+
+_go_version_for_bin() {
+    local go_bin="$1"
+    "$go_bin" env GOVERSION 2>/dev/null | sed -E 's/^go//; s/(rc|beta).*//'
+}
+
+_find_compatible_go() {
+    local go_bin go_version
+    if [ -x "$GO_TOOLCHAIN_DIR/bin/go" ] && [ -f "$GO_TOOLCHAIN_MARKER" ]; then
+        go_version=$(_go_version_for_bin "$GO_TOOLCHAIN_DIR/bin/go")
+        if _version_at_least "$go_version" "$GO_MIN_VERSION"; then
+            printf '%s\n' "$GO_TOOLCHAIN_DIR/bin/go"
+            return 0
+        fi
+    fi
+    if command -v go >/dev/null 2>&1; then
+        go_bin=$(command -v go)
+        go_version=$(_go_version_for_bin "$go_bin")
+        if _version_at_least "$go_version" "$GO_MIN_VERSION"; then
+            printf '%s\n' "$go_bin"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+_install_managed_go_toolchain() {
+    local machine go_arch metadata entry go_version filename expected_sha
+    local temp_dir archive extracted_version new_dir backup_dir=""
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64) go_arch="amd64" ;;
+        aarch64|arm64) go_arch="arm64" ;;
+        i386|i486|i586|i686) go_arch="386" ;;
+        armv6l|armv7l) go_arch="armv6l" ;;
+        *) _error "官方 Go 工具链暂不支持此架构: ${machine}"; return 1 ;;
+    esac
+
+    _pkg_install curl jq tar ca-certificates coreutils git || return 1
+    metadata=$(curl -fsSL --connect-timeout 10 --max-time 30 'https://go.dev/dl/?mode=json') || {
+        _error "无法读取 Go 官方版本元数据。"
+        return 1
+    }
+    entry=$(printf '%s' "$metadata" | jq -r --arg arch "$go_arch" '
+        first(.[] | select(.stable == true) as $release
+            | $release.files[]
+            | select(.os == "linux" and .arch == $arch and .kind == "archive")
+            | [$release.version, .filename, .sha256] | @tsv) // empty
+    ' 2>/dev/null)
+    IFS=$'\t' read -r go_version filename expected_sha <<< "$entry"
+    if [[ ! "$go_version" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || \
+       [[ ! "$filename" =~ ^go[0-9.]+\.linux-(amd64|arm64|386|armv6l)\.tar\.gz$ ]] || \
+       [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || \
+       ! _version_at_least "$go_version" "$GO_MIN_VERSION"; then
+        _error "Go 官方元数据无效或版本低于 ${GO_MIN_VERSION}。"
+        return 1
+    fi
+
+    temp_dir=$(mktemp -d /tmp/sb-go-toolchain.XXXXXX) || return 1
+    archive="${temp_dir}/${filename}"
+    _info "正在下载 Go ${go_version#go} (${go_arch})，并校验官方 SHA-256..."
+    if ! curl -fL --connect-timeout 10 --max-time 300 \
+        "https://go.dev/dl/${filename}" -o "$archive"; then
+        rm -rf -- "$temp_dir"
+        _error "Go 官方工具链下载失败。"
+        return 1
+    fi
+    if ! printf '%s  %s\n' "$expected_sha" "$archive" | sha256sum -c - >/dev/null 2>&1; then
+        rm -rf -- "$temp_dir"
+        _error "Go 官方工具链 SHA-256 校验失败。"
+        return 1
+    fi
+    if ! tar -xzf "$archive" -C "$temp_dir" || [ ! -x "$temp_dir/go/bin/go" ]; then
+        rm -rf -- "$temp_dir"
+        _error "Go 官方工具链解压失败。"
+        return 1
+    fi
+    extracted_version=$(_go_version_for_bin "$temp_dir/go/bin/go")
+    if ! _version_at_least "$extracted_version" "$GO_MIN_VERSION"; then
+        rm -rf -- "$temp_dir"
+        _error "下载的 Go 版本不满足 ${GO_MIN_VERSION}+ 要求。"
+        return 1
+    fi
+
+    mkdir -p "$REALITL_SCANNER_DIR" || { rm -rf -- "$temp_dir"; return 1; }
+    if [ -e "$GO_TOOLCHAIN_DIR" ]; then
+        if [ ! -f "$GO_TOOLCHAIN_MARKER" ]; then
+            rm -rf -- "$temp_dir"
+            _error "${GO_TOOLCHAIN_DIR} 已存在且不属于本脚本，拒绝覆盖。"
+            return 1
+        fi
+        backup_dir="${GO_TOOLCHAIN_DIR}.old.$$"
+        mv "$GO_TOOLCHAIN_DIR" "$backup_dir" || { rm -rf -- "$temp_dir"; return 1; }
+    fi
+    new_dir="${temp_dir}/go"
+    if ! mv "$new_dir" "$GO_TOOLCHAIN_DIR"; then
+        [ -n "$backup_dir" ] && mv "$backup_dir" "$GO_TOOLCHAIN_DIR" 2>/dev/null || true
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    touch "$GO_TOOLCHAIN_MARKER"
+    [ -n "$backup_dir" ] && rm -rf -- "$backup_dir"
+    rm -rf -- "$temp_dir"
+    _success "已安装受本脚本隔离管理的 Go ${extracted_version}。"
+}
+
+_ensure_compatible_go() {
+    local go_bin current_version install_go
+    if go_bin=$(_find_compatible_go); then
+        printf '%s\n' "$go_bin"
+        return 0
+    fi
+    if command -v go >/dev/null 2>&1; then
+        current_version=$(_go_version_for_bin "$(command -v go)")
+        _warn "系统 Go ${current_version:-未知} 低于 RealiTLScanner 要求的 ${GO_MIN_VERSION}。"
+    else
+        _warn "未检测到 Go ${GO_MIN_VERSION}+。"
+    fi
+    read -r -p "是否从 go.dev 安装满足要求的官方 Go 工具链？[Y/n]: " install_go
+    if [[ "$install_go" == "n" || "$install_go" == "N" ]]; then
+        _warn "已取消 RealiTLScanner 安装。"
+        return 1
+    fi
+    _install_managed_go_toolchain || return 1
+    _find_compatible_go
+}
+
+_sb_nginx_running() {
+    [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null
+}
+
+_sb_reload_or_start_nginx() {
+    nginx -t || return 1
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        if systemctl is-active nginx >/dev/null 2>&1; then
+            systemctl reload nginx
+        else
+            systemctl enable --now nginx
+        fi
+    elif command -v rc-service >/dev/null 2>&1; then
+        if rc-service nginx status >/dev/null 2>&1; then rc-service nginx reload; else rc-service nginx start; fi
+    elif _sb_nginx_running; then
+        nginx -s reload
+    else
+        nginx
+    fi
+}
+
+_sb_backup_nginx_file() {
+    local target="$1" stamp
+    [ -f "$target" ] || return 0
+    mkdir -p "$NGINX_BACKUP_DIR" || return 1
+    chmod 700 "$NGINX_BACKUP_DIR" 2>/dev/null || true
+    stamp=$(date +%Y%m%d_%H%M%S)
+    cp -a -- "$target" "${NGINX_BACKUP_DIR}/$(basename "$target").${stamp}.$$"
+}
+
+_ensure_nginx_conf_d_include() {
+    [ -f "$NGINX_MAIN_CONF" ] || { _error "未找到 ${NGINX_MAIN_CONF}。"; return 1; }
+    grep -Eq '^[[:space:]]*include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' "$NGINX_MAIN_CONF" && return 0
+
+    local tmp rollback
+    tmp=$(mktemp) || return 1
+    rollback=$(mktemp) || { rm -f "$tmp"; return 1; }
+    cp -a -- "$NGINX_MAIN_CONF" "$rollback" || { rm -f "$tmp" "$rollback"; return 1; }
+    awk '
+        BEGIN {in_http=0; depth=0; inserted=0}
+        {
+            line=$0; opens=gsub(/\{/, "{", line); closes=gsub(/\}/, "}", line)
+            if (!in_http && $0 ~ /^[[:space:]]*http[[:space:]]*\{/) {in_http=1; depth=opens-closes; print; next}
+            if (in_http) {
+                if (depth==1 && $0 ~ /^[[:space:]]*}[[:space:]]*$/ && !inserted) {print "    include /etc/nginx/conf.d/*.conf;"; inserted=1}
+                depth += opens-closes; if (depth==0) in_http=0
+            }
+            print
+        }
+        END {if (!inserted) exit 12}
+    ' "$NGINX_MAIN_CONF" > "$tmp" || {
+        rm -f "$tmp" "$rollback"
+        _error "无法安全地向 nginx.conf 添加 conf.d include。"
+        return 1
+    }
+    _sb_backup_nginx_file "$NGINX_MAIN_CONF" || { rm -f "$tmp" "$rollback"; return 1; }
+    if ! cp -- "$tmp" "$NGINX_MAIN_CONF"; then
+        cp -a -- "$rollback" "$NGINX_MAIN_CONF" 2>/dev/null || true
+        rm -f "$tmp" "$rollback"
+        return 1
+    fi
+    rm -f "$tmp"
+    if ! nginx -t >/dev/null 2>&1; then
+        cp -a -- "$rollback" "$NGINX_MAIN_CONF"
+        rm -f "$rollback"
+        _error "添加 conf.d include 后 Nginx 测试失败，已回滚。"
+        return 1
+    fi
+    rm -f "$rollback"
+    _success "已向 nginx.conf 添加 ${NGINX_CONF_DIR}/*.conf。"
+}
+
+_install_managed_nginx_config() {
+    local source="$1" target="$2" marker="$3" rollback="" existed=false
+    if [ -e "$target" ]; then
+        if ! grep -Fqx "$marker" "$target" 2>/dev/null; then
+            _error "Nginx 配置已存在且不属于本脚本，拒绝覆盖: ${target}"
+            return 1
+        fi
+        existed=true
+        rollback=$(mktemp) || return 1
+        cp -a -- "$target" "$rollback" || { rm -f "$rollback"; return 1; }
+        _sb_backup_nginx_file "$target" || { rm -f "$rollback"; return 1; }
+    fi
+    if ! install -m 644 "$source" "$target"; then
+        if [ "$existed" = true ]; then cp -a -- "$rollback" "$target"; else rm -f -- "$target"; fi
+        [ -n "$rollback" ] && rm -f "$rollback"
+        return 1
+    fi
+    if ! _sb_reload_or_start_nginx; then
+        if [ "$existed" = true ]; then cp -a -- "$rollback" "$target"; else rm -f -- "$target"; fi
+        rm -f "$rollback"
+        _sb_reload_or_start_nginx >/dev/null 2>&1 || true
+        _error "Nginx 配置加载失败，已回滚: ${target}"
+        return 1
+    fi
+    [ -n "$rollback" ] && rm -f "$rollback"
+}
+
+_ensure_local_origin_dependencies() {
+    _info "正在安装/检查 Nginx 与证书依赖..."
+    if command -v apk >/dev/null 2>&1; then
+        _pkg_install nginx dcron || return 1
+    elif command -v apt-get >/dev/null 2>&1; then
+        _pkg_install nginx cron || return 1
+    else
+        _pkg_install nginx cronie || return 1
+    fi
+    command -v nginx >/dev/null 2>&1 || { _error "Nginx 安装失败。"; return 1; }
+    install -d -m 755 "$NGINX_CONF_DIR" "$NGINX_CERT_DIR" "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
+    install -d -m 700 "$NGINX_BACKUP_DIR" || return 1
+    _ensure_nginx_conf_d_include
+}
+
+_validate_local_origin_dns() {
+    local domain="$1" public_v4 public_v6 resolved_a resolved_aaaa ip local_v6=""
+    resolved_a=$(getent ahostsv4 "$domain" 2>/dev/null | awk '$2 == "STREAM" {print $1}' | sort -u)
+    resolved_aaaa=$(getent ahostsv6 "$domain" 2>/dev/null | awk '$2 == "STREAM" && $1 ~ /:/ && $1 !~ /^::ffff:/ {print tolower($1)}' | sort -u)
+    [ -n "$resolved_a$resolved_aaaa" ] || { _error "公共 DNS 尚未解析出 ${domain} 的 A/AAAA 记录。"; return 1; }
+
+    public_v4=$(timeout 8 curl -fsS4 --max-time 5 https://icanhazip.com 2>/dev/null | tr -d '\r\n ' || true)
+    public_v6=$(timeout 8 curl -fsS6 --max-time 5 https://icanhazip.com 2>/dev/null | tr -d '\r\n ' | tr '[:upper:]' '[:lower:]' || true)
+    if [ -n "$resolved_a" ]; then
+        _is_valid_ipv4 "$public_v4" || { _error "无法获取本机公网 IPv4，不能核对域名 A 记录。"; return 1; }
+        while read -r ip; do
+            [ -z "$ip" ] && continue
+            _is_cloudflare_ipv4 "$ip" && { _error "${domain} 的 A 记录 ${ip} 属于 Cloudflare；请改为 DNS only。"; return 1; }
+            [ "$ip" = "$public_v4" ] || { _error "${domain} 的 A 记录 ${ip} 未指向本机公网 IPv4 ${public_v4}。"; return 1; }
+        done <<< "$resolved_a"
+    fi
+    if [ -n "$resolved_aaaa" ]; then
+        if command -v ip >/dev/null 2>&1; then
+            local_v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print tolower($4)}' | sort -u)
+        fi
+        while read -r ip; do
+            [ -z "$ip" ] && continue
+            if ! printf '%s\n%s\n' "$local_v6" "$public_v6" | grep -Fxiq "$ip"; then
+                _error "${domain} 的 AAAA 记录 ${ip} 未指向本机；请修正或删除该 AAAA 记录。"
+                return 1
+            fi
+        done <<< "$resolved_aaaa"
+    fi
+    _success "域名 DNS 已确认直连本机（DNS only）。"
+}
+
+_install_sb_acme() {
+    local current_version archive extract_dir source_dir
+    if [ -x "$SB_ACME_SH" ]; then
+        current_version=$("$SB_ACME_SH" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | tail -n 1 || true)
+        if _version_at_least "$current_version" "$SB_ACME_VERSION"; then
+            "$SB_ACME_SH" --set-default-ca --server letsencrypt >/dev/null
+            return 0
+        fi
+        _warn "现有 acme.sh ${current_version:-未知} 过旧，将升级到 ${SB_ACME_VERSION}。"
+    fi
+
+    archive=$(mktemp) || return 1
+    extract_dir=$(mktemp -d /tmp/sb-acme-install.XXXXXX) || { rm -f "$archive"; return 1; }
+    _info "正在安装 acme.sh ${SB_ACME_VERSION}..."
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 "$SB_ACME_ARCHIVE_URL" -o "$archive" || \
+       ! printf '%s  %s\n' "$SB_ACME_ARCHIVE_SHA256" "$archive" | sha256sum -c - >/dev/null 2>&1 || \
+       ! tar -xzf "$archive" -C "$extract_dir"; then
+        rm -f "$archive"; rm -rf -- "$extract_dir"
+        _error "acme.sh 下载、校验或解压失败。"
+        return 1
+    fi
+    source_dir="${extract_dir}/acme.sh-${SB_ACME_VERSION}"
+    if [ ! -f "$source_dir/acme.sh" ] || ! (cd "$source_dir" && sh ./acme.sh --install --home "$SB_ACME_HOME" --nocron); then
+        rm -f "$archive"; rm -rf -- "$extract_dir"
+        _error "acme.sh 安装失败。"
+        return 1
+    fi
+    rm -f "$archive"; rm -rf -- "$extract_dir"
+    [ -x "$SB_ACME_SH" ] || return 1
+    "$SB_ACME_SH" --set-default-ca --server letsencrypt >/dev/null
+    touch "${SINGBOX_DIR}/.managed_acme"
+}
+
+_ensure_acme_renewal() {
+    local cron_file="/etc/cron.d/singbox-reality-acme" marker="# Managed by singbox-lite Reality ACME"
+    if ! { command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "$SB_ACME_SH"; } && \
+       ! grep -RqsF "$SB_ACME_SH" /etc/cron.d 2>/dev/null; then
+        if [ -e "$cron_file" ] && ! grep -Fqx "$marker" "$cron_file" 2>/dev/null; then
+            _error "续期任务文件已存在且不属于本脚本: ${cron_file}"
+            return 1
+        fi
+        local tmp
+        tmp=$(mktemp) || return 1
+        {
+            echo "$marker"
+            printf '23 3 * * * root "%s" --cron --home "%s" >/dev/null 2>&1\n' "$SB_ACME_SH" "$SB_ACME_HOME"
+        } > "$tmp"
+        install -m 644 "$tmp" "$cron_file" || { rm -f "$tmp"; return 1; }
+        rm -f "$tmp"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service dcron start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+        rc-update add dcron default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
+    fi
+}
+
+_acme_ecc_cert_is_usable() {
+    local domain="$1" info cert_path
+    [ -x "$SB_ACME_SH" ] || return 1
+    info=$("$SB_ACME_SH" --info -d "$domain" --ecc 2>/dev/null || true)
+    cert_path=$(printf '%s\n' "$info" | sed -n "s/^Le_RealFullChainPath='\(.*\)'$/\1/p" | head -n 1)
+    [ -n "$cert_path" ] && [ -s "$cert_path" ] && openssl x509 -in "$cert_path" -checkend 604800 -noout >/dev/null 2>&1
+}
+
+_acme_record_uses_webroot() {
+    local domain="$1" info
+    info=$("$SB_ACME_SH" --info -d "$domain" --ecc 2>/dev/null || true)
+    printf '%s\n' "$info" | grep -Fq "$ACME_WEBROOT"
+}
+
+_issue_local_origin_certificate() {
+    local domain="$1" cert_dir="${NGINX_CERT_DIR}/${domain}"
+    local -a force_args=()
+    if ! _acme_ecc_cert_is_usable "$domain" || ! _acme_record_uses_webroot "$domain"; then
+        if "$SB_ACME_SH" --info -d "$domain" --ecc >/dev/null 2>&1; then
+            force_args+=(--force)
+            _warn "现有证书续期方式不是本机 HTTP-01 webroot，将迁移为无 Token 的自动续期。"
+        fi
+        _info "正在通过 HTTP-01 webroot 申请 Let's Encrypt 证书: ${domain}"
+        "$SB_ACME_SH" --issue --server letsencrypt --webroot "$ACME_WEBROOT" \
+            -d "$domain" --keylength ec-256 "${force_args[@]}" || return 1
+    else
+        _info "检测到仍有效的现有 ECC 证书，将直接复用。"
+    fi
+    install -d -m 700 "$cert_dir" || return 1
+    "$SB_ACME_SH" --install-cert -d "$domain" --ecc \
+        --fullchain-file "$cert_dir/cert" \
+        --key-file "$cert_dir/key" \
+        --reloadcmd "$SB_ACME_RELOAD_CMD" || return 1
+    [ -s "$cert_dir/cert" ] && [ -s "$cert_dir/key" ] || return 1
+    chmod 600 "$cert_dir/cert" "$cert_dir/key" 2>/dev/null || true
+}
+
+_prepare_local_reality_origin() {
+    local domain="${1,,}" safe_domain challenge_conf origin_conf site_root tmp marker
+    _is_valid_reality_domain "$domain" || { _error "自有域名格式无效: ${domain}"; return 1; }
+    safe_domain="${domain//[^a-z0-9.-]/_}"
+    challenge_conf="${NGINX_CONF_DIR}/00-sb-reality-acme-${safe_domain}.conf"
+    origin_conf="${NGINX_CONF_DIR}/${safe_domain}.${REALITY_LOCAL_ORIGIN_PORT}.reality.conf"
+    site_root="/var/www/singbox-reality/${safe_domain}"
+
+    _validate_local_origin_dns "$domain" || return 1
+    _ensure_local_origin_dependencies || return 1
+
+    marker="# Generated by singbox-lite Reality local origin"
+    tmp=$(mktemp) || return 1
+    {
+        echo "$marker"
+        echo 'server {'
+        echo '    listen 0.0.0.0:80;'
+        if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = "0" ]; then
+            echo '    listen [::]:80;'
+        fi
+        echo "    server_name ${domain};"
+        echo '    location ^~ /.well-known/acme-challenge/ {'
+        echo "        root ${ACME_WEBROOT};"
+        echo '        default_type text/plain;'
+        echo '        try_files $uri =404;'
+        echo '    }'
+        echo '    location / { return 404; }'
+        echo '}'
+    } > "$tmp"
+    _install_managed_nginx_config "$tmp" "$challenge_conf" "$marker" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+
+    _install_sb_acme || return 1
+    _ensure_acme_renewal || return 1
+    _issue_local_origin_certificate "$domain" || return 1
+
+    install -d -m 755 "$site_root" || return 1
+    if [ ! -f "$site_root/index.html" ]; then
+        tmp=$(mktemp) || return 1
+        printf '%s\n' '<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body><h1>Welcome</h1></body></html>' > "$tmp"
+        install -m 644 "$tmp" "$site_root/index.html" || { rm -f "$tmp"; return 1; }
+        rm -f "$tmp"
+    fi
+
+    tmp=$(mktemp) || return 1
+    cat > "$tmp" <<EOF_REALITY_ORIGIN
+$marker
+server {
+    listen ${REALITY_LOCAL_ORIGIN_HOST}:${REALITY_LOCAL_ORIGIN_PORT} ssl http2;
+    server_name ${domain};
+
+    ssl_certificate ${NGINX_CERT_DIR}/${domain}/cert;
+    ssl_certificate_key ${NGINX_CERT_DIR}/${domain}/key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SBRealitySSL:10m;
+    ssl_session_timeout 1h;
+    server_tokens off;
+
+    root ${site_root};
+    index index.html;
+    location / { try_files \$uri \$uri/ =404; }
+}
+EOF_REALITY_ORIGIN
+    _install_managed_nginx_config "$tmp" "$origin_conf" "$marker" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+
+    if ! _probe_reality_target "$REALITY_LOCAL_ORIGIN_HOST" "$domain" "$REALITY_LOCAL_ORIGIN_PORT"; then
+        _error "本机 HTTPS 源站复核失败: ${REALITY_PROBE_ERROR}"
+        return 1
+    fi
+    _success "自有证书、本机 Nginx HTTPS 源站与自动续期已配置完成。"
+    _info "Reality SNI: ${domain} | 握手目标: ${REALITY_LOCAL_ORIGIN_HOST}:${REALITY_LOCAL_ORIGIN_PORT}"
+}
+
 _install_realitlscanner() {
     if [ -x "$REALITL_SCANNER_BIN" ] && [ -r "$REALITL_SCANNER_MARKER" ] && \
        [ "$(tr -d '\r\n ' < "$REALITL_SCANNER_MARKER")" = "$REALITL_SCANNER_COMMIT" ]; then
@@ -226,40 +692,17 @@ _install_realitlscanner() {
     fi
 
     _warn "RealiTLScanner 上游未发布可校验的二进制资产，首次扫描需从固定上游提交编译。"
-    if ! command -v go >/dev/null 2>&1; then
-        local install_go
-        read -r -p "未检测到 Go，是否安装编译依赖？[Y/n]: " install_go
-        if [[ "$install_go" == "n" || "$install_go" == "N" ]]; then
-            _warn "已取消 RealiTLScanner 安装。"
-            return 1
-        fi
-        _info "正在安装 Go 与 Git（仅用于编译扫描器）..."
-        if command -v apk >/dev/null 2>&1; then
-            _pkg_install go git || return 1
-        elif command -v apt-get >/dev/null 2>&1; then
-            _pkg_install golang-go git || return 1
-        else
-            _pkg_install golang git || return 1
-        fi
-    fi
-
-    local go_version go_major go_minor
-    go_version=$(go env GOVERSION 2>/dev/null | sed -E 's/^go//; s/(rc|beta).*//')
-    go_major="${go_version%%.*}"
-    go_minor="${go_version#*.}"; go_minor="${go_minor%%.*}"
-    if [[ ! "$go_major" =~ ^[0-9]+$ || ! "$go_minor" =~ ^[0-9]+$ ]] || \
-       [ "$go_major" -lt 1 ] || { [ "$go_major" -eq 1 ] && [ "$go_minor" -lt 21 ]; }; then
-        _error "RealiTLScanner 需要 Go 1.21+，当前版本: ${go_version:-未知}"
-        return 1
-    fi
+    local go_bin
+    go_bin=$(_ensure_compatible_go) || return 1
+    _pkg_install git || return 1
 
     local temp_dir candidate
     temp_dir=$(mktemp -d /tmp/sb-realitlscanner.XXXXXX) || return 1
     _info "正在编译 XTLS/RealiTLScanner@${REALITL_SCANNER_COMMIT:0:12}..."
-    if ! env GOBIN="$temp_dir" GOTOOLCHAIN=local go install \
+    if ! env GOBIN="$temp_dir" GOTOOLCHAIN=local "$go_bin" install \
         "github.com/xtls/RealiTLScanner@${REALITL_SCANNER_COMMIT}"; then
         _warn "Go 模块代理下载失败，尝试直连 GitHub..."
-        if ! env GOBIN="$temp_dir" GOTOOLCHAIN=local GOPROXY=direct go install \
+        if ! env GOBIN="$temp_dir" GOTOOLCHAIN=local GOPROXY=direct "$go_bin" install \
             "github.com/xtls/RealiTLScanner@${REALITL_SCANNER_COMMIT}"; then
             [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
             _error "RealiTLScanner 编译失败。"
@@ -284,7 +727,7 @@ _install_realitlscanner() {
 }
 
 _probe_reality_target() {
-    local target="$1" sni="$2" connect_target curl_result curl_headers curl_meta appconnect
+    local target="$1" sni="$2" target_port="${3:-443}" connect_target curl_result curl_headers curl_meta appconnect
     local tls_output
     REALITY_PROBE_ERROR=""
     REALITY_PROBE_LATENCY=""
@@ -294,8 +737,12 @@ _probe_reality_target() {
         REALITY_PROBE_ERROR="目标 IP 属于 Cloudflare 公开网段"
         return 1
     }
-    connect_target="${target}:443"
-    [[ "$target" == *:* ]] && connect_target="[${target}]:443"
+    [[ "$target_port" =~ ^[0-9]+$ ]] && [ "$target_port" -ge 1 ] && [ "$target_port" -le 65535 ] || {
+        REALITY_PROBE_ERROR="目标端口无效"
+        return 1
+    }
+    connect_target="${target}:${target_port}"
+    [[ "$target" == *:* ]] && connect_target="[${target}]:${target_port}"
     tls_output=$(timeout 7 openssl s_client -connect "$connect_target" -servername "$sni" \
         -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1) || true
     printf '%s' "$tls_output" | grep -q 'TLSv1.3' || {
@@ -312,9 +759,9 @@ _probe_reality_target() {
     }
 
     local curl_args=(-sS -I --noproxy '*' --connect-timeout 4 --max-time 8)
-    _is_valid_ipv4 "$target" && curl_args+=(--resolve "${sni}:443:${target}")
+    _is_valid_ipv4 "$target" && curl_args+=(--resolve "${sni}:${target_port}:${target}")
     curl_result=$(curl "${curl_args[@]}" -w $'\nSB_REALITY:%{http_code}\t%{time_appconnect}' \
-        "https://${sni}/" 2>/dev/null) || {
+        "https://${sni}:${target_port}/" 2>/dev/null) || {
         REALITY_PROBE_ERROR="HTTPS 请求失败"
         return 1
     }
@@ -432,19 +879,44 @@ _select_reality_sni() {
     echo "Reality 目标优先使用你自己控制的、真实可访问的 HTTPS 域名。"
     read -r -p "你是否有符合条件的自有域名？[y/N]: " own_domain_choice
     if [[ "$own_domain_choice" == "y" || "$own_domain_choice" == "Y" ]]; then
-        echo "  DNS/HTTPS 配置要求："
-        echo "  1) 为该域名配置 A/AAAA/CNAME，指向一个真实 HTTPS 源站。"
+        echo "  自有域名使用方式："
+        echo "  1) 单机自动模式：本机安装 Nginx、申请证书并配置自动续期（默认）"
+        echo "  2) 使用已经存在的独立 HTTPS 源站"
+        local own_mode own_domain
+        read -r -p "请选择 [1-2] (默认: 1): " own_mode
+        own_mode="${own_mode:-1}"
+        if [ "$own_mode" = "1" ]; then
+            echo "  单机自动模式要求："
+            echo "  1) 域名 A/AAAA 已指向本机，且使用 DNS only。"
+            echo "  2) 公网 TCP 80 可访问，用于 Let's Encrypt HTTP-01；不需要 Cloudflare Token。"
+            echo "  3) Nginx 仅在 127.0.0.1:${REALITY_LOCAL_ORIGIN_PORT} 提供 Reality HTTPS 源站。"
+            echo "  4) 若之后让 Emby Nginx 使用公网 443，Reality 节点请选择其他公网端口。"
+            read -r -p "请输入自有域名: " own_domain
+            own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
+            _is_valid_reality_domain "$own_domain" || { _error "自有域名格式无效。"; return 1; }
+            _prepare_local_reality_origin "$own_domain" || return 1
+            SELECTED_REALITY_SNI="$own_domain"
+            SELECTED_REALITY_HANDSHAKE_SERVER="$REALITY_LOCAL_ORIGIN_HOST"
+            SELECTED_REALITY_HANDSHAKE_PORT="$REALITY_LOCAL_ORIGIN_PORT"
+            return 0
+        elif [ "$own_mode" != "2" ]; then
+            _error "无效选择。"
+            return 1
+        fi
+
+        echo "  独立 HTTPS 源站要求："
+        echo "  1) A/AAAA/CNAME 指向另一个真实 HTTPS 源站。"
         echo "  2) 使用 DNS only，不要开启 Cloudflare 代理/CDN。"
-        echo "  3) 源站证书必须匹配该域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
-        echo "  4) 不要把它只指向当前 Reality 公网监听端口；连接 VPS 的域名应与 Reality SNI 分开。"
-        local own_domain
+        echo "  3) 证书匹配域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
+        echo "  4) 不要指向当前 Reality 公网监听端口，以免形成自连接回环。"
         read -r -p "请输入自有 Reality 目标域名: " own_domain
         own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
         if _is_valid_reality_domain "$own_domain" && _probe_reality_target "$own_domain" "$own_domain"; then
             SELECTED_REALITY_SNI="$own_domain"
             SELECTED_REALITY_HANDSHAKE_SERVER="$own_domain"
+            SELECTED_REALITY_HANDSHAKE_PORT=443
             _success "自有域名已通过 TLS/H2/跳转/Cloudflare 复核。"
-            _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:443"
+            _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
             return 0
         fi
         _warn "自有域名未通过复核：${REALITY_PROBE_ERROR:-域名格式无效}。将转入扫描/默认选择。"
@@ -480,12 +952,16 @@ _select_reality_sni() {
             [[ "$force_default" == "y" || "$force_default" == "Y" ]] || return 1
         fi
     fi
-    _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:443"
+    _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
 }
 
 _validate_reality_no_self_loop() {
-    local listen_port="$1" target="$2" public_ip target_ip
-    [ "$listen_port" = "443" ] || return 0
+    local listen_port="$1" target="$2" target_port="${3:-443}" public_ip target_ip
+    [ "$listen_port" = "$target_port" ] || return 0
+    if [[ "$target" == 127.* || "$target" == "::1" || "$target" == "localhost" ]]; then
+        _error "Reality 入站与本机握手目标同时使用 ${target_port}，会发生端口冲突或自连接回环。"
+        return 1
+    fi
     public_ip=$(_get_public_ip 2>/dev/null || true)
     _is_valid_ipv4 "$public_ip" || return 0
     if _is_valid_ipv4 "$target"; then
@@ -493,13 +969,13 @@ _validate_reality_no_self_loop() {
     else
         while read -r target_ip; do
             [ "$target_ip" = "$public_ip" ] && {
-                _error "Reality 握手目标 ${target}:443 解析回本机，与入站 443 形成自连接回环。"
+                _error "Reality 握手目标 ${target}:${target_port} 解析回本机，与入站 ${listen_port} 形成自连接回环。"
                 return 1
             }
         done < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
         return 0
     fi
-    _error "Reality 握手目标 ${target}:443 就是本机公网 IP，与入站 443 形成自连接回环。"
+    _error "Reality 握手目标 ${target}:${target_port} 就是本机公网 IP，与入站 ${listen_port} 形成自连接回环。"
     return 1
 }
 
@@ -2343,10 +2819,12 @@ _uninstall() {
     local managed_yq=false
     local managed_cloudflared=false
     local managed_realitlscanner=false
+    local managed_go_toolchain=false
     [ -f "${SINGBOX_DIR}/.managed_sing_box" ] && managed_sing_box=true
     [ -f "${SINGBOX_DIR}/.managed_yq" ] && managed_yq=true
     [ -f "${SINGBOX_DIR}/.managed_cloudflared" ] && managed_cloudflared=true
     [ -f "${SINGBOX_DIR}/.managed_realitlscanner" ] && managed_realitlscanner=true
+    [ -f "$GO_TOOLCHAIN_MARKER" ] && managed_go_toolchain=true
 
     _warning "！！！警告！！！"
     _warning "本操作将停止并禁用 [主脚本] 服务 (sing-box)，"
@@ -2359,6 +2837,8 @@ _uninstall() {
     [ "$managed_yq" = true ] && echo -e "  ${RED}-${NC} 本脚本安装的 yq: ${YQ_BINARY}"
     [ "$managed_cloudflared" = true ] && echo -e "  ${RED}-${NC} 本脚本安装的 cloudflared: ${CLOUDFLARED_BIN}"
     [ "$managed_realitlscanner" = true ] && echo -e "  ${RED}-${NC} 本脚本编译的 RealiTLScanner: ${REALITL_SCANNER_BIN}"
+    [ "$managed_go_toolchain" = true ] && echo -e "  ${RED}-${NC} RealiTLScanner 专用 Go 工具链: ${GO_TOOLCHAIN_DIR}"
+    echo -e "  ${YELLOW}!${NC} Nginx、证书和 ACME 续期任务将保留，避免影响同机 Emby 反代。"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
@@ -2400,8 +2880,11 @@ _uninstall() {
     fi
     if [ "$managed_realitlscanner" = true ]; then
         rm -f "$REALITL_SCANNER_BIN" "$REALITL_SCANNER_MARKER"
-        rmdir "$REALITL_SCANNER_DIR" 2>/dev/null || true
     fi
+    if [ "$managed_go_toolchain" = true ] && [ "$GO_TOOLCHAIN_DIR" = "/usr/local/lib/singbox-lite/go-toolchain" ]; then
+        rm -rf -- "$GO_TOOLCHAIN_DIR"
+    fi
+    rmdir "$REALITL_SCANNER_DIR" 2>/dev/null || true
 
     # 4. 清理别名；不删除脚本目录外的同名文件。
     _info "正在清理周边环境..."
@@ -3582,6 +4065,7 @@ _create_anyreality_node() {
     local password="$4"
     local name="$5"
     local handshake_server="${6:-$server_name}"
+    local handshake_port="${7:-443}"
     local tag="any-reality-in-${port}"
 
     local keypair private_key public_key short_id
@@ -3596,6 +4080,7 @@ _create_anyreality_node() {
         --arg pw "$password" \
         --arg sn "$server_name" \
         --arg hs "$handshake_server" \
+        --arg hp "$handshake_port" \
         --arg pk "$private_key" \
         --arg sid "$short_id" \
         '{
@@ -3612,7 +4097,7 @@ _create_anyreality_node() {
                     "enabled": true,
                     "handshake": {
                         "server": $hs,
-                        "server_port": 443
+                        "server_port": ($hp|tonumber)
                     },
                     "private_key": $pk,
                     "short_id": [$sid]
@@ -3631,11 +4116,12 @@ _create_anyreality_node() {
         --arg type "any-reality" \
         --arg sn "$server_name" \
         --arg hs "$handshake_server" \
+        --arg hp "$handshake_port" \
         --arg pub "$public_key" \
         --arg sid "$short_id" \
         --arg link "$share_link" \
         --arg n "$name" \
-        '{type:$type, name:$n, server_name:$sn, handshake_server:$hs, publicKey:$pub, shortId:$sid, share_link:$link, yaml:false}')
+        '{type:$type, name:$n, server_name:$sn, handshake_server:$hs, handshake_port:($hp|tonumber), publicKey:$pub, shortId:$sid, share_link:$link, yaml:false}')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
 
     _success "Any-Reality 节点 [${name}] 添加成功!"
@@ -3649,12 +4135,14 @@ _add_anytls() {
     local port=""
     local server_name="$DEFAULT_SNI"
     local reality_handshake_server="$DEFAULT_REALITY_SNI"
+    local reality_handshake_port=443
     local mode_choice="1"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
         server_name="${BATCH_SNI:-$DEFAULT_SNI}"
         reality_handshake_server="${BATCH_REALITY_HANDSHAKE_SERVER:-${BATCH_SNI:-$DEFAULT_REALITY_SNI}}"
+        reality_handshake_port="${BATCH_REALITY_HANDSHAKE_PORT:-443}"
         mode_choice="${BATCH_ANYTLS_MODE:-1}"
     else
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
@@ -3690,6 +4178,7 @@ _add_anytls() {
             _select_reality_sni || return 1
             server_name="$SELECTED_REALITY_SNI"
             reality_handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
+            reality_handshake_port="$SELECTED_REALITY_HANDSHAKE_PORT"
         else
             read -p "请输入 AnyTLS 伪装域名/SNI (默认: ${DEFAULT_SNI}): " camouflage_domain
             server_name=${camouflage_domain:-$DEFAULT_SNI}
@@ -3727,8 +4216,8 @@ _add_anytls() {
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
-            _validate_reality_no_self_loop "$port" "$reality_handshake_server" || return 1
-            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_handshake_server" || return 1
+            _validate_reality_no_self_loop "$port" "$reality_handshake_server" "$reality_handshake_port" || return 1
+            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_handshake_server" "$reality_handshake_port" || return 1
             created=true
             ;;
         1,2|2,1|"1 2"|"2 1")
@@ -3747,9 +4236,9 @@ _add_anytls() {
                 read -p "请输入 Any-Reality 节点名称 (默认: ${default_reality_name}): " custom_reality_name
                 reality_name=${custom_reality_name:-$default_reality_name}
             fi
-            _validate_reality_no_self_loop "$reality_port" "$reality_handshake_server" || return 1
+            _validate_reality_no_self_loop "$reality_port" "$reality_handshake_server" "$reality_handshake_port" || return 1
             _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" || return 1
-            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_handshake_server" || return 1
+            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_handshake_server" "$reality_handshake_port" || return 1
             created=true
             ;;
     esac
@@ -3763,6 +4252,7 @@ _add_vless_reality() {
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local server_name="$DEFAULT_REALITY_SNI"
     local handshake_server="$DEFAULT_REALITY_SNI"
+    local handshake_port=443
     local port=""
     local name=""
 
@@ -3772,6 +4262,7 @@ _add_vless_reality() {
         server_name=$(echo "${BATCH_SNI}" | xargs)
         [[ -z "$server_name" ]] && server_name="$DEFAULT_REALITY_SNI"
         handshake_server="${BATCH_REALITY_HANDSHAKE_SERVER:-$server_name}"
+        handshake_port="${BATCH_REALITY_HANDSHAKE_PORT:-443}"
         name="Batch-Reality-${port}"
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
@@ -3781,6 +4272,7 @@ _add_vless_reality() {
         _select_reality_sni || return 1
         server_name="$SELECTED_REALITY_SNI"
         handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
+        handshake_port="$SELECTED_REALITY_HANDSHAKE_PORT"
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -3798,15 +4290,15 @@ _add_vless_reality() {
     local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
     local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
     local tag="vless-in-${port}"
-    _validate_reality_no_self_loop "$port" "$handshake_server" || return 1
+    _validate_reality_no_self_loop "$port" "$handshake_server" "$handshake_port" || return 1
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg hs "$handshake_server" --arg pk "$private_key" --arg sid "$short_id" \
-        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg hs "$handshake_server" --arg hp "$handshake_port" --arg pk "$private_key" --arg sid "$short_id" \
+        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":($hp|tonumber)},"private_key":$pk,"short_id":[$sid]}}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\", \"handshakeServer\": \"$handshake_server\"}}" || return 1
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\", \"handshakeServer\": \"$handshake_server\", \"handshakePort\": $handshake_port}}" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"firefox","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
@@ -5833,12 +6325,15 @@ _batch_create_nodes() {
     # 2.1 SNI 收集 (强制净化处理)
     export BATCH_SNI="$DEFAULT_SNI"
     export BATCH_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
+    export BATCH_REALITY_HANDSHAKE_PORT=443
     if [ "$has_reality" = true ]; then
         _select_reality_sni || return 1
         BATCH_SNI="$SELECTED_REALITY_SNI"
         BATCH_REALITY_HANDSHAKE_SERVER="$SELECTED_REALITY_HANDSHAKE_SERVER"
+        BATCH_REALITY_HANDSHAKE_PORT="$SELECTED_REALITY_HANDSHAKE_PORT"
         export BATCH_SNI
         export BATCH_REALITY_HANDSHAKE_SERVER
+        export BATCH_REALITY_HANDSHAKE_PORT
     elif [ "$has_sni_req" = true ]; then
         read -p "请输入统一伪装域名 (SNI) [默认: $BATCH_SNI]: " input_sni
         input_sni=$(echo "$input_sni" | xargs)
@@ -5971,7 +6466,7 @@ _batch_create_nodes() {
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_REALITY_HANDSHAKE_SERVER BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_REALITY_HANDSHAKE_SERVER BATCH_REALITY_HANDSHAKE_PORT BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
@@ -6154,6 +6649,15 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 _check_root
                 mkdir -p "$SINGBOX_DIR"
                 _install_realitlscanner
+                exit $?
+                ;;
+            install-reality-origin)
+                _check_root
+                local_origin_domain="${2:-}"
+                [ -n "$local_origin_domain" ] || { _error "缺少自有域名参数。"; exit 1; }
+                mkdir -p "$SINGBOX_DIR"
+                _install_dependencies
+                _prepare_local_reality_origin "$local_origin_domain"
                 exit $?
                 ;;
             *)

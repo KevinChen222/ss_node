@@ -11,6 +11,8 @@ GITHUB_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
 DEFAULT_SNI="www.icloud.com"
 DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 DEFAULT_FINGERPRINT="firefox"
+REALITY_LOCAL_ORIGIN_HOST="127.0.0.1"
+REALITY_LOCAL_ORIGIN_PORT=8443
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
@@ -196,8 +198,18 @@ _install_realitlscanner() {
     bash /usr/local/bin/sb install-realitlscanner
 }
 
+_prepare_local_reality_origin() {
+    local domain="$1"
+    if [ ! -x /usr/local/bin/sb ]; then
+        _error "找不到 /usr/local/bin/sb，无法安全配置自有证书与本机 Nginx 源站。"
+        _warn "请先安装/更新同仓库的 sb.sh。"
+        return 1
+    fi
+    bash /usr/local/bin/sb install-reality-origin "$domain"
+}
+
 _probe_reality_target() {
-    local target="$1" sni="$2" connect_target curl_result curl_headers curl_meta appconnect
+    local target="$1" sni="$2" target_port="${3:-443}" connect_target curl_result curl_headers curl_meta appconnect
     local tls_output
     REALITY_PROBE_ERROR=""
     REALITY_PROBE_LATENCY=""
@@ -207,8 +219,12 @@ _probe_reality_target() {
         REALITY_PROBE_ERROR="目标 IP 属于 Cloudflare 公开网段"
         return 1
     }
-    connect_target="${target}:443"
-    [[ "$target" == *:* ]] && connect_target="[${target}]:443"
+    [[ "$target_port" =~ ^[0-9]+$ ]] && [ "$target_port" -ge 1 ] && [ "$target_port" -le 65535 ] || {
+        REALITY_PROBE_ERROR="目标端口无效"
+        return 1
+    }
+    connect_target="${target}:${target_port}"
+    [[ "$target" == *:* ]] && connect_target="[${target}]:${target_port}"
     tls_output=$(timeout 7 openssl s_client -connect "$connect_target" -servername "$sni" \
         -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1) || true
     printf '%s' "$tls_output" | grep -q 'TLSv1.3' || {
@@ -225,9 +241,9 @@ _probe_reality_target() {
     }
 
     local curl_args=(-sS -I --noproxy '*' --connect-timeout 4 --max-time 8)
-    _is_valid_ipv4 "$target" && curl_args+=(--resolve "${sni}:443:${target}")
+    _is_valid_ipv4 "$target" && curl_args+=(--resolve "${sni}:${target_port}:${target}")
     curl_result=$(curl "${curl_args[@]}" -w $'\nSB_REALITY:%{http_code}\t%{time_appconnect}' \
-        "https://${sni}/" 2>/dev/null) || {
+        "https://${sni}:${target_port}/" 2>/dev/null) || {
         REALITY_PROBE_ERROR="HTTPS 请求失败"
         return 1
     }
@@ -345,19 +361,44 @@ _select_reality_sni() {
     echo "Reality 目标优先使用你自己控制的、真实可访问的 HTTPS 域名。"
     read -r -p "你是否有符合条件的自有域名？[y/N]: " own_domain_choice
     if [[ "$own_domain_choice" == "y" || "$own_domain_choice" == "Y" ]]; then
-        echo "  DNS/HTTPS 配置要求："
-        echo "  1) 为该域名配置 A/AAAA/CNAME，指向一个真实 HTTPS 源站。"
+        echo "  自有域名使用方式："
+        echo "  1) 单机自动模式：本机安装 Nginx、申请证书并配置自动续期（默认）"
+        echo "  2) 使用已经存在的独立 HTTPS 源站"
+        local own_mode own_domain
+        read -r -p "请选择 [1-2] (默认: 1): " own_mode
+        own_mode="${own_mode:-1}"
+        if [ "$own_mode" = "1" ]; then
+            echo "  单机自动模式要求："
+            echo "  1) 域名 A/AAAA 已指向本机，且使用 DNS only。"
+            echo "  2) 公网 TCP 80 可访问，用于 Let's Encrypt HTTP-01；不需要 Cloudflare Token。"
+            echo "  3) Nginx 仅在 127.0.0.1:${REALITY_LOCAL_ORIGIN_PORT} 提供 Reality HTTPS 源站。"
+            echo "  4) 若之后让 Emby Nginx 使用公网 443，Reality 节点请选择其他公网端口。"
+            read -r -p "请输入自有域名: " own_domain
+            own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
+            _is_valid_reality_domain "$own_domain" || { _error "自有域名格式无效。"; return 1; }
+            _prepare_local_reality_origin "$own_domain" || return 1
+            SELECTED_REALITY_SNI="$own_domain"
+            SELECTED_REALITY_HANDSHAKE_SERVER="$REALITY_LOCAL_ORIGIN_HOST"
+            SELECTED_REALITY_HANDSHAKE_PORT="$REALITY_LOCAL_ORIGIN_PORT"
+            return 0
+        elif [ "$own_mode" != "2" ]; then
+            _error "无效选择。"
+            return 1
+        fi
+
+        echo "  独立 HTTPS 源站要求："
+        echo "  1) A/AAAA/CNAME 指向另一个真实 HTTPS 源站。"
         echo "  2) 使用 DNS only，不要开启 Cloudflare 代理/CDN。"
-        echo "  3) 源站证书必须匹配该域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
-        echo "  4) 不要把它只指向当前 Reality 公网监听端口；连接 VPS 的域名应与 Reality SNI 分开。"
-        local own_domain
+        echo "  3) 证书匹配域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
+        echo "  4) 不要指向当前 Reality 公网监听端口，以免形成自连接回环。"
         read -r -p "请输入自有 Reality 目标域名: " own_domain
         own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
         if _is_valid_reality_domain "$own_domain" && _probe_reality_target "$own_domain" "$own_domain"; then
             SELECTED_REALITY_SNI="$own_domain"
             SELECTED_REALITY_HANDSHAKE_SERVER="$own_domain"
+            SELECTED_REALITY_HANDSHAKE_PORT=443
             _success "自有域名已通过 TLS/H2/跳转/Cloudflare 复核。"
-            _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:443"
+            _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
             return 0
         fi
         _warn "自有域名未通过复核：${REALITY_PROBE_ERROR:-域名格式无效}。将转入扫描/默认选择。"
@@ -393,12 +434,16 @@ _select_reality_sni() {
             [[ "$force_default" == "y" || "$force_default" == "Y" ]] || return 1
         fi
     fi
-    _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:443"
+    _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
 }
 
 _validate_reality_no_self_loop() {
-    local listen_port="$1" target="$2" public_ip target_ip
-    [ "$listen_port" = "443" ] || return 0
+    local listen_port="$1" target="$2" target_port="${3:-443}" public_ip target_ip
+    [ "$listen_port" = "$target_port" ] || return 0
+    if [[ "$target" == 127.* || "$target" == "::1" || "$target" == "localhost" ]]; then
+        _error "Reality 入站与本机握手目标同时使用 ${target_port}，会发生端口冲突或自连接回环。"
+        return 1
+    fi
     public_ip=$(_get_public_ip 2>/dev/null || true)
     _is_valid_ipv4 "$public_ip" || return 0
     if _is_valid_ipv4 "$target"; then
@@ -406,13 +451,13 @@ _validate_reality_no_self_loop() {
     else
         while read -r target_ip; do
             [ "$target_ip" = "$public_ip" ] && {
-                _error "Reality 握手目标 ${target}:443 解析回本机，与入站 443 形成自连接回环。"
+                _error "Reality 握手目标 ${target}:${target_port} 解析回本机，与入站 ${listen_port} 形成自连接回环。"
                 return 1
             }
         done < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
         return 0
     fi
-    _error "Reality 握手目标 ${target}:443 就是本机公网 IP，与入站 443 形成自连接回环。"
+    _error "Reality 握手目标 ${target}:${target_port} 就是本机公网 IP，与入站 ${listen_port} 形成自连接回环。"
     return 1
 }
 
@@ -1443,10 +1488,12 @@ _finalize_relay_setup() {
     
     local entrance_sni="$DEFAULT_SNI"
     local entrance_handshake_server="$DEFAULT_REALITY_SNI"
+    local entrance_handshake_port=443
     if [ "$relay_type" == "vless-reality" ]; then
         _select_reality_sni || return 1
         entrance_sni="$SELECTED_REALITY_SNI"
         entrance_handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
+        entrance_handshake_port="$SELECTED_REALITY_HANDSHAKE_PORT"
     else
         read -p "  请输入中转机入口 SNI (回车默认 ${DEFAULT_SNI}): " entrance_sni
         [[ -z "$entrance_sni" ]] && entrance_sni="$DEFAULT_SNI"
@@ -1492,7 +1539,7 @@ _finalize_relay_setup() {
     local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
     
     if [ "$relay_type" == "vless-reality" ]; then
-        _validate_reality_no_self_loop "$listen_port" "$entrance_handshake_server" || return 1
+        _validate_reality_no_self_loop "$listen_port" "$entrance_handshake_server" "$entrance_handshake_port" || return 1
         local uuid=$($SINGBOX_BIN generate uuid)
         keypair=$($SINGBOX_BIN generate reality-keypair)
         local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
@@ -1502,8 +1549,8 @@ _finalize_relay_setup() {
         # 默认开启 XTLS-Vision 流控
         local flow="xtls-rprx-vision"
 
-        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg hs "$entrance_handshake_server" --arg pk "$pk" --arg sid "$sid" \
-            '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+        inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg hs "$entrance_handshake_server" --arg hp "$entrance_handshake_port" --arg pk "$pk" --arg sid "$sid" \
+            '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":($hp|tonumber)},"private_key":$pk,"short_id":[$sid]}}}')
              
         link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=${DEFAULT_FINGERPRINT}&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
@@ -3250,7 +3297,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║           (v16-kevin.2)               ║"
+    echo "  ║           (v16-kevin.3)               ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
