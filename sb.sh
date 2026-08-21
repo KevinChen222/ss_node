@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.7"
+export SCRIPT_VERSION="20-kevin.9"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -15,7 +15,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="4b57b7dd77fe413218f26977d190a640b95ce5cd35593593fb026a4a016664dd"
+ADVANCED_RELAY_SHA256="d345f722a28ed82622880e20acfc758660dd644a4f4d58f93620ca3eaa4cf96f"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
@@ -42,6 +42,18 @@ SB_ACME_VERSION="3.1.2"
 SB_ACME_ARCHIVE_SHA256="a51511ad0e2912be45125cf189401e4ae776ca1a29d5768f020a1e35a9560186"
 SB_ACME_ARCHIVE_URL="https://github.com/acmesh-official/acme.sh/archive/refs/tags/${SB_ACME_VERSION}.tar.gz"
 SB_ACME_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
+
+# HAProxy SNI 共享入口。HAProxy 只负责 TCP ClientHello 分流，不终止 TLS。
+SNI_ROUTER_API_VERSION=1
+SNI_ROUTER_PUBLIC_PORT=443
+SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
+SNI_ROUTER_HTTPS_BACKEND_PORT=8444
+SNI_ROUTER_STATE_DIR="${SNI_ROUTER_STATE_DIR:-/var/lib/sb-sni-router}"
+SNI_ROUTER_STATE_FILE="${SNI_ROUTER_STATE_FILE:-${SNI_ROUTER_STATE_DIR}/state.json}"
+SNI_ROUTER_LOCK_FILE="${SNI_ROUTER_LOCK_FILE:-/run/lock/sb-sni-router.lock}"
+SNI_ROUTER_HAPROXY_CONF="${SNI_ROUTER_HAPROXY_CONF:-/etc/haproxy/haproxy.cfg}"
+SNI_ROUTER_HAPROXY_BACKUP_DIR="${SNI_ROUTER_HAPROXY_BACKUP_DIR:-/etc/haproxy/backup}"
+SNI_ROUTER_MARKER="# Managed by singbox-lite SNI router"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -890,7 +902,7 @@ _select_reality_sni() {
             echo "  1) 域名 A/AAAA 已指向本机，且使用 DNS only。"
             echo "  2) 公网 TCP 80 可访问，用于 Let's Encrypt HTTP-01；不需要 Cloudflare Token。"
             echo "  3) Nginx 仅在 127.0.0.1:${REALITY_LOCAL_ORIGIN_PORT} 提供 Reality HTTPS 源站。"
-            echo "  4) 若之后让 Emby Nginx 使用公网 443，Reality 节点请选择其他公网端口。"
+            echo "  4) 若 Reality 与 Emby 都使用公网 443，请启用 HAProxy SNI 分流，并确保两个域名不同。"
             read -r -p "请输入自有域名: " own_domain
             own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
             _is_valid_reality_domain "$own_domain" || { _error "自有域名格式无效。"; return 1; }
@@ -1327,6 +1339,374 @@ _pkg_install() {
     fi
 }
 
+# --- HAProxy TCP/443 SNI 共享入口 ---
+
+_sni_router_require_systemd() {
+    _detect_init_system
+    if [ "$INIT_SYSTEM" != "systemd" ]; then
+        _error "HAProxy SNI 共享入口当前仅支持 systemd。"
+        return 1
+    fi
+}
+
+_sni_router_lock() {
+    command -v flock >/dev/null 2>&1 || _pkg_install util-linux || return 1
+    mkdir -p "$(dirname "$SNI_ROUTER_LOCK_FILE")" || return 1
+    exec 9>"$SNI_ROUTER_LOCK_FILE"
+    flock -x 9
+}
+
+_sni_router_init_state() {
+    mkdir -p "$SNI_ROUTER_STATE_DIR" || return 1
+    chmod 700 "$SNI_ROUTER_STATE_DIR" 2>/dev/null || true
+    if [ ! -s "$SNI_ROUTER_STATE_FILE" ]; then
+        local tmp
+        tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || return 1
+        jq -n --argjson version "$SNI_ROUTER_API_VERSION" --argjson port "$SNI_ROUTER_PUBLIC_PORT" \
+            '{version:$version,public_port:$port,reality:null,https_backend:null,https_routes:{}}' > "$tmp" || {
+            rm -f "$tmp"
+            return 1
+        }
+        chmod 600 "$tmp"
+        mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    fi
+    if ! jq -e --argjson version "$SNI_ROUTER_API_VERSION" \
+        '.version == $version and (.https_routes | type == "object")' \
+        "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+        _error "SNI 路由状态版本不兼容: ${SNI_ROUTER_STATE_FILE}"
+        return 1
+    fi
+}
+
+_sni_router_state_has_routes() {
+    jq -e '(.reality != null) or ((.https_routes | length) > 0)' \
+        "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1
+}
+
+_sni_router_validate_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+_sni_router_allocate_backend_port() {
+    local preferred="${1:-$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT}" port
+    _sni_router_validate_port "$preferred" || return 1
+    for ((port=preferred; port<=preferred+99 && port<=65535; port++)); do
+        [ "$port" -eq "$REALITY_LOCAL_ORIGIN_PORT" ] && continue
+        [ "$port" -eq "$SNI_ROUTER_HTTPS_BACKEND_PORT" ] && continue
+        if [ -f "$CONFIG_FILE" ] && jq -e --argjson p "$port" \
+            '.inbounds[]? | select(.listen_port == $p)' "$CONFIG_FILE" >/dev/null 2>&1; then
+            continue
+        fi
+        if [ -f "${SINGBOX_DIR}/relay.json" ] && jq -e --argjson p "$port" \
+            '.inbounds[]? | select(.listen_port == $p)' "${SINGBOX_DIR}/relay.json" >/dev/null 2>&1; then
+            continue
+        fi
+        _check_port_occupied "$port" tcp && continue
+        printf '%s\n' "$port"
+        return 0
+    done
+    _error "未找到可用的 Reality 回环后端端口。"
+    return 1
+}
+
+_sni_router_prepare_haproxy() {
+    _sni_router_require_systemd || return 1
+    if ! command -v haproxy >/dev/null 2>&1; then
+        _info "正在安装 HAProxy（仅用于 TCP/443 SNI 分流）..."
+        _pkg_install haproxy util-linux || {
+            _error "HAProxy 安装失败。"
+            return 1
+        }
+    fi
+
+    mkdir -p "$(dirname "$SNI_ROUTER_HAPROXY_CONF")" "$SNI_ROUTER_HAPROXY_BACKUP_DIR" || return 1
+    chmod 700 "$SNI_ROUTER_HAPROXY_BACKUP_DIR" 2>/dev/null || true
+    if [ -f "$SNI_ROUTER_HAPROXY_CONF" ] && ! grep -Fq "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF"; then
+        if grep -Eq '^[[:space:]]*(frontend|listen)[[:space:]]' "$SNI_ROUTER_HAPROXY_CONF"; then
+            _error "检测到非 sb.sh 管理的 HAProxy 前端，拒绝覆盖: ${SNI_ROUTER_HAPROXY_CONF}"
+            _error "请先手动整合现有 HAProxy 配置。"
+            return 1
+        fi
+        cp -a -- "$SNI_ROUTER_HAPROXY_CONF" \
+            "${SNI_ROUTER_HAPROXY_BACKUP_DIR}/haproxy.cfg.$(date +%Y%m%d_%H%M%S).$$" || return 1
+        systemctl stop haproxy >/dev/null 2>&1 || true
+    fi
+}
+
+_sni_router_generate_haproxy_config() {
+    local output="$1" public_port reality_host reality_port https_host https_port
+    public_port=$(jq -r '.public_port' "$SNI_ROUTER_STATE_FILE")
+    reality_host=$(jq -r '.reality.backend_host // empty' "$SNI_ROUTER_STATE_FILE")
+    reality_port=$(jq -r '.reality.backend_port // empty' "$SNI_ROUTER_STATE_FILE")
+    https_host=$(jq -r '.https_backend.host // empty' "$SNI_ROUTER_STATE_FILE")
+    https_port=$(jq -r '.https_backend.port // empty' "$SNI_ROUTER_STATE_FILE")
+
+    {
+        echo "$SNI_ROUTER_MARKER"
+        echo '# TLS remains end-to-end; HAProxy only inspects ClientHello SNI.'
+        cat <<'EOF_HAPROXY_GLOBAL'
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    user haproxy
+    group haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 1h
+    timeout server 1h
+
+frontend sb_sni_443
+EOF_HAPROXY_GLOBAL
+        echo "    bind 0.0.0.0:${public_port}"
+        if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && \
+           [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "0" ]; then
+            echo "    bind [::]:${public_port} v6only"
+        fi
+        cat <<'EOF_HAPROXY_INSPECT'
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+EOF_HAPROXY_INSPECT
+
+        local domain route_count=0
+        while IFS= read -r domain; do
+            [ -n "$domain" ] || continue
+            echo "    acl sb_https_${route_count} req.ssl_sni -i ${domain}"
+            echo "    use_backend sb_https_backend if sb_https_${route_count}"
+            route_count=$((route_count + 1))
+        done < <(jq -r '.https_routes | keys[]?' "$SNI_ROUTER_STATE_FILE")
+
+        if [ -n "$reality_host" ] && [ -n "$reality_port" ]; then
+            echo '    default_backend sb_reality_backend'
+        elif [ "$route_count" -gt 0 ]; then
+            local conditions=""
+            local i
+            for ((i=0; i<route_count; i++)); do conditions="${conditions} !sb_https_${i}"; done
+            echo "    tcp-request content reject if${conditions}"
+        fi
+
+        if [ "$route_count" -gt 0 ]; then
+            cat <<EOF_HAPROXY_HTTPS
+
+backend sb_https_backend
+    server nginx ${https_host}:${https_port} send-proxy-v2 check
+EOF_HAPROXY_HTTPS
+        fi
+        if [ -n "$reality_host" ] && [ -n "$reality_port" ]; then
+            cat <<EOF_HAPROXY_REALITY
+
+backend sb_reality_backend
+    server singbox ${reality_host}:${reality_port} check
+EOF_HAPROXY_REALITY
+        fi
+    } > "$output"
+}
+
+_sni_router_apply() {
+    _sni_router_init_state || return 1
+    if ! _sni_router_state_has_routes; then
+        if [ -f "$SNI_ROUTER_HAPROXY_CONF" ] && grep -Fq "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF"; then
+            systemctl disable --now haproxy >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+    _sni_router_prepare_haproxy || return 1
+
+    local new_conf old_conf had_old=no
+    new_conf=$(mktemp) || return 1
+    old_conf=$(mktemp) || { rm -f "$new_conf"; return 1; }
+    _sni_router_generate_haproxy_config "$new_conf" || { rm -f "$new_conf" "$old_conf"; return 1; }
+    if ! haproxy -c -f "$new_conf"; then
+        _error "HAProxy 配置验证失败，未安装新配置。"
+        rm -f "$new_conf" "$old_conf"
+        return 1
+    fi
+    if [ -f "$SNI_ROUTER_HAPROXY_CONF" ]; then
+        cp -a -- "$SNI_ROUTER_HAPROXY_CONF" "$old_conf" || { rm -f "$new_conf" "$old_conf"; return 1; }
+        had_old=yes
+    fi
+    install -m 640 "$new_conf" "${SNI_ROUTER_HAPROXY_CONF}.new" || { rm -f "$new_conf" "$old_conf"; return 1; }
+    mv "${SNI_ROUTER_HAPROXY_CONF}.new" "$SNI_ROUTER_HAPROXY_CONF" || { rm -f "$new_conf" "$old_conf"; return 1; }
+    rm -f "$new_conf"
+
+    systemctl enable haproxy >/dev/null 2>&1 || true
+    if systemctl is-active haproxy >/dev/null 2>&1; then
+        systemctl reload haproxy
+    else
+        systemctl start haproxy
+    fi
+    if [ $? -ne 0 ]; then
+        _error "HAProxy 加载失败，正在恢复上一份配置。"
+        if [ "$had_old" = yes ]; then
+            cp -a -- "$old_conf" "$SNI_ROUTER_HAPROXY_CONF"
+            systemctl restart haproxy >/dev/null 2>&1 || true
+        else
+            rm -f "$SNI_ROUTER_HAPROXY_CONF"
+            systemctl stop haproxy >/dev/null 2>&1 || true
+        fi
+        rm -f "$old_conf"
+        return 1
+    fi
+    rm -f "$old_conf"
+    return 0
+}
+
+_sni_router_restore_state() {
+    local backup="$1"
+    cp -a -- "$backup" "$SNI_ROUTER_STATE_FILE"
+    _sni_router_apply >/dev/null 2>&1 || true
+}
+
+_sni_router_register_reality() {
+    local owner="$1" tag="$2" sni="$3" backend_port="$4"
+    _is_valid_reality_domain "$sni" || { _error "Reality SNI 格式无效: ${sni}"; return 1; }
+    _sni_router_validate_port "$backend_port" || { _error "Reality 后端端口无效。"; return 1; }
+    _sni_router_lock || return 1
+    _sni_router_init_state || return 1
+    local existing conflicting_https backup tmp
+    existing=$(jq -r '.reality.tag // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$existing" ] && [ "$existing" != "$tag" ]; then
+        _error "公网 443 已登记 Reality 后端: ${existing}。一个 443 入口只能指定一个默认 Reality 后端。"
+        return 1
+    fi
+    conflicting_https=$(jq -r --arg sni "${sni,,}" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$conflicting_https" ]; then
+        _error "Reality SNI ${sni,,} 已被 HTTPS 路由 ${conflicting_https} 使用；两者必须使用不同域名。"
+        return 1
+    fi
+    backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
+    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    jq --arg owner "$owner" --arg tag "$tag" --arg sni "${sni,,}" --argjson port "$backend_port" \
+        '.reality={owner:$owner,tag:$tag,sni:$sni,backend_host:"127.0.0.1",backend_port:$port}' \
+        "$SNI_ROUTER_STATE_FILE" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    chmod 600 "$tmp"; mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    if ! _sni_router_apply; then
+        _sni_router_restore_state "$backup"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+_sni_router_remove_reality() {
+    local tag="${1:-}"
+    _sni_router_lock || return 1
+    _sni_router_init_state || return 1
+    local existing backup tmp
+    existing=$(jq -r '.reality.tag // empty' "$SNI_ROUTER_STATE_FILE")
+    [ -n "$existing" ] || return 0
+    if [ -n "$tag" ] && [ "$tag" != "$existing" ]; then
+        _error "Reality 默认后端属于 ${existing}，拒绝按不匹配的 tag ${tag} 删除。"
+        return 1
+    fi
+    backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
+    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    jq '.reality=null' "$SNI_ROUTER_STATE_FILE" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    chmod 600 "$tmp"; mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    if ! _sni_router_apply; then
+        _sni_router_restore_state "$backup"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+_sni_router_register_https() {
+    local owner="$1" sni="${2,,}" backend_port="$3"
+    _is_valid_reality_domain "$sni" || { _error "HTTPS SNI 格式无效: ${sni}"; return 1; }
+    _sni_router_validate_port "$backend_port" || { _error "HTTPS 后端端口无效。"; return 1; }
+    _sni_router_lock || return 1
+    _sni_router_init_state || return 1
+    local existing_owner existing_port reality_sni backup tmp
+    existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$existing_owner" ] && [ "$existing_owner" != "$owner" ]; then
+        _error "SNI ${sni} 已由 ${existing_owner} 登记。"
+        return 1
+    fi
+    reality_sni=$(jq -r '.reality.sni // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$reality_sni" ] && [ "$reality_sni" = "$sni" ]; then
+        _error "HTTPS SNI ${sni} 与 Reality SNI 相同；两者必须使用不同域名。"
+        return 1
+    fi
+    existing_port=$(jq -r '.https_backend.port // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$existing_port" ] && [ "$existing_port" != "$backend_port" ]; then
+        _error "现有 HTTPS 后端为 127.0.0.1:${existing_port}，拒绝混用 ${backend_port}。"
+        return 1
+    fi
+    backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
+    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    jq --arg owner "$owner" --arg sni "$sni" --argjson port "$backend_port" \
+        '.https_backend={host:"127.0.0.1",port:$port} | .https_routes[$sni]={owner:$owner}' \
+        "$SNI_ROUTER_STATE_FILE" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    chmod 600 "$tmp"; mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    if ! _sni_router_apply; then
+        _sni_router_restore_state "$backup"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+_sni_router_remove_https() {
+    local owner="$1" sni="${2,,}"
+    _sni_router_lock || return 1
+    _sni_router_init_state || return 1
+    local existing_owner backup tmp
+    existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
+    [ -n "$existing_owner" ] || return 0
+    if [ -n "$owner" ] && [ "$owner" != "$existing_owner" ]; then
+        _error "SNI ${sni} 属于 ${existing_owner}，拒绝由 ${owner} 删除。"
+        return 1
+    fi
+    backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
+    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    jq --arg sni "$sni" \
+        'del(.https_routes[$sni]) | if (.https_routes|length)==0 then .https_backend=null else . end' \
+        "$SNI_ROUTER_STATE_FILE" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    chmod 600 "$tmp"; mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    if ! _sni_router_apply; then
+        _sni_router_restore_state "$backup"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+_sni_router_status() {
+    _sni_router_init_state || return 1
+    echo "SNI_ROUTER_API_VERSION=${SNI_ROUTER_API_VERSION}"
+    jq -r '
+        . as $root |
+        "public=:" + (.public_port|tostring),
+        (if .reality then "reality=" + .reality.sni + " -> " + .reality.backend_host + ":" + (.reality.backend_port|tostring) else "reality=未登记" end),
+        (if (.https_routes|length)>0 then (.https_routes|to_entries[]|"https="+.key+" -> "+$root.https_backend.host+":"+($root.https_backend.port|tostring)+" ("+.value.owner+")") else "https=未登记" end)
+    ' "$SNI_ROUTER_STATE_FILE"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active haproxy >/dev/null 2>&1; then
+        echo 'haproxy=active'
+    else
+        echo 'haproxy=inactive'
+    fi
+}
+
+_sni_router_check() {
+    _sni_router_init_state || return 1
+    if _sni_router_state_has_routes; then
+        command -v haproxy >/dev/null 2>&1 || { _error "未安装 HAProxy。"; return 1; }
+        local tmp
+        tmp=$(mktemp) || return 1
+        _sni_router_generate_haproxy_config "$tmp" || { rm -f "$tmp"; return 1; }
+        haproxy -c -f "$tmp"
+        local status=$?
+        rm -f "$tmp"
+        return "$status"
+    fi
+    _info "SNI 路由尚未登记任何后端。"
+}
+
 # 原子修改 JSON/YAML 文件
 _atomic_modify_json() {
     local file="$1" filter="$2"
@@ -1347,6 +1727,121 @@ _atomic_modify_yaml() {
         mv "$tmp" "$file"
         return 1
     fi
+}
+
+_sni_router_migrate_existing_reality() {
+    [ -s "$CONFIG_FILE" ] || return 0
+    _sni_router_init_state || return 1
+    if jq -e '.reality != null' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local candidates count tag sni backend_port config_backup metadata_backup had_metadata=no
+    candidates=$(jq -r --argjson port "$SNI_ROUTER_PUBLIC_PORT" '
+        [.inbounds[]?
+         | select(.listen_port == $port)
+         | select(.tls.reality.enabled == true)
+         | [.tag, (.tls.server_name // .tls.reality.handshake.server // "")]
+         | @tsv][]
+    ' "$CONFIG_FILE" 2>/dev/null)
+    count=$(printf '%s\n' "$candidates" | sed '/^$/d' | wc -l | tr -d ' ')
+    [ "$count" -gt 0 ] || return 0
+    if [ "$count" -ne 1 ]; then
+        _error "检测到 ${count} 个直接监听 443 的 Reality 入站，无法自动确定 HAProxy 默认后端。"
+        return 1
+    fi
+    IFS=$'\t' read -r tag sni <<< "$candidates"
+    _is_valid_reality_domain "$sni" || { _error "Reality 入站 ${tag} 的 SNI 无效。"; return 1; }
+    backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
+
+    config_backup=$(mktemp) || return 1
+    metadata_backup=$(mktemp) || { rm -f "$config_backup"; return 1; }
+    cp -a -- "$CONFIG_FILE" "$config_backup" || { rm -f "$config_backup" "$metadata_backup"; return 1; }
+    if [ -f "$METADATA_FILE" ]; then
+        cp -a -- "$METADATA_FILE" "$metadata_backup" || { rm -f "$config_backup" "$metadata_backup"; return 1; }
+        had_metadata=yes
+    else
+        printf '{}\n' > "$METADATA_FILE"
+    fi
+
+    _info "正在把现有 Reality ${tag} 从公网 443 迁移到 127.0.0.1:${backend_port}..."
+    if ! jq --arg tag "$tag" --argjson port "$backend_port" '
+        (.inbounds[] | select(.tag == $tag)) |= (.listen="127.0.0.1" | .listen_port=$port)
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" || ! mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"; then
+        rm -f "${CONFIG_FILE}.tmp" "$config_backup" "$metadata_backup"
+        return 1
+    fi
+    if ! jq --arg tag "$tag" --argjson public "$SNI_ROUTER_PUBLIC_PORT" --argjson backend "$backend_port" '
+        .[$tag] = ((.[$tag] // {}) + {publicPort:$public,backendPort:$backend,frontedBy:"haproxy",routerRole:"reality-default"})
+    ' "$METADATA_FILE" > "${METADATA_FILE}.tmp" || ! mv "${METADATA_FILE}.tmp" "$METADATA_FILE"; then
+        cp -a -- "$config_backup" "$CONFIG_FILE"
+        [ "$had_metadata" = yes ] && cp -a -- "$metadata_backup" "$METADATA_FILE"
+        rm -f "${CONFIG_FILE}.tmp" "${METADATA_FILE}.tmp" "$config_backup" "$metadata_backup"
+        return 1
+    fi
+
+    if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" >/dev/null 2>&1 || \
+       ! _manage_service restart || \
+       ! _sni_router_register_reality sb "$tag" "$sni" "$backend_port"; then
+        _error "Reality 迁移失败，正在恢复原来的公网 443 监听。"
+        cp -a -- "$config_backup" "$CONFIG_FILE"
+        if [ "$had_metadata" = yes ]; then cp -a -- "$metadata_backup" "$METADATA_FILE"; else rm -f "$METADATA_FILE"; fi
+        _manage_service restart >/dev/null 2>&1 || true
+        rm -f "$config_backup" "$metadata_backup"
+        return 1
+    fi
+    rm -f "$config_backup" "$metadata_backup"
+    _success "Reality 已迁移到 HAProxy 443 共享入口，客户端节点端口仍为 443。"
+}
+
+_sni_router_prepare() {
+    _sni_router_require_systemd || return 1
+    _sni_router_migrate_existing_reality || return 1
+    _sni_router_init_state || return 1
+    if _sni_router_state_has_routes; then
+        _sni_router_apply
+    fi
+}
+
+_sni_router_cli() {
+    local action="${1:-status}"
+    shift || true
+    case "$action" in
+        api-version)
+            printf '%s\n' "$SNI_ROUTER_API_VERSION"
+            ;;
+        status)
+            _sni_router_status
+            ;;
+        check)
+            _sni_router_check
+            ;;
+        prepare)
+            _sni_router_prepare
+            ;;
+        allocate-backend)
+            _sni_router_allocate_backend_port "${1:-$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT}"
+            ;;
+        register-reality)
+            [ "$#" -eq 4 ] || { _error "用法: sb sni-router register-reality OWNER TAG SNI BACKEND_PORT"; return 2; }
+            _sni_router_register_reality "$1" "$2" "$3" "$4"
+            ;;
+        remove-reality)
+            _sni_router_remove_reality "${1:-}"
+            ;;
+        register-https)
+            [ "$#" -eq 3 ] || { _error "用法: sb sni-router register-https OWNER SNI BACKEND_PORT"; return 2; }
+            _sni_router_register_https "$1" "$2" "$3"
+            ;;
+        remove-https)
+            [ "$#" -eq 2 ] || { _error "用法: sb sni-router remove-https OWNER SNI"; return 2; }
+            _sni_router_remove_https "$1" "$2"
+            ;;
+        *)
+            _error "未知 SNI 路由操作: ${action}"
+            return 2
+            ;;
+    esac
 }
 
 # --- 资源与环境管理 ---
@@ -2820,11 +3315,16 @@ _uninstall() {
     local managed_cloudflared=false
     local managed_realitlscanner=false
     local managed_go_toolchain=false
+    local preserve_router_manager=false
     [ -f "${SINGBOX_DIR}/.managed_sing_box" ] && managed_sing_box=true
     [ -f "${SINGBOX_DIR}/.managed_yq" ] && managed_yq=true
     [ -f "${SINGBOX_DIR}/.managed_cloudflared" ] && managed_cloudflared=true
     [ -f "${SINGBOX_DIR}/.managed_realitlscanner" ] && managed_realitlscanner=true
     [ -f "$GO_TOOLCHAIN_MARKER" ] && managed_go_toolchain=true
+    if [ -s "$SNI_ROUTER_STATE_FILE" ] && \
+       [ "$(jq -r '.https_routes | length' "$SNI_ROUTER_STATE_FILE" 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+        preserve_router_manager=true
+    fi
 
     _warning "！！！警告！！！"
     _warning "本操作将停止并禁用 [主脚本] 服务 (sing-box)，"
@@ -2839,6 +3339,7 @@ _uninstall() {
     [ "$managed_realitlscanner" = true ] && echo -e "  ${RED}-${NC} 本脚本编译的 RealiTLScanner: ${REALITL_SCANNER_BIN}"
     [ "$managed_go_toolchain" = true ] && echo -e "  ${RED}-${NC} RealiTLScanner 专用 Go 工具链: ${GO_TOOLCHAIN_DIR}"
     echo -e "  ${YELLOW}!${NC} Nginx、证书和 ACME 续期任务将保留，避免影响同机 Emby 反代。"
+    echo -e "  ${YELLOW}!${NC} 若 HAProxy 仍登记 Emby SNI，将保留 HAProxy 与共享路由状态。"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
@@ -2846,7 +3347,15 @@ _uninstall() {
     read -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
     [[ "$confirm_main" != "y" && "$confirm_main" != "Y" ]] && _info "卸载已取消。" && return
 
-    # 1. 停止服务
+    # 1. 先注销 Reality 默认后端；失败时保持 sing-box 原状运行。
+    local router_reality_tag=""
+    router_reality_tag=$(jq -r '.reality.tag // empty' "$SNI_ROUTER_STATE_FILE" 2>/dev/null)
+    [ -z "$router_reality_tag" ] || _sni_router_remove_reality "$router_reality_tag" || {
+        _error "无法安全注销 HAProxy Reality 后端，卸载已中止。"
+        return 1
+    }
+
+    # 2. 停止服务
     _manage_service "stop"
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         systemctl disable sing-box >/dev/null 2>&1
@@ -2857,7 +3366,7 @@ _uninstall() {
         rm -f "$SERVICE_FILE"
     fi
 
-    # 2. 清理配置与日志
+    # 3. 清理配置与日志
     _info "正在清理配置文件与日志..."
     _remove_log_cleanup
     # 清理脚本创建的 nftables 规则
@@ -2871,7 +3380,7 @@ _uninstall() {
     fi
     _remove_nftables_rules
 
-    # 3. 先停止脚本创建的 Argo 任务，再删除元数据。
+    # 4. 先停止脚本创建的 Argo 任务，再删除元数据。
     _disable_argo_watchdog 2>/dev/null
     _stop_all_argo_tunnels 2>/dev/null
     rm -rf "${SINGBOX_DIR}" "${LOG_FILE}" "${ARGO_LOG_FILE}"
@@ -2886,11 +3395,15 @@ _uninstall() {
     fi
     rmdir "$REALITL_SCANNER_DIR" 2>/dev/null || true
 
-    # 4. 清理别名；不删除脚本目录外的同名文件。
+    # 5. 若 Emby 仍依赖共享入口，保留管理命令，避免 deploy.sh 以后无法注销路由。
     _info "正在清理周边环境..."
-    rm -f "/usr/local/bin/sb"
+    if [ "$preserve_router_manager" = true ]; then
+        _warn "检测到仍在使用的 Emby SNI 路由，将保留 ${SELF_SCRIPT_PATH} 与 /usr/local/bin/sb 作为 HAProxy 管理器。"
+    else
+        rm -f "/usr/local/bin/sb"
+    fi
     
-    # 5. 仅删除带有本脚本管理标记的二进制，避免误删用户已有程序。
+    # 6. 仅删除带有本脚本管理标记的二进制，避免误删用户已有程序。
     local relay_script="/root/relay-install.sh"
     if [ -f "$relay_script" ]; then
         _warn "检测到 [线路机] 脚本存在，为保持其运行，将 [保留] sing-box 主程序。"
@@ -2899,8 +3412,12 @@ _uninstall() {
         [ "$managed_yq" = true ] && rm -f "${YQ_BINARY}"
     fi
 
-    _success "清理完成。脚本已自毁。再见！"
-    [ -f "${SELF_SCRIPT_PATH}" ] && rm -f "${SELF_SCRIPT_PATH}"
+    if [ "$preserve_router_manager" = true ]; then
+        _success "Sing-box 核心与节点已清理；HAProxy/Emby 路由管理器已保留。"
+    else
+        _success "清理完成。脚本已自毁。再见！"
+        [ -f "${SELF_SCRIPT_PATH}" ] && rm -f "${SELF_SCRIPT_PATH}"
+    fi
     exit 0
 }
 
@@ -4254,6 +4771,9 @@ _add_vless_reality() {
     local handshake_server="$DEFAULT_REALITY_SNI"
     local handshake_port=443
     local port=""
+    local backend_port=""
+    local listen_address="::"
+    local router_mode=false
     local name=""
 
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4266,6 +4786,14 @@ _add_vless_reality() {
         name="Batch-Reality-${port}"
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
+        if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ] && [ "${BATCH_SNI_ROUTER:-false}" = "true" ]; then
+            _sni_router_prepare || return 1
+            backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
+            listen_address="127.0.0.1"
+            router_mode=true
+        else
+            backend_port="$port"
+        fi
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
@@ -4276,7 +4804,23 @@ _add_vless_reality() {
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
+            if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+                local use_router
+                read -r -p "是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: " use_router
+                if [[ ! "$use_router" =~ ^[Nn]$ ]]; then
+                    _sni_router_prepare || continue
+                    if jq -e '.reality != null' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+                        _error "HAProxy 443 已经登记了一个 Reality 默认后端，请复用或删除该节点。"
+                        continue
+                    fi
+                    backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || continue
+                    listen_address="127.0.0.1"
+                    router_mode=true
+                    break
+                fi
+            fi
             _check_port_conflict "$port" "tcp" && continue
+            backend_port="$port"
             break
         done
         local default_name="VLESS-REALITY-${port}"
@@ -4289,20 +4833,37 @@ _add_vless_reality() {
     local private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
     local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
     local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
+    [ -n "$backend_port" ] || backend_port="$port"
     local tag="vless-in-${port}"
     _validate_reality_no_self_loop "$port" "$handshake_server" "$handshake_port" || return 1
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg hs "$handshake_server" --arg hp "$handshake_port" --arg pk "$private_key" --arg sid "$short_id" \
-        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":($hp|tonumber)},"private_key":$pk,"short_id":[$sid]}}}')
+    local inbound_json=$(jq -n --arg t "$tag" --arg p "$backend_port" --arg listen "$listen_address" --arg u "$uuid" --arg sn "$server_name" --arg hs "$handshake_server" --arg hp "$handshake_port" --arg pk "$private_key" --arg sid "$short_id" \
+        '{"type":"vless","tag":$t,"listen":$listen,"listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$hs,"server_port":($hp|tonumber)},"private_key":$pk,"short_id":[$sid]}}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\", \"handshakeServer\": \"$handshake_server\", \"handshakePort\": $handshake_port}}" || return 1
+    local meta_json
+    meta_json=$(jq -n --arg n "$name" --arg pub "$public_key" --arg sid "$short_id" \
+        --arg hs "$handshake_server" --arg hp "$handshake_port" --argjson public_port "$port" \
+        --argjson backend "$backend_port" --argjson routed "$router_mode" \
+        '{name:$n,publicKey:$pub,shortId:$sid,handshakeServer:$hs,handshakePort:($hp|tonumber),publicPort:$public_port,backendPort:$backend} +
+         (if $routed then {frontedBy:"haproxy",routerRole:"reality-default"} else {} end)')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"firefox","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     _add_node_to_yaml "$proxy_json"
+    if [ "$router_mode" = true ]; then
+        if ! _sni_router_register_reality sb "$tag" "$server_name" "$backend_port"; then
+            _error "HAProxy Reality 路由登记失败，正在撤销新节点。"
+            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+            _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
+            _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+            return 1
+        fi
+        _info "公网 443 -> HAProxy -> 127.0.0.1:${backend_port} -> Sing-box Reality"
+    fi
     _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id"
 }
@@ -4884,6 +5445,12 @@ _view_nodes() {
         
         # 过滤掉多端口监听生成的辅助节点（跳过 tag 中包含 -hop- 的节点）
         if [[ "$tag" == *"-hop-"* ]]; then continue; fi
+
+        # HAProxy 共享节点的 Sing-box 实际监听端口是回环后端端口；客户端必须使用 publicPort。
+        local backend_port="$port"
+        local public_port
+        public_port=$(jq -r --arg t "$tag" --argjson fallback "$port" '.[$t].publicPort // $fallback' "$METADATA_FILE" 2>/dev/null)
+        [ -n "$public_port" ] && [ "$public_port" != "null" ] && port="$public_port"
         
         # 使用统一查找函数
         local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
@@ -4902,6 +5469,9 @@ _view_nodes() {
         echo "-------------------------------------"
         # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
+        if [ "$backend_port" != "$port" ]; then
+            _info " 入口: 公网 ${port} -> HAProxy -> 127.0.0.1:${backend_port}"
+        fi
         local url=""
         
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
@@ -5070,6 +5640,7 @@ _delete_node() {
     # 我们需要先构建一个数组，来映射用户输入和节点信息
     local inbound_tags=()
     local inbound_ports=()
+    local inbound_public_ports=()
     local inbound_types=()
     local display_names=() # 存储显示名称
     local i=1
@@ -5079,20 +5650,29 @@ _delete_node() {
         # [!] 过滤辅助节点
         if [[ "$tag" == *"-hop-"* ]]; then continue; fi
         
+        local public_port
+        public_port=$(jq -r --arg t "$tag" --argjson fallback "$port" '.[$t].publicPort // $fallback' "$METADATA_FILE" 2>/dev/null)
+        [ -n "$public_port" ] && [ "$public_port" != "null" ] || public_port="$port"
+
         # 存储信息
         inbound_tags+=("$tag")
         inbound_ports+=("$port")
+        inbound_public_ports+=("$public_port")
         inbound_types+=("$type")
 
         # 使用 utils.sh 中的统一查找函数
-        local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
+        local proxy_name_to_find=$(_find_proxy_name "$public_port" "$type" "$tag")
         
         local meta_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
         local display_name=${proxy_name_to_find:-${meta_name:-$tag}} # 回退到 metadata/tag
         display_names+=("$display_name") # 存储显示名称
         
         # [!] 已修改：显示自定义名称、类型和端口
-        echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${port}"
+        if [ "$public_port" != "$port" ]; then
+            echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ 公网 ${public_port} -> 回环 ${port}"
+        else
+            echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${port}"
+        fi
         ((i++))
     done < <(jq -r '.inbounds[] | [.tag, .type, (.listen_port|tostring)] | @tsv' "$CONFIG_FILE")
     # --- 列表逻辑结束 ---
@@ -5115,6 +5695,15 @@ _delete_node() {
         fi
         
         _info "正在删除所有节点..."
+
+        local router_reality_tag
+        router_reality_tag=$(jq -r 'to_entries[] | select(.value.frontedBy == "haproxy" and .value.routerRole == "reality-default") | .key' "$METADATA_FILE" 2>/dev/null | head -n 1)
+        if [ -n "$router_reality_tag" ]; then
+            _sni_router_remove_reality "$router_reality_tag" || {
+                _error "无法注销 HAProxy Reality 后端，已取消删除所有节点。"
+                return 1
+            }
+        fi
         
         # [安全性加固] 精准分离并销毁仅关联本脚本的 nftables 跳跃端口规则（必须在清空 metadata 之前执行！）
         if [ -f "$METADATA_FILE" ]; then
@@ -5160,11 +5749,12 @@ _delete_node() {
     local tag_to_del=${inbound_tags[$index]}
     local type_to_del=${inbound_types[$index]}
     local port_to_del=${inbound_ports[$index]}
+    local public_port_to_del=${inbound_public_ports[$index]}
     local display_name_to_del=${display_names[$index]}
 
     # --- [!] 新的删除逻辑 ---
     # 使用统一查找函数确定 clash.yaml 中的确切名称
-    local proxy_name_to_del=$(_find_proxy_name "$port_to_del" "$type_to_del" "$tag_to_del")
+    local proxy_name_to_del=$(_find_proxy_name "$public_port_to_del" "$type_to_del" "$tag_to_del")
 
     # [!] 已修改：使用显示名称进行确认
     read -p "$(echo -e ${YELLOW}"确定要删除节点 ${display_name_to_del} 吗? (y/N): "${NC})" confirm
@@ -5179,9 +5769,23 @@ _delete_node() {
     if [ -n "$node_metadata" ]; then
         node_type=$(echo "$node_metadata" | jq -r '.type // empty')
     fi
+
+    local router_backed=false router_sni="" router_backend=""
+    if [ -n "$node_metadata" ] && [ "$(echo "$node_metadata" | jq -r '.frontedBy // empty')" = "haproxy" ]; then
+        router_backed=true
+        router_sni=$(jq -r --arg tag "$tag_to_del" '.inbounds[] | select(.tag == $tag) | .tls.server_name // empty' "$CONFIG_FILE")
+        router_backend=$(echo "$node_metadata" | jq -r '.backendPort // empty')
+        _sni_router_remove_reality "$tag_to_del" || {
+            _error "无法注销 HAProxy Reality 后端，节点未删除。"
+            return 1
+        }
+    fi
     
     # [!] 重要修正：不使用索引删除（因为列表已过滤），改为使用 Tag 精确匹配删除
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag_to_del\"))" || return
+    if ! _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag_to_del\"))"; then
+        [ "$router_backed" = true ] && _sni_router_register_reality sb "$tag_to_del" "$router_sni" "$router_backend" >/dev/null 2>&1 || true
+        return
+    fi
     
     # [!] 新增：精准剥离该节点绑定的系统级防火墙端口跳跃策略
     local port_hopping=$(echo "$node_metadata" | jq -r '.portHopping // empty' 2>/dev/null)
@@ -5412,6 +6016,113 @@ _dns_config_menu() {
     done
 }
 
+_switch_reality_public_port() {
+    local tag="$1" type="$2" actual_port="$3" old_public="$4" new_public="$5"
+    local currently_routed=false target_routed=false
+    local old_backend="$actual_port" target_port="$new_public" target_listen="::"
+    local sni new_tag old_proxy_name new_proxy_name current_link new_link current_name new_name
+    local config_backup metadata_backup yaml_backup had_yaml=no
+
+    jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag and .tls.reality.enabled == true)' \
+        "$CONFIG_FILE" >/dev/null 2>&1 || return 2
+    [ "$(jq -r --arg tag "$tag" '.[$tag].frontedBy // empty' "$METADATA_FILE")" = "haproxy" ] && currently_routed=true
+    [ "$new_public" -eq "$SNI_ROUTER_PUBLIC_PORT" ] && target_routed=true
+    if [ "$currently_routed" = false ] && [ "$target_routed" = false ]; then return 2; fi
+    if [ "$currently_routed" = true ] && [ "$new_public" -eq "$old_public" ]; then
+        _warning "新端口与当前公网端口相同，无需修改。"
+        return 0
+    fi
+
+    sni=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .tls.server_name // empty' "$CONFIG_FILE")
+    _is_valid_reality_domain "$sni" || { _error "Reality SNI 无效，无法切换 443 共享模式。"; return 1; }
+    if [ "$target_routed" = true ]; then
+        _sni_router_prepare || return 1
+        local registered_tag
+        registered_tag=$(jq -r '.reality.tag // empty' "$SNI_ROUTER_STATE_FILE")
+        if [ -n "$registered_tag" ] && [ "$registered_tag" != "$tag" ]; then
+            _error "HAProxy 443 已登记 Reality 后端 ${registered_tag}。"
+            return 1
+        fi
+        target_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
+        target_listen="127.0.0.1"
+    else
+        _check_port_conflict "$new_public" tcp && return 1
+    fi
+
+    new_tag=$(printf '%s' "$tag" | sed "s/${old_public}/${new_public}/g")
+    [ "$new_tag" != "$tag" ] || new_tag="${tag}-public-${new_public}"
+    if jq -e --arg tag "$new_tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "目标 Tag 已存在: ${new_tag}"
+        return 1
+    fi
+
+    config_backup=$(mktemp); metadata_backup=$(mktemp); yaml_backup=$(mktemp) || {
+        rm -f "$config_backup" "$metadata_backup" "$yaml_backup"
+        return 1
+    }
+    cp -a -- "$CONFIG_FILE" "$config_backup" || return 1
+    cp -a -- "$METADATA_FILE" "$metadata_backup" || return 1
+    if [ -f "$CLASH_YAML_FILE" ]; then cp -a -- "$CLASH_YAML_FILE" "$yaml_backup" && had_yaml=yes; fi
+
+    if [ "$currently_routed" = true ]; then
+        _sni_router_remove_reality "$tag" || { rm -f "$config_backup" "$metadata_backup" "$yaml_backup"; return 1; }
+    fi
+
+    if ! jq --arg tag "$tag" --arg new_tag "$new_tag" --arg listen "$target_listen" --argjson port "$target_port" '
+        (.inbounds[] | select(.tag == $tag)) |= (.tag=$new_tag | .listen=$listen | .listen_port=$port)
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" || ! mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"; then
+        cp -a -- "$config_backup" "$CONFIG_FILE"
+        [ "$currently_routed" = true ] && _sni_router_register_reality sb "$tag" "$sni" "$old_backend" >/dev/null 2>&1 || true
+        rm -f "$config_backup" "$metadata_backup" "$yaml_backup"
+        return 1
+    fi
+
+    current_link=$(jq -r --arg tag "$tag" '.[$tag].share_link // empty' "$METADATA_FILE")
+    new_link=$(printf '%s' "$current_link" | sed -E "s/(:${old_public})([?&#\/]|$)/:${new_public}\\2/g; s/(-${old_public})([?&#\/]|$)/-${new_public}\\2/g")
+    current_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$METADATA_FILE")
+    new_name=$(printf '%s' "$current_name" | sed "s/${old_public}/${new_public}/g")
+    local routing_filter
+    if [ "$target_routed" = true ]; then
+        routing_filter='.[$new_tag] += {frontedBy:"haproxy",routerRole:"reality-default"}'
+    else
+        routing_filter='del(.[$new_tag].frontedBy, .[$new_tag].routerRole)'
+    fi
+    if ! jq --arg tag "$tag" --arg new_tag "$new_tag" --arg link "$new_link" --arg name "$new_name" \
+        --argjson public "$new_public" --argjson backend "$target_port" \
+        ".[$new_tag]=.[$tag] | del(.[$tag]) | .[$new_tag].publicPort=\$public | .[$new_tag].backendPort=\$backend | .[$new_tag].share_link=\$link | .[$new_tag].name=\$name | ${routing_filter}" \
+        "$METADATA_FILE" > "${METADATA_FILE}.tmp" || ! mv "${METADATA_FILE}.tmp" "$METADATA_FILE"; then
+        cp -a -- "$config_backup" "$CONFIG_FILE"
+        cp -a -- "$metadata_backup" "$METADATA_FILE"
+        [ "$currently_routed" = true ] && _sni_router_register_reality sb "$tag" "$sni" "$old_backend" >/dev/null 2>&1 || true
+        rm -f "$config_backup" "$metadata_backup" "$yaml_backup"
+        return 1
+    fi
+
+    old_proxy_name=$(_find_proxy_name "$old_public" "$type" "$tag")
+    if [ -n "$old_proxy_name" ] && [ -f "$CLASH_YAML_FILE" ]; then
+        new_proxy_name=$(printf '%s' "$old_proxy_name" | sed "s/${old_public}/${new_public}/g")
+        export OLD_NAME="$old_proxy_name" NEW_NAME="$new_proxy_name" NEW_PORT_VAL="$new_public"
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)) | .name) = env(NEW_NAME) | (.proxies[] | select(.name == env(NEW_NAME)) | .port) = (env(NEW_PORT_VAL)|tonumber) | (.proxy-groups[].proxies[] | select(. == env(OLD_NAME))) = env(NEW_NAME)' || true
+    fi
+
+    if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" >/dev/null 2>&1 || \
+       ! _manage_service restart || \
+       { [ "$target_routed" = true ] && ! _sni_router_register_reality sb "$new_tag" "$sni" "$target_port"; }; then
+        _error "端口模式切换失败，正在恢复。"
+        cp -a -- "$config_backup" "$CONFIG_FILE"
+        cp -a -- "$metadata_backup" "$METADATA_FILE"
+        [ "$had_yaml" = yes ] && cp -a -- "$yaml_backup" "$CLASH_YAML_FILE"
+        _sni_router_remove_reality "$new_tag" >/dev/null 2>&1 || true
+        [ "$currently_routed" = true ] && _sni_router_register_reality sb "$tag" "$sni" "$old_backend" >/dev/null 2>&1 || true
+        _manage_service restart >/dev/null 2>&1 || true
+        rm -f "$config_backup" "$metadata_backup" "$yaml_backup"
+        return 1
+    fi
+    rm -f "$config_backup" "$metadata_backup" "$yaml_backup"
+    _success "Reality 公网端口已切换: ${old_public} -> ${new_public}（实际监听 ${target_listen}:${target_port}）"
+    return 0
+}
+
 _modify_port() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
         _warning "当前没有任何节点。"
@@ -5423,6 +6134,7 @@ _modify_port() {
     # 列出所有节点
     local inbound_tags=()
     local inbound_ports=()
+    local inbound_public_ports=()
     local inbound_types=()
     local display_names=()
     
@@ -5435,15 +6147,23 @@ _modify_port() {
         inbound_tags+=("$tag")
         inbound_ports+=("$port")
         inbound_types+=("$type")
+        local public_port
+        public_port=$(jq -r --arg t "$tag" --argjson fallback "$port" '.[$t].publicPort // $fallback' "$METADATA_FILE" 2>/dev/null)
+        [ -n "$public_port" ] && [ "$public_port" != "null" ] || public_port="$port"
+        inbound_public_ports+=("$public_port")
         
         # [M1] 使用公共函数替代内联重复的代理名查找逻辑
-        local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
+        local proxy_name_to_find=$(_find_proxy_name "$public_port" "$type" "$tag")
         
         local meta_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
         local display_name=${proxy_name_to_find:-${meta_name:-$tag}}
         display_names+=("$display_name")
         
-        echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${GREEN}${port}${NC}"
+        if [ "$public_port" != "$port" ]; then
+            echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${GREEN}公网 ${public_port} -> 回环 ${port}${NC}"
+        else
+            echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${GREEN}${port}${NC}"
+        fi
         ((i++))
     done < <(jq -r '.inbounds[] | [.tag, .type, (.listen_port|tostring)] | @tsv' "$CONFIG_FILE")
     
@@ -5461,6 +6181,7 @@ _modify_port() {
     local tag_to_modify=${inbound_tags[$index]}
     local type_to_modify=${inbound_types[$index]}
     local old_port=${inbound_ports[$index]}
+    local old_public_port=${inbound_public_ports[$index]}
     local display_name_to_modify=${display_names[$index]}
     local hop_info=""
     local hop_mode=""
@@ -5470,7 +6191,8 @@ _modify_port() {
     local final_hop_end=""
     
     _info "当前节点: ${display_name_to_modify} (${type_to_modify})"
-    _info "当前端口: ${old_port}"
+    _info "当前公网端口: ${old_public_port}"
+    [ "$old_public_port" = "$old_port" ] || _info "当前回环后端端口: ${old_port}"
     
     if [ "$type_to_modify" = "hysteria2" ] && [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
         hop_info=$(jq -r ".\"$tag_to_modify\".portHopping // \"\"" "$METADATA_FILE" 2>/dev/null)
@@ -5492,9 +6214,15 @@ _modify_port() {
         return
     fi
     
-    if [ "$new_port" -eq "$old_port" ]; then
+    if [ "$new_port" -eq "$old_public_port" ]; then
         _warning "新端口与当前端口相同，无需修改。"
         return
+    fi
+
+    _switch_reality_public_port "$tag_to_modify" "$type_to_modify" "$old_port" "$old_public_port" "$new_port"
+    local router_switch_status=$?
+    if [ "$router_switch_status" -ne 2 ]; then
+        return "$router_switch_status"
     fi
     
     # 检查端口是否已被占用
@@ -6637,6 +7365,12 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     # 解析命令行参数；直接执行 sb 时保持原有交互入口。
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            sni-router)
+                _check_root
+                shift
+                _sni_router_cli "$@"
+                exit $?
+                ;;
             keepalive)
                 _argo_keepalive
                 exit 0
