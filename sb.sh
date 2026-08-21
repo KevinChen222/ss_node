@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.10"
+export SCRIPT_VERSION="20-kevin.11"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -479,7 +479,10 @@ _install_managed_nginx_config() {
         _error "Nginx 配置加载失败，已回滚: ${target}"
         return 1
     fi
-    [ -n "$rollback" ] && rm -f "$rollback"
+    if [ -n "$rollback" ]; then
+        rm -f "$rollback"
+    fi
+    return 0
 }
 
 _ensure_local_origin_dependencies() {
