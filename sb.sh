@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.13"
+export SCRIPT_VERSION="20-kevin.14"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -15,7 +15,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="bec2b009ac0941054175fed6caede61c4e1a9b94e7d6e7115d620be38179ff25"
+ADVANCED_RELAY_SHA256="775258ded65eb729ef362275a97f2b12d29543e5d6b1300ebe5dea3cf2ff156b"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
@@ -4063,12 +4063,12 @@ _show_node_link() {
             # 参数: password, sni, skip_verify
             local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3" cert_path="$4"
             local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            url="anytls://$(_url_encode "$password")@${link_ip}:${port}/?sni=$(_url_encode "$sni")${insecure_param}#$(_url_encode "$name")"
             ;;
         "any-reality")
             # 参数: password, sni, public_key, short_id
             local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
-            url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=firefox&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+            url="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${sni}&fp=firefox&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
             ;;
         "shadowsocks")
             # 参数: method, password
@@ -4781,8 +4781,8 @@ _create_anytls_tls_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
-    # --- 生成 Inbound 配置 (包含 padding_scheme) ---
-    # padding_scheme 是 AnyTLS 的核心功能，用于流量填充对抗检测
+    # --- 生成 Inbound 配置 ---
+    # 不固定 padding_scheme，让当前 sing-box 自动使用并跟随上游默认填充方案。
     local inbound_json=$(jq -n \
         --arg t "$tag" \
         --arg p "$port" \
@@ -4796,11 +4796,6 @@ _create_anytls_tls_node() {
             "listen": "::",
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
-            "padding_scheme": [
-                "stop=2",
-                "0=100-200",
-                "1=100-200"
-            ],
             "tls": {
                 "enabled": true,
                 "alpn": ["http/1.1"],
@@ -4843,13 +4838,6 @@ _create_anytls_tls_node() {
     meta_json=$(jq -n --arg n "$name" --arg sn "$server_name" '{name:$n, server_name:$sn, yaml:true}')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
     
-    # --- 生成分享链接 ---
-    local insecure_param=""
-    if [ "$skip_verify" == "true" ]; then
-        insecure_param="&insecure=1"
-    fi
-    local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
-    
     _success "AnyTLS 节点 [${name}] 添加成功!"
     _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify"
 }
@@ -4885,7 +4873,6 @@ _create_anyreality_node() {
             "listen": "::",
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
-            "padding_scheme": [],
             "tls": {
                 "enabled": true,
                 "server_name": $sn,
@@ -4906,7 +4893,7 @@ _create_anyreality_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=firefox&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+    local share_link="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${server_name}&fp=firefox&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
     local meta_json
     meta_json=$(jq -n \
         --arg type "any-reality" \
@@ -5902,7 +5889,7 @@ _view_nodes() {
                 if [ "$skip_verify" == "true" ]; then
                     insecure_param="&insecure=1"
                 fi
-                url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
+                url="anytls://$(_url_encode "$pw")@${link_ip}:${port}/?sni=$(_url_encode "$sn")${insecure_param}#$(_url_encode "$display_name")"
                 ;;
             "shadowsocks")
                 # [资源优化] 合并2次jq为1次
