@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.14"
+export SCRIPT_VERSION="20-kevin.15"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -15,7 +15,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="775258ded65eb729ef362275a97f2b12d29543e5d6b1300ebe5dea3cf2ff156b"
+ADVANCED_RELAY_SHA256="f4a6c15623bea07d56ab749e039b6b07ce2defe699d39cd211c7273ba73a3966"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
@@ -761,11 +761,22 @@ _install_realitlscanner() {
         return 0
     fi
 
-    command -v sha256sum >/dev/null 2>&1 || _pkg_install coreutils || return 1
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-        _pkg_install curl wget ca-certificates || return 1
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        _pkg_install coreutils || {
+            _error "无法安装 SHA-256 校验工具，RealiTLScanner 安装已中止。"
+            return 1
+        }
     fi
-    temp_dir=$(mktemp -d /tmp/sb-realitlscanner.XXXXXX) || return 1
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        _pkg_install curl wget ca-certificates || {
+            _error "无法安装下载工具，RealiTLScanner 安装已中止。"
+            return 1
+        }
+    fi
+    temp_dir=$(mktemp -d /tmp/sb-realitlscanner.XXXXXX) || {
+        _error "无法创建 RealiTLScanner 临时目录。"
+        return 1
+    }
     candidate="${temp_dir}/${asset_name}"
     _info "正在下载并校验 XTLS/RealiTLScanner ${REALITL_SCANNER_VERSION} (${asset_name})..."
     if command -v curl >/dev/null 2>&1; then
@@ -786,12 +797,17 @@ _install_realitlscanner() {
     chmod 700 "$candidate"
     if ! mkdir -p "$REALITL_SCANNER_DIR" || ! install -m 700 "$candidate" "$REALITL_SCANNER_BIN"; then
         [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
+        _error "无法将 RealiTLScanner 安装到 ${REALITL_SCANNER_BIN}。"
         return 1
     fi
-    printf '%s\n' "$expected_marker" > "$REALITL_SCANNER_MARKER"
-    chmod 600 "$REALITL_SCANNER_MARKER"
+    if ! printf '%s\n' "$expected_marker" > "$REALITL_SCANNER_MARKER" || \
+       ! chmod 600 "$REALITL_SCANNER_MARKER" || \
+       ! mkdir -p "$SINGBOX_DIR" || ! touch "${SINGBOX_DIR}/.managed_realitlscanner"; then
+        [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
+        _error "无法写入 RealiTLScanner 安装校验标记。"
+        return 1
+    fi
     rm -f "${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
-    touch "${SINGBOX_DIR}/.managed_realitlscanner"
     [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
     _success "RealiTLScanner ${REALITL_SCANNER_VERSION} 官方二进制已安装并通过固定 SHA-256 校验。"
 }
@@ -1055,12 +1071,18 @@ _first_exact_cert_domain() {
 
 _scan_reality_sni_once() {
     if [ "$REALITY_SNI_SCAN_DONE" = "true" ]; then
-        [ "${#REALITY_SNI_DOMAINS[@]}" -gt 0 ]
-        return
+        [ "${#REALITY_SNI_DOMAINS[@]}" -gt 0 ] && return 0
     fi
-    REALITY_SNI_SCAN_DONE=true
+    REALITY_SNI_SCAN_DONE=false
+    REALITY_SNI_DOMAINS=()
+    REALITY_SNI_LATENCIES=()
+    REALITY_SNI_TARGETS=()
+    REALITY_SNI_CHINA_STATUSES=()
 
-    _install_realitlscanner || return 1
+    _install_realitlscanner || {
+        _error "RealiTLScanner 安装或校验失败，尚未开始扫描。"
+        return 1
+    }
     local public_ipv4 default_cidr="" scan_cidr
     public_ipv4=$(_get_public_ip 2>/dev/null || true)
     if _is_valid_ipv4 "$public_ipv4"; then
@@ -1076,13 +1098,27 @@ _scan_reality_sni_once() {
     fi
 
     local temp_dir csv_file scan_log scan_status
-    temp_dir=$(mktemp -d /tmp/sb-reality-scan.XXXXXX) || return 1
+    temp_dir=$(mktemp -d /tmp/sb-reality-scan.XXXXXX) || {
+        _error "无法创建 Reality 扫描临时目录。"
+        return 1
+    }
     csv_file="${temp_dir}/out.csv"; scan_log="${temp_dir}/scan.log"
     _info "正在使用 RealiTLScanner 扫描 ${scan_cidr}:443..."
     timeout 180 "$REALITL_SCANNER_BIN" -addr "$scan_cidr" -port 443 -thread 16 -timeout 3 \
         -out "$csv_file" > "$scan_log" 2>&1
     scan_status=$?
-    [ "$scan_status" -eq 124 ] && _warn "扫描达到 180 秒上限，将使用已获得的结果。"
+    if [ "$scan_status" -eq 124 ]; then
+        _warn "扫描达到 180 秒上限，将使用已获得的结果。"
+    elif [ "$scan_status" -ne 0 ]; then
+        if [ -s "$csv_file" ]; then
+            _warn "扫描器返回状态 ${scan_status}，将尝试使用已获得的结果。"
+        else
+            _error "RealiTLScanner 执行失败（状态 ${scan_status}）。"
+            [ -s "$scan_log" ] && tail -n 5 "$scan_log" >&2
+            [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
+            return 1
+        fi
+    fi
 
     local results="" target origin candidate remainder key china_status
     local gfw_result gfw_rejected=0
@@ -1128,10 +1164,16 @@ _scan_reality_sni_once() {
         _warning "本次未找到同时满足 TLS 1.3、H2、不跳转、证书匹配、非 Cloudflare 且未命中大陆高风险判定的候选。"
         return 1
     fi
+    REALITY_SNI_SCAN_DONE=true
     _success "扫描与复核完成，共保留 ${#REALITY_SNI_DOMAINS[@]} 个候选；大陆侧高风险过滤 ${gfw_rejected} 个。"
 }
 
 _select_reality_sni() {
+    REALITY_SNI_SCAN_DONE=false
+    REALITY_SNI_DOMAINS=()
+    REALITY_SNI_LATENCIES=()
+    REALITY_SNI_TARGETS=()
+    REALITY_SNI_CHINA_STATUSES=()
     SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
     SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
     SELECTED_REALITY_HANDSHAKE_PORT=443
@@ -1182,7 +1224,7 @@ _select_reality_sni() {
         _warn "自有域名未通过复核：${REALITY_PROBE_ERROR:-域名格式无效}。将转入扫描/默认选择。"
     fi
 
-    local scan_choice greatfire_choice default_china_status="未验证"
+    local scan_choice scan_action greatfire_choice default_china_status="未验证"
     echo ""
     _warn "境外 VPS 无法自行证明候选域名在中国大陆可达。"
     echo "  可选的大陆侧校验会把候选 HTTPS 域名提交给 GreatFire。"
@@ -1197,7 +1239,24 @@ _select_reality_sni() {
 
     read -r -p "是否使用 XTLS/RealiTLScanner 扫描邻近 IP？[Y/n]: " scan_choice
     if [[ "$scan_choice" != "n" && "$scan_choice" != "N" ]]; then
-        _scan_reality_sni_once || true
+        while ! _scan_reality_sni_once; do
+            while true; do
+                echo "  1) 重新扫描（默认）"
+                echo "  2) 跳过扫描，进入默认域名选择"
+                echo "  0) 取消本次 Reality 节点添加"
+                read -r -p "扫描未成功，请选择 [0-2] (默认: 1): " scan_action
+                scan_action="${scan_action:-1}"
+                case "$scan_action" in
+                    1) break ;;
+                    2) break 2 ;;
+                    0)
+                        _info "已取消本次 Reality 节点添加。"
+                        return 1
+                        ;;
+                    *) _warn "无效选择，请重新输入。" ;;
+                esac
+            done
+        done
     fi
 
     if [ "$REALITY_CHINA_CHECK_ENABLED" = "true" ]; then
