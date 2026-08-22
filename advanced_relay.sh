@@ -4,7 +4,7 @@
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.6"
+SCRIPT_VERSION="16-kevin.7"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -25,6 +25,19 @@ REALITL_SCANNER_ARM64_SHA256="27bdd3e53d4391c66c8df3391d3c3fb5eb2dc356125f2fb33a
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
 REALITL_SCANNER_BIN="${REALITL_SCANNER_DIR}/RealiTLScanner"
 REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.release"
+REALITY_SNI_MAX_SCAN_TARGETS=512
+# 基于 3x-ui 当前内置 Reality 扫描种子；www.cloudflare.com 因既有非 Cloudflare 规则省略。
+REALITY_SNI_SEED_DOMAINS=(
+    "www.microsoft.com"
+    "www.amazon.com"
+    "aws.amazon.com"
+    "www.samsung.com"
+    "www.nvidia.com"
+    "www.amd.com"
+    "www.intel.com"
+    "www.sony.com"
+    "dl.google.com"
+)
 GREATFIRE_API_BASE="https://zh.greatfire.org"
 
 # sing-box 1.12+ 废弃配置兼容环境变量，与 sb.sh 保持一致。
@@ -547,6 +560,59 @@ _is_safe_reality_scan_cidr() {
     [[ "$prefix" =~ ^[0-9]+$ ]] && [ "$prefix" -ge 24 ] && [ "$prefix" -le 32 ]
 }
 
+_prepare_reality_custom_scan_file() {
+    local output_file="$1" raw_line token normalized prefix expanded
+    local total_targets=0 valid_entries=0 invalid_entries=0
+    local seen=" "
+    local tokens=()
+    : > "$output_file" || { _error "无法创建自定义扫描列表。"; return 1; }
+
+    echo "请粘贴域名、IPv4 或 IPv4 CIDR；支持每行一个，也可用空格或逗号分隔。"
+    echo "CIDR 仅允许 /24-/32，全部条目展开后最多 ${REALITY_SNI_MAX_SCAN_TARGETS} 个目标；输入空行结束。"
+    while true; do
+        IFS= read -r raw_line || break
+        raw_line="${raw_line//$'\r'/}"
+        [ -z "${raw_line//[[:space:]]/}" ] && break
+        raw_line="${raw_line//,/ }"
+        raw_line="${raw_line//;/ }"
+        read -r -a tokens <<< "$raw_line"
+        for token in "${tokens[@]}"; do
+            normalized=$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')
+            [ -z "$normalized" ] && continue
+            expanded=1
+            if [[ "$normalized" == */* ]]; then
+                if ! _is_safe_reality_scan_cidr "$normalized"; then
+                    _warn "已忽略无效或过大的 CIDR: ${token}"
+                    invalid_entries=$((invalid_entries + 1))
+                    continue
+                fi
+                prefix="${normalized#*/}"
+                expanded=$((1 << (32 - 10#$prefix)))
+            elif _is_valid_ipv4 "$normalized"; then
+                :
+            elif _is_valid_reality_domain "$normalized"; then
+                :
+            else
+                _warn "已忽略无效目标: ${token}"
+                invalid_entries=$((invalid_entries + 1))
+                continue
+            fi
+            [[ "$seen" == *" ${normalized} "* ]] && continue
+            if [ $((total_targets + expanded)) -gt "$REALITY_SNI_MAX_SCAN_TARGETS" ]; then
+                _error "自定义列表展开后超过 ${REALITY_SNI_MAX_SCAN_TARGETS} 个目标，请缩小 CIDR 或减少条目。"
+                return 1
+            fi
+            printf '%s\n' "$normalized" >> "$output_file" || return 1
+            seen="${seen}${normalized} "
+            total_targets=$((total_targets + expanded))
+            valid_entries=$((valid_entries + 1))
+        done
+    done
+    [ "$valid_entries" -gt 0 ] || { _error "没有可扫描的有效目标。"; return 1; }
+    [ "$invalid_entries" -gt 0 ] && _warn "共忽略 ${invalid_entries} 个无效目标。"
+    _info "已载入 ${valid_entries} 个条目，展开后最多 ${total_targets} 个扫描目标。"
+}
+
 _first_exact_cert_domain() {
     local target="$1" cert_info domain
     cert_info=$(timeout 6 openssl s_client -connect "${target}:443" -showcerts </dev/null 2>/dev/null | \
@@ -573,28 +639,70 @@ _scan_reality_sni_once() {
         _error "RealiTLScanner 安装或校验失败，尚未开始扫描。"
         return 1
     }
+    local temp_dir csv_file scan_log scan_status input_file scan_mode scan_label entry_count
     local public_ipv4 default_cidr="" scan_cidr
+    local scan_args=()
+    temp_dir=$(mktemp -d /tmp/sb-reality-scan.XXXXXX) || {
+        _error "无法创建 Reality 扫描临时目录。"
+        return 1
+    }
+    csv_file="${temp_dir}/out.csv"
+    scan_log="${temp_dir}/scan.log"
+    input_file="${temp_dir}/targets.txt"
+
     public_ipv4=$(_get_public_ip 2>/dev/null || true)
     if _is_valid_ipv4 "$public_ipv4"; then
         IFS='.' read -r _scan_a _scan_b _scan_c _scan_d <<< "$public_ipv4"
         default_cidr="${_scan_a}.${_scan_b}.${_scan_c}.0/24"
     fi
-    _warn "上游建议在本地而非云 VPS 扫描；本脚本限制为最多 /24、16 线程、3 秒单目标超时。"
-    read -r -p "请输入扫描 IPv4 CIDR [${default_cidr:-例如 203.0.113.0/24}]: " scan_cidr
-    scan_cidr="${scan_cidr:-$default_cidr}"
-    if ! _is_safe_reality_scan_cidr "$scan_cidr"; then
-        _error "扫描范围必须是 IPv4 CIDR，且前缀长度为 /24-/32。"
-        return 1
-    fi
 
-    local temp_dir csv_file scan_log scan_status
-    temp_dir=$(mktemp -d /tmp/sb-reality-scan.XXXXXX) || {
-        _error "无法创建 Reality 扫描临时目录。"
-        return 1
-    }
-    csv_file="${temp_dir}/out.csv"; scan_log="${temp_dir}/scan.log"
-    _info "正在使用 RealiTLScanner 扫描 ${scan_cidr}:443..."
-    timeout 180 "$REALITL_SCANNER_BIN" -addr "$scan_cidr" -port 443 -thread 16 -timeout 3 \
+    echo "请选择 Reality 候选扫描方式："
+    echo "  1) 扫描 VPS 邻近 IPv4 /24"
+    echo "  2) 检测内置大厂域名种子（推荐）"
+    echo "  3) 粘贴自定义域名/IPv4/CIDR 列表"
+    read -r -p "请选择 [1-3] (默认: 2): " scan_mode
+    scan_mode="${scan_mode:-2}"
+    case "$scan_mode" in
+        1)
+            _warn "上游建议在本地而非云 VPS 扫描；本模式限制为最多 /24、16 线程、3 秒单目标超时。"
+            read -r -p "请输入扫描 IPv4 CIDR [${default_cidr:-例如 203.0.113.0/24}]: " scan_cidr
+            scan_cidr="${scan_cidr:-$default_cidr}"
+            if ! _is_safe_reality_scan_cidr "$scan_cidr"; then
+                [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
+                _error "扫描范围必须是 IPv4 CIDR，且前缀长度为 /24-/32。"
+                return 1
+            fi
+            scan_args=(-addr "$scan_cidr")
+            scan_label="VPS 邻近网段 ${scan_cidr}:443"
+            ;;
+        2)
+            printf '%s\n' "${REALITY_SNI_SEED_DOMAINS[@]}" > "$input_file" || {
+                [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
+                _error "无法写入内置 Reality 域名种子。"
+                return 1
+            }
+            scan_args=(-in "$input_file")
+            scan_label="内置大厂域名种子（${#REALITY_SNI_SEED_DOMAINS[@]} 个）"
+            _info "种子源自 3x-ui 当前内置列表；已按既有规则排除 www.cloudflare.com。"
+            ;;
+        3)
+            if ! _prepare_reality_custom_scan_file "$input_file"; then
+                [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
+                return 1
+            fi
+            entry_count=$(wc -l < "$input_file" | tr -d ' ')
+            scan_args=(-in "$input_file")
+            scan_label="自定义列表（${entry_count} 个条目）"
+            ;;
+        *)
+            [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
+            _error "扫描方式无效。"
+            return 1
+            ;;
+    esac
+
+    _info "正在使用 RealiTLScanner 检测 ${scan_label}..."
+    timeout 180 "$REALITL_SCANNER_BIN" "${scan_args[@]}" -port 443 -thread 16 -timeout 3 \
         -out "$csv_file" > "$scan_log" 2>&1
     scan_status=$?
     if [ "$scan_status" -eq 124 ]; then
@@ -610,15 +718,38 @@ _scan_reality_sni_once() {
         fi
     fi
 
-    local results="" target origin candidate remainder key china_status
+    local results="" target origin candidate key china_status
     local gfw_result gfw_rejected=0
     local seen=" "
+    local csv_header header_name csv_line cert_domain_index=-1 i
+    local csv_fields=()
     if [ -s "$csv_file" ]; then
-        while IFS=',' read -r target origin candidate remainder; do
+        IFS= read -r csv_header < "$csv_file"
+        IFS=',' read -r -a csv_fields <<< "$csv_header"
+        for i in "${!csv_fields[@]}"; do
+            header_name=$(printf '%s' "${csv_fields[$i]}" | tr -d '\r\" ' | tr '[:lower:]' '[:upper:]')
+            [ "$header_name" = "CERT_DOMAIN" ] && { cert_domain_index="$i"; break; }
+        done
+        if [ "$cert_domain_index" -lt 0 ]; then
+            _error "无法识别 RealiTLScanner CSV 格式：缺少 CERT_DOMAIN 列。"
+            [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
+            return 1
+        fi
+        while IFS= read -r csv_line; do
+            IFS=',' read -r -a csv_fields <<< "$csv_line"
+            [ "${#csv_fields[@]}" -gt "$cert_domain_index" ] || continue
+            target="${csv_fields[0]}"
+            origin="${csv_fields[1]}"
+            candidate="${csv_fields[$cert_domain_index]}"
             target=$(printf '%s' "$target" | tr -d '\r ')
+            origin=$(printf '%s' "$origin" | tr -d '\r\" ' | tr '[:upper:]' '[:lower:]')
             candidate=$(printf '%s' "$candidate" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
             _is_valid_ipv4 "$target" || continue
-            [[ "$candidate" == \*.* ]] && candidate=$(_first_exact_cert_domain "$target" 2>/dev/null || true)
+            if ! _is_valid_ipv4 "$origin" && _is_valid_reality_domain "$origin"; then
+                candidate="$origin"
+            elif [[ "$candidate" == \*.* ]]; then
+                candidate=$(_first_exact_cert_domain "$target" 2>/dev/null || true)
+            fi
             _is_valid_reality_domain "$candidate" || continue
             key="${target}|${candidate}"
             [[ "$seen" == *" ${key} "* ]] && continue
@@ -727,7 +858,7 @@ _select_reality_sni() {
         REALITY_CHINA_CHECK_ENABLED=true
     fi
 
-    read -r -p "是否使用 XTLS/RealiTLScanner 扫描邻近 IP？[Y/n]: " scan_choice
+    read -r -p "是否使用 XTLS/RealiTLScanner 查找 Reality 候选？[Y/n]: " scan_choice
     if [[ "$scan_choice" != "n" && "$scan_choice" != "N" ]]; then
         while ! _scan_reality_sni_once; do
             while true; do
