@@ -4,9 +4,9 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.12"
+export SCRIPT_VERSION="20-kevin.13"
 export DEFAULT_SNI="www.icloud.com"
-export DEFAULT_REALITY_SNI="rocm.nightlies.amd.com"
+export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -15,12 +15,15 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="73f3f7522a74b16a070ae0137bc91a2bfbb7e4ee430ec016ab991e521e53ce32"
+ADVANCED_RELAY_SHA256="bec2b009ac0941054175fed6caede61c4e1a9b94e7d6e7115d620be38179ff25"
 PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
-REALITL_SCANNER_COMMIT="9bf9dfaf7fc2737970bfe7c6e9e74b00421e7018"
+REALITL_SCANNER_VERSION="v0.2.3"
+REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
+REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
+REALITL_SCANNER_ARM64_SHA256="27bdd3e53d4391c66c8df3391d3c3fb5eb2dc356125f2fb33ac58fcaaf8f88b3"
 REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
 REALITL_SCANNER_BIN="${REALITL_SCANNER_DIR}/RealiTLScanner"
-REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
+REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.release"
 GREATFIRE_API_BASE="https://zh.greatfire.org"
 GO_MIN_VERSION="1.21"
 GO_TOOLCHAIN_DIR="${REALITL_SCANNER_DIR}/go-toolchain"
@@ -730,45 +733,67 @@ EOF_REALITY_ORIGIN
     _info "Reality SNI: ${domain} | 握手目标: ${REALITY_LOCAL_ORIGIN_HOST}:${REALITY_LOCAL_ORIGIN_PORT}"
 }
 
+_realitlscanner_release_spec() {
+    case "$(uname -m)" in
+        x86_64|amd64)
+            printf '%s\t%s\n' "RealiTLScanner-linux-amd64" "$REALITL_SCANNER_AMD64_SHA256"
+            ;;
+        aarch64|arm64)
+            printf '%s\t%s\n' "RealiTLScanner-linux-arm64" "$REALITL_SCANNER_ARM64_SHA256"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 _install_realitlscanner() {
+    local spec asset_name expected_sha expected_marker temp_dir candidate actual_sha
+    spec=$(_realitlscanner_release_spec) || {
+        _error "RealiTLScanner ${REALITL_SCANNER_VERSION} 未提供当前架构 $(uname -m) 的官方 Linux 二进制。"
+        _warn "为避免临时安装 Go 与本地编译，已中止扫描器安装。"
+        return 1
+    }
+    IFS=$'\t' read -r asset_name expected_sha <<< "$spec"
+    expected_marker="${REALITL_SCANNER_VERSION}:${asset_name}:${expected_sha}"
     if [ -x "$REALITL_SCANNER_BIN" ] && [ -r "$REALITL_SCANNER_MARKER" ] && \
-       [ "$(tr -d '\r\n ' < "$REALITL_SCANNER_MARKER")" = "$REALITL_SCANNER_COMMIT" ]; then
+       [ "$(tr -d '\r\n ' < "$REALITL_SCANNER_MARKER")" = "$expected_marker" ]; then
         return 0
     fi
 
-    _warn "RealiTLScanner 上游未发布可校验的二进制资产，首次扫描需从固定上游提交编译。"
-    local go_bin
-    go_bin=$(_ensure_compatible_go) || return 1
-    _pkg_install git || return 1
-
-    local temp_dir candidate
+    command -v sha256sum >/dev/null 2>&1 || _pkg_install coreutils || return 1
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        _pkg_install curl wget ca-certificates || return 1
+    fi
     temp_dir=$(mktemp -d /tmp/sb-realitlscanner.XXXXXX) || return 1
-    _info "正在编译 XTLS/RealiTLScanner@${REALITL_SCANNER_COMMIT:0:12}..."
-    if ! env GOBIN="$temp_dir" GOTOOLCHAIN=local "$go_bin" install \
-        "github.com/xtls/RealiTLScanner@${REALITL_SCANNER_COMMIT}"; then
-        _warn "Go 模块代理下载失败，尝试直连 GitHub..."
-        if ! env GOBIN="$temp_dir" GOTOOLCHAIN=local GOPROXY=direct "$go_bin" install \
-            "github.com/xtls/RealiTLScanner@${REALITL_SCANNER_COMMIT}"; then
-            [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-            _error "RealiTLScanner 编译失败。"
-            return 1
+    candidate="${temp_dir}/${asset_name}"
+    _info "正在下载并校验 XTLS/RealiTLScanner ${REALITL_SCANNER_VERSION} (${asset_name})..."
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -fL --connect-timeout 10 --max-time 180 \
+            "${REALITL_SCANNER_RELEASE_BASE}/${asset_name}" -o "$candidate"; then
+            rm -f "$candidate"
         fi
     fi
-    candidate="${temp_dir}/RealiTLScanner"
-    if [ ! -x "$candidate" ]; then
+    if [ ! -s "$candidate" ] && command -v wget >/dev/null 2>&1; then
+        wget -qO "$candidate" "${REALITL_SCANNER_RELEASE_BASE}/${asset_name}" || true
+    fi
+    actual_sha=$(sha256sum "$candidate" 2>/dev/null | awk '{print $1}')
+    if [ ! -s "$candidate" ] || [ "$actual_sha" != "$expected_sha" ]; then
         [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-        _error "RealiTLScanner 编译产物缺失。"
+        _error "RealiTLScanner 下载失败或 SHA-256 校验不匹配，已拒绝安装。"
         return 1
     fi
+    chmod 700 "$candidate"
     if ! mkdir -p "$REALITL_SCANNER_DIR" || ! install -m 700 "$candidate" "$REALITL_SCANNER_BIN"; then
         [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
         return 1
     fi
-    printf '%s\n' "$REALITL_SCANNER_COMMIT" > "$REALITL_SCANNER_MARKER"
+    printf '%s\n' "$expected_marker" > "$REALITL_SCANNER_MARKER"
     chmod 600 "$REALITL_SCANNER_MARKER"
+    rm -f "${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
     touch "${SINGBOX_DIR}/.managed_realitlscanner"
     [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-    _success "RealiTLScanner 已按固定提交安装。"
+    _success "RealiTLScanner ${REALITL_SCANNER_VERSION} 官方二进制已安装并通过固定 SHA-256 校验。"
 }
 
 _probe_reality_target() {
@@ -1183,7 +1208,7 @@ _select_reality_sni() {
     local i sni_choice force_default
     while true; do
         echo "请选择 Reality SNI（候选已按 TLS 延迟从低到高排序）:"
-        echo "  回车) ${DEFAULT_REALITY_SNI} (默认，AMD ROCm / Amazon CloudFront，非 Cloudflare；大陆判定: ${default_china_status})"
+        echo "  回车) ${DEFAULT_REALITY_SNI} (默认，AMD 官方站点；仍需现场复核；大陆判定: ${default_china_status})"
         for i in "${!REALITY_SNI_DOMAINS[@]}"; do
             printf '  %d) %s (目标 %s:443, %s ms；大陆判定: %s)\n' "$((i + 1))" \
                 "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_TARGETS[$i]}" \
@@ -3590,7 +3615,7 @@ _uninstall() {
     [ "$managed_sing_box" = true ] && echo -e "  ${RED}-${NC} 本脚本安装的 sing-box: ${SINGBOX_BIN}"
     [ "$managed_yq" = true ] && echo -e "  ${RED}-${NC} 本脚本安装的 yq: ${YQ_BINARY}"
     [ "$managed_cloudflared" = true ] && echo -e "  ${RED}-${NC} 本脚本安装的 cloudflared: ${CLOUDFLARED_BIN}"
-    [ "$managed_realitlscanner" = true ] && echo -e "  ${RED}-${NC} 本脚本编译的 RealiTLScanner: ${REALITL_SCANNER_BIN}"
+    [ "$managed_realitlscanner" = true ] && echo -e "  ${RED}-${NC} 本脚本安装的 RealiTLScanner: ${REALITL_SCANNER_BIN}"
     [ "$managed_go_toolchain" = true ] && echo -e "  ${RED}-${NC} RealiTLScanner 专用 Go 工具链: ${GO_TOOLCHAIN_DIR}"
     echo -e "  ${YELLOW}!${NC} Nginx、证书和 ACME 续期任务将保留，避免影响同机 Emby 反代。"
     echo -e "  ${YELLOW}!${NC} 若 HAProxy 仍登记 Emby SNI，将保留 HAProxy 与共享路由状态。"
@@ -3642,7 +3667,7 @@ _uninstall() {
         rm -f "${CLOUDFLARED_BIN}"
     fi
     if [ "$managed_realitlscanner" = true ]; then
-        rm -f "$REALITL_SCANNER_BIN" "$REALITL_SCANNER_MARKER"
+        rm -f "$REALITL_SCANNER_BIN" "$REALITL_SCANNER_MARKER" "${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
     fi
     if [ "$managed_go_toolchain" = true ] && [ "$GO_TOOLCHAIN_DIR" = "/usr/local/lib/singbox-lite/go-toolchain" ]; then
         rm -rf -- "$GO_TOOLCHAIN_DIR"
