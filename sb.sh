@@ -1,22 +1,26 @@
 #!/bin/bash
 
+# SB_MANAGER_MANAGED_COMMAND=1
+
 # 所有运行时配置、节点凭据和私钥默认仅允许 root 读取。
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.17"
+export SCRIPT_VERSION="20-kevin.18"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
-SELF_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
+SB_QUICK_COMMAND_PATH="/usr/local/bin/sb"
+SB_QUICK_COMMAND_MARKER="# SB_MANAGER_MANAGED_COMMAND=1"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="2da659e757fe33464430b49daf253bcdf34c401a279d7bbf4da55adb565d39b4"
-PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
+ADVANCED_RELAY_SHA256="2e5d157036607dc51c978d039137e3607fefb9b512708dd6fdf331f948efa047"
+PARSER_SHA256="33edfbb4dc2dd2724d950b0608ae3c910db859f21701fd0e9ec8e09c2d438f31"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -72,11 +76,6 @@ SNI_ROUTER_HAPROXY_CONF="${SNI_ROUTER_HAPROXY_CONF:-/etc/haproxy/haproxy.cfg}"
 SNI_ROUTER_HAPROXY_BACKUP_DIR="${SNI_ROUTER_HAPROXY_BACKUP_DIR:-/etc/haproxy/backup}"
 SNI_ROUTER_MARKER="# Managed by singbox-lite SNI router"
 
-# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
-export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
-export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
-export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
-
 # --- 核心工具函数 ---
 
 # 颜色定义
@@ -102,10 +101,62 @@ _check_root() {
     fi
 }
 
+_ensure_quick_command() {
+    local source_path="$SELF_SCRIPT_PATH" source_real target_real install_tmp
+
+    if [ ! -f "$source_path" ]; then
+        _warn "当前脚本不是普通本地文件，已跳过自动安装 sb 快捷命令。"
+        _warn "请先下载 sb.sh 并执行 bash -n sb.sh，再运行该本地文件。"
+        return 0
+    fi
+    if ! grep -Fqx -- "$SB_QUICK_COMMAND_MARKER" "$source_path" || ! bash -n "$source_path"; then
+        _warn "当前脚本缺少管理标记或语法校验失败，已跳过自动安装 sb 快捷命令。"
+        return 0
+    fi
+
+    source_real=$(readlink -f -- "$source_path" 2>/dev/null || printf '%s\n' "$source_path")
+    if [ -L "$SB_QUICK_COMMAND_PATH" ]; then
+        _warn "sb 快捷命令路径是符号链接，已保留原目标: ${SB_QUICK_COMMAND_PATH}"
+        return 0
+    fi
+    if [ -e "$SB_QUICK_COMMAND_PATH" ]; then
+        target_real=$(readlink -f -- "$SB_QUICK_COMMAND_PATH" 2>/dev/null || printf '%s\n' "$SB_QUICK_COMMAND_PATH")
+        if [ "$source_real" = "$target_real" ]; then
+            chmod 700 -- "$SB_QUICK_COMMAND_PATH" 2>/dev/null || true
+            return 0
+        fi
+        if [ ! -f "$SB_QUICK_COMMAND_PATH" ] || ! grep -Fqx -- "$SB_QUICK_COMMAND_MARKER" "$SB_QUICK_COMMAND_PATH"; then
+            _warn "${SB_QUICK_COMMAND_PATH} 已被其他文件占用，拒绝覆盖；deploy.sh 将无法调用本脚本的 SNI 路由接口。"
+            return 0
+        fi
+    fi
+
+    install_tmp=$(mktemp "${SB_QUICK_COMMAND_PATH}.tmp.XXXXXXXXXX") || return 1
+    if ! install -m 700 -- "$source_path" "$install_tmp" || ! mv -f -- "$install_tmp" "$SB_QUICK_COMMAND_PATH"; then
+        rm -f -- "$install_tmp"
+        _warn "安装 sb 快捷命令失败；本次管理仍可继续，但暂不能保证与 deploy.sh 自动协作。"
+        return 0
+    fi
+    SELF_SCRIPT_PATH="$SB_QUICK_COMMAND_PATH"
+    SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
+    _success "sb 快捷命令已就绪: ${SB_QUICK_COMMAND_PATH}"
+}
+
 # 编解码器 (纯 Bash 稳健实现)
 _url_decode() {
-    local data="${1//+/ }"
-    printf '%b' "${data//%/\\x}"
+    local data="$1" result="" hex decoded
+    while [ -n "$data" ]; do
+        if [ "${data:0:1}" = "%" ] && [[ "${data:1:2}" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+            hex="${data:1:2}"
+            printf -v decoded '%b' "\\x${hex}"
+            result+="$decoded"
+            data="${data:3}"
+        else
+            result+="${data:0:1}"
+            data="${data:1}"
+        fi
+    done
+    printf '%s' "$result"
 }
 _url_encode() {
     # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
@@ -639,7 +690,8 @@ _acme_record_uses_webroot() {
 }
 
 _issue_local_origin_certificate() {
-    local domain="$1" cert_dir="${NGINX_CERT_DIR}/${domain}"
+    local domain="$1"
+    local cert_dir="${NGINX_CERT_DIR}/${domain}"
     local -a force_args=()
     if ! _acme_ecc_cert_is_usable "$domain" || ! _acme_record_uses_webroot "$domain"; then
         if "$SB_ACME_SH" --info -d "$domain" --ecc >/dev/null 2>&1; then
@@ -1745,9 +1797,6 @@ _manage_service() {
                     rm -f "$PID_FILE"
                     [ -s "${SINGBOX_DIR}/relay.json" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
                     nohup env GOMEMLIMIT="$(_get_mem_limit)MiB" \
-                        ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
-                        ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
-                        ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true \
                         "$SINGBOX_BIN" run -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" \
                         >> "$LOG_FILE" 2>&1 &
                     echo $! > "$PID_FILE"
@@ -3670,9 +3719,6 @@ After=network.target nss-lookup.target
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
-Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
-Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
-Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -3696,7 +3742,7 @@ command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB"
 respawn_delay=3
 respawn_max=0
 
@@ -3907,15 +3953,8 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-local",
-        "address": "local",
-        "detour": "direct"
-      }
-    ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-local"
+        "type": "local",
+        "tag": "dns-main"
       }
     ],
     "strategy": "prefer_ipv4"
@@ -3929,6 +3968,7 @@ _initialize_config_files() {
   ],
   "route": {
     "rules": [],
+    "default_domain_resolver": "dns-main",
     "final": "direct"
   }
 }
@@ -4083,41 +4123,163 @@ _cleanup_legacy_config() {
     return 1
 }
 
-_check_and_fix_dns() {
-    # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 3. 为未设置策略的旧配置补充 prefer_ipv4；保留用户在 DNS 菜单中明确选择的策略
-    if [ ! -f "$CONFIG_FILE" ]; then return; fi
-    
-    local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
-    local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
-    local dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
-    local needs_restart=false
-    
-    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ]; then
-        _warn "检测到 DNS/路由配置需要兼容性修复，正在自动处理..."
-        
-        local tmp_file="${CONFIG_FILE}.tmp"
-        jq '
-            if has("dns") then . else . + {
-                "dns": {
-                    "servers": [
-                        {"tag": "dns-local", "address": "local", "detour": "direct"}
-                    ],
-                    "rules": [{"outbound": "any", "server": "dns-local"}],
-                    "strategy": "prefer_ipv4"
-                }
-            } end
-            | if ((.dns.strategy // "") == "") then .dns.strategy = "prefer_ipv4" else . end
-            | del(.route.auto_detect_interface)
-        ' "$CONFIG_FILE" > "$tmp_file"
-        
-        if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
-            mv "$tmp_file" "$CONFIG_FILE"
-            _success "DNS 与路由参数热修复完成！"
-            needs_restart=true
+_build_dns_config() {
+    local dns_address="$1" dns_strategy="$2"
+    local scheme rest authority host port path default_port main_json
+    local needs_bootstrap=false
+
+    if [ "$dns_address" = "local" ]; then
+        jq -n --arg strategy "$dns_strategy" \
+            '{servers:[{type:"local",tag:"dns-main"}],strategy:$strategy}'
+        return
+    fi
+
+    if [[ "$dns_address" == *"://"* ]]; then
+        scheme="${dns_address%%://*}"
+        rest="${dns_address#*://}"
+    elif _is_valid_ipv4 "$dns_address" || [[ "$dns_address" =~ ^\[?[0-9A-Fa-f:]+\]?$ && "$dns_address" == *:* ]]; then
+        scheme="udp"
+        rest="$dns_address"
+    else
+        return 1
+    fi
+    case "$scheme" in
+        udp|tcp|tls|https) ;;
+        *) return 1 ;;
+    esac
+
+    if [ "$scheme" = "https" ]; then
+        authority="${rest%%/*}"
+        if [[ "$rest" == */* ]]; then
+            path="/${rest#*/}"
         else
-            _error "高级修复应用失败！"
+            path="/dns-query"
+        fi
+        [ -n "$path" ] || path="/dns-query"
+    else
+        [[ "$rest" != */* ]] || return 1
+        authority="$rest"
+        path=""
+    fi
+
+    if [[ "$authority" =~ ^\[([^]]+)\](:([0-9]+))?$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[3]}"
+    elif [[ "$authority" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$authority" =~ ^[0-9A-Fa-f:]+$ && "$authority" == *:* ]]; then
+        host="$authority"
+        port=""
+    else
+        host="$authority"
+        port=""
+    fi
+    [[ -n "$host" && "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+
+    case "$scheme" in
+        udp|tcp) default_port=53 ;;
+        tls) default_port=853 ;;
+        https) default_port=443 ;;
+    esac
+    port="${port:-$default_port}"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+
+    main_json=$(jq -n --arg type "$scheme" --arg server "$host" --argjson port "$port" --arg path "$path" '
+        {type:$type,tag:"dns-main",server:$server,server_port:$port}
+        | if $type == "https" then .path = $path else . end
+    ') || return 1
+    if ! _is_valid_ipv4 "$host" && [[ "$host" != *:* ]]; then
+        needs_bootstrap=true
+    fi
+
+    if [ "$needs_bootstrap" = true ]; then
+        jq -n --argjson main "$main_json" --arg strategy "$dns_strategy" '
+            {servers:[($main + {domain_resolver:"dns-bootstrap"}),{type:"local",tag:"dns-bootstrap"}],strategy:$strategy}
+        '
+    else
+        jq -n --argjson main "$main_json" --arg strategy "$dns_strategy" \
+            '{servers:[$main],strategy:$strategy}'
+    fi
+}
+
+_dns_current_address() {
+    jq -r '
+        ((.dns.servers[]? | select(.tag == "dns-main")) // .dns.servers[0]? // {}) as $server
+        | if (($server.address? // "") | type) == "string" and ($server.address? // "") != "" then
+            $server.address
+          elif $server.type == "local" then
+            "local"
+          elif ($server.server? // "") != "" then
+            ($server.server | if contains(":") then "[" + . + "]" else . end) as $host
+            | (($server.type // "udp") + "://" + $host
+               + (if $server.server_port? then ":" + ($server.server_port | tostring) else "" end)
+               + (if $server.type == "https" then ($server.path // "/dns-query") else "" end))
+          else
+            "未设置"
+          end
+    ' "$CONFIG_FILE" 2>/dev/null
+}
+
+_check_and_fix_dns() {
+    # 迁移脚本旧版 DNS 格式，避免 sing-box 1.14 删除兼容入口后首次启动失败。
+    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
+
+    local has_dns has_auto_detect dns_strategy legacy_count resolver_tag
+    local needs_restart=false tmp_file dns_json legacy_address
+    has_dns=$(jq -r '(.dns.servers? | type == "array") and ((.dns.servers | length) > 0)' "$CONFIG_FILE" 2>/dev/null)
+    has_auto_detect=$(jq -r 'try (.route.auto_detect_interface == true) catch false' "$CONFIG_FILE" 2>/dev/null)
+    dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
+    legacy_count=$(jq -r '[.dns.servers[]? | select(has("address"))] | length' "$CONFIG_FILE" 2>/dev/null)
+    tmp_file="${CONFIG_FILE}.tmp"
+
+    if [ "$has_dns" != "true" ]; then
+        dns_json=$(_build_dns_config local "${dns_strategy:-prefer_ipv4}") || return 1
+        jq --argjson dns "$dns_json" '
+            .dns = $dns
+            | .route = (.route // {rules:[],final:"direct"})
+            | .route.default_domain_resolver = "dns-main"
+            | del(.route.auto_detect_interface)
+        ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+        needs_restart=true
+    elif [ "$legacy_count" -gt 0 ]; then
+        if [ "$legacy_count" -ne 1 ] || [ "$(jq -r '.dns.servers | length' "$CONFIG_FILE")" -ne 1 ]; then
+            _warn "检测到自定义的多服务器旧版 DNS 配置，无法无损自动迁移。"
+            _warn "请先在 DNS 菜单重新选择服务器，再升级到 sing-box 1.14。"
+            return 1
+        fi
+        legacy_address=$(jq -r '.dns.servers[0].address // empty' "$CONFIG_FILE")
+        dns_json=$(_build_dns_config "$legacy_address" "${dns_strategy:-prefer_ipv4}") || {
+            _warn "旧版 DNS 地址无法自动迁移: ${legacy_address}"
+            return 1
+        }
+        jq --argjson dns "$dns_json" '
+            .dns = $dns
+            | .route = (.route // {rules:[],final:"direct"})
+            | .route.default_domain_resolver = "dns-main"
+            | del(.route.auto_detect_interface)
+        ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+        needs_restart=true
+    else
+        resolver_tag=$(jq -r '.dns.servers[0].tag // empty' "$CONFIG_FILE")
+        if [ "$has_auto_detect" = "true" ] || [ -z "$dns_strategy" ] || { [ -n "$resolver_tag" ] && ! jq -e '.route.default_domain_resolver? | strings | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; }; then
+            jq --arg strategy "${dns_strategy:-prefer_ipv4}" --arg resolver "$resolver_tag" '
+                .dns.strategy = $strategy
+                | .route = (.route // {rules:[],final:"direct"})
+                | if $resolver != "" and ((.route.default_domain_resolver // "") == "") then .route.default_domain_resolver = $resolver else . end
+                | del(.route.auto_detect_interface)
+            ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+            needs_restart=true
+        fi
+    fi
+
+    if [ "$needs_restart" = true ]; then
+        if [ -s "$tmp_file" ] && mv "$tmp_file" "$CONFIG_FILE"; then
+            _success "DNS 配置已迁移到 sing-box 1.14 兼容格式。"
+        else
+            _error "DNS 配置兼容性修复失败。"
             rm -f "$tmp_file"
+            return 1
         fi
     fi
 
@@ -6368,25 +6530,17 @@ _apply_dns_config() {
     local dns_strategy="$2"
     local tmp_file="${CONFIG_FILE}.dns.tmp.$$"
     local backup_file="${CONFIG_FILE}.bak_dns_$(date +%Y%m%d_%H%M%S)"
-    local check_result
+    local check_result dns_json
 
-    if ! jq --arg address "$dns_address" --arg strategy "$dns_strategy" '
-        .dns = {
-            "servers": [
-                {
-                    "tag": "dns-local",
-                    "address": $address,
-                    "detour": "direct"
-                }
-            ],
-            "rules": [
-                {
-                    "outbound": "any",
-                    "server": "dns-local"
-                }
-            ],
-            "strategy": $strategy
-        }
+    dns_json=$(_build_dns_config "$dns_address" "$dns_strategy") || {
+        _error "DNS 地址格式无效，仅支持 local、IP 或 udp/tcp/tls/https URL。"
+        return 1
+    }
+    if ! jq --argjson dns "$dns_json" '
+        .dns = $dns
+        | .route = (.route // {rules:[],final:"direct"})
+        | .route.default_domain_resolver = "dns-main"
+        | del(.route.auto_detect_interface)
     ' "$CONFIG_FILE" > "$tmp_file"; then
         _error "生成 DNS 配置失败。"
         rm -f "$tmp_file"
@@ -6415,7 +6569,7 @@ _dns_config_menu() {
     local current_address current_strategy choice dns_address dns_strategy
 
     while true; do
-        current_address=$(jq -r '.dns.servers[0].address // "未设置"' "$CONFIG_FILE" 2>/dev/null)
+        current_address=$(_dns_current_address)
         current_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "$CONFIG_FILE" 2>/dev/null)
         [ -z "$current_address" ] || [ "$current_address" = "null" ] && current_address="未设置"
         [ -z "$current_strategy" ] || [ "$current_strategy" = "null" ] && current_strategy="prefer_ipv4"
@@ -7773,6 +7927,7 @@ main() {
     
     # 1. 首次安装或依赖状态失效时才完整检查，避免每次 sb 进入菜单都触发包管理器
     _install_dependencies
+    _ensure_quick_command
     
     # 2. 根据核心安装状态决定初始化路径
     if [ -f "${SINGBOX_BIN}" ]; then
@@ -7811,6 +7966,10 @@ main() {
             fi
             if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
                 _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
+                need_update=true
+            fi
+            if grep -q "ENABLE_DEPRECATED_" "$SERVICE_FILE"; then
+                _warn "检测到 sing-box 旧版 DNS 兼容环境变量，正在移除..."
                 need_update=true
             fi
             if [ "$need_update" = true ]; then

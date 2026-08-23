@@ -9,8 +9,19 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 
 # [整合方案] 解析器核心解码函数 (独立实现，不依赖外部)
 _url_decode() {
-    local data="${1//+/ }"
-    printf '%b' "${data//%/\\x}"
+    local data="$1" result="" hex decoded
+    while [ -n "$data" ]; do
+        if [ "${data:0:1}" = "%" ] && [[ "${data:1:2}" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+            hex="${data:1:2}"
+            printf -v decoded '%b' "\\x${hex}"
+            result+="$decoded"
+            data="${data:3}"
+        else
+            result+="${data:0:1}"
+            data="${data:1}"
+        fi
+    done
+    printf '%s' "$result"
 }
 
 if ! command -v jq &>/dev/null; then
@@ -171,7 +182,8 @@ _parse_trojan() {
     local host_regex='(\[[^]]+\]|[^:/?#]+)'
     local regex="trojan://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
-        local password="${BASH_REMATCH[1]}"
+        local password
+        password=$(_decode "${BASH_REMATCH[1]}")
         local server=$(_strip_ipv6_brackets "${BASH_REMATCH[2]}")
         local port="${BASH_REMATCH[3]}"
         local params="${BASH_REMATCH[4]}"
@@ -311,13 +323,14 @@ _parse_socks() {
     local regex_noauth="socks5://${host_regex}:([0-9]+)#?(.*)"
     
     if [[ $link =~ $regex_auth ]]; then
-        local user="${BASH_REMATCH[1]}"
-        local pass="${BASH_REMATCH[2]}"
+        local user pass
+        user=$(_decode "${BASH_REMATCH[1]}")
+        pass=$(_decode "${BASH_REMATCH[2]}")
         local server=$(_strip_ipv6_brackets "${BASH_REMATCH[3]}")
         local port="${BASH_REMATCH[4]}"
         
         jq -n --arg s "$server" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
-            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pw}]}'
+            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", username:$u, password:$pw}'
     elif [[ $link =~ $regex_noauth ]]; then
         local server=$(_strip_ipv6_brackets "${BASH_REMATCH[1]}")
         local port="${BASH_REMATCH[2]}"

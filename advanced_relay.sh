@@ -4,7 +4,7 @@
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.7"
+SCRIPT_VERSION="16-kevin.8"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -17,7 +17,7 @@ REALITY_LOCAL_ORIGIN_PORT=8443
 SNI_ROUTER_API_VERSION=1
 SNI_ROUTER_PUBLIC_PORT=443
 SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
-PARSER_SHA256="90423e0ad625f13f812782e017ba42a51eaa25af1d4069f80bef028ea62da4f0"
+PARSER_SHA256="33edfbb4dc2dd2724d950b0608ae3c910db859f21701fd0e9ec8e09c2d438f31"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -39,11 +39,6 @@ REALITY_SNI_SEED_DOMAINS=(
     "dl.google.com"
 )
 GREATFIRE_API_BASE="https://zh.greatfire.org"
-
-# sing-box 1.12+ 废弃配置兼容环境变量，与 sb.sh 保持一致。
-export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
-export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
-export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
 
 # [整合方案] 检测父进程导出的工具函数
 # 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
@@ -1208,10 +1203,7 @@ _manage_service() {
                     fi
                     rm -f "$pid_file"
                     [ -s "$RELAY_CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
-                    nohup env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
-                        ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
-                        ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true \
-                        "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
+                    nohup "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
                         >> "$log_file" 2>&1 &
                     echo $! > "$pid_file"
                     ;;
@@ -2416,6 +2408,55 @@ _view_relays() {
 }
 
 # --- 4. 删除中转路由 ---
+_clear_all_relays() {
+    local links_file="${RELAY_AUX_DIR}/relay_links.json"
+    local relay_tmp links_tmp router_tag
+
+    relay_tmp=$(mktemp "${RELAY_CONFIG_FILE}.tmp.XXXXXXXXXX") || return 1
+    links_tmp=$(mktemp "${links_file}.tmp.XXXXXXXXXX") || { rm -f "$relay_tmp"; return 1; }
+    printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$relay_tmp"
+    printf '%s\n' '{}' > "$links_tmp"
+    if ! "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$relay_tmp" >/dev/null 2>&1; then
+        _error "清空后的配置未通过 sing-box 校验，原配置未修改。"
+        rm -f "$relay_tmp" "$links_tmp"
+        return 1
+    fi
+
+    router_tag=$(jq -r 'to_entries[]? | select(.value.fronted_by == "haproxy" and .value.router_role == "reality-default") | .key' "$links_file" 2>/dev/null | head -n 1)
+    if [ -n "$router_tag" ]; then
+        _sni_router_call remove-reality "$router_tag" || {
+            _error "无法注销 HAProxy Reality 后端，已取消清空。"
+            rm -f "$relay_tmp" "$links_tmp"
+            return 1
+        }
+    fi
+
+    if [ -f "$links_file" ]; then
+        jq -r 'to_entries[]? | select(.value.port_hopping) | "\(.key)|\(.value.port_hopping)"' "$links_file" 2>/dev/null | \
+            while IFS="|" read -r ptag hop; do
+                local psuffix hstart hend
+                psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
+                hstart="${hop%-*}"
+                hend="${hop#*-}"
+                _nft_apply_redirect_rule delete "$hstart" "$hend" "$psuffix" "singboxlite-relay-hop-${ptag}"
+            done
+        _save_nftables_rules 2>/dev/null || true
+    fi
+
+    # 元数据仍在时先清理脚本创建的 YAML 节点和证书；复用的 sb.sh 节点会保留。
+    _clear_created_relay_yaml_nodes
+    _clear_created_relay_certificates
+    mv "$relay_tmp" "$RELAY_CONFIG_FILE" || { rm -f "$relay_tmp" "$links_tmp"; return 1; }
+    mv "$links_tmp" "$links_file" || { rm -f "$links_tmp"; return 1; }
+    chmod 600 "$RELAY_CONFIG_FILE" "$links_file" 2>/dev/null || true
+
+    if ! _manage_service restart; then
+        _error "中转配置已清空，但 sing-box 重启失败；请检查主配置和服务日志。"
+        return 1
+    fi
+    _success "全部中转已清空，HAProxy 与 nftables 关联也已解除。"
+}
+
 _delete_relay() {
     echo -e "\n  ${RED}【删除中转路由】${NC}"
     
@@ -2472,36 +2513,7 @@ _delete_relay() {
         read -p "  确认删除所有? (yes/N): " confirm_all
         if [[ "$confirm_all" == "yes" ]]; then
             _info "正在批量删除..."
-
-            local router_tag
-            router_tag=$(jq -r 'to_entries[] | select(.value.fronted_by == "haproxy" and .value.router_role == "reality-default") | .key' "$LINKS_FILE" 2>/dev/null | head -n 1)
-            if [ -n "$router_tag" ]; then
-                _sni_router_call remove-reality "$router_tag" || {
-                    _error "无法注销 HAProxy Reality 后端，已取消批量删除。"
-                    return 1
-                }
-            fi
-            
-            # 清理中转跳跃端口 nftables 规则
-            if [ -f "${RELAY_AUX_DIR}/relay_links.json" ]; then
-                jq -r 'to_entries | .[] | select(.value.port_hopping) | "\(.key)|\(.value.port_hopping)"' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null | while IFS="|" read -r ptag hop; do
-                    local psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
-                    local hstart="${hop%-*}"
-                    local hend="${hop#*-}"
-                    _nft_apply_redirect_rule delete "$hstart" "$hend" "$psuffix" "singboxlite-relay-hop-${ptag}"
-                done
-                _save_nftables_rules 2>/dev/null
-            fi
-            
-            # 先按元数据移除中转脚本创建的 YAML 节点；复用的 sb.sh 节点不在清理范围内。
-            _clear_created_relay_yaml_nodes
-            _clear_created_relay_certificates
-
-            # 重置中转专用配置与元数据
-            echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
-            echo '{}' > "${RELAY_AUX_DIR}/relay_links.json"
-             _manage_service restart
-             _success "全部中转已清空"
+            _clear_all_relays
         fi
         return
     fi
@@ -4303,12 +4315,7 @@ _menu() {
             6) _modify_relay_port ;;
             7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
                if [ "$cn" == "y" ]; then
-                   _clear_created_relay_yaml_nodes
-                   _clear_created_relay_certificates
-                   echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
-                   echo '{}' > "${RELAY_AUX_DIR}/relay_links.json"
-                   _manage_service restart
-                   _success "全部中转已清空"
+                   _clear_all_relays
                fi ;;
             0) break ;;
             8) _port_forward_menu ;;
