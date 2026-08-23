@@ -4,7 +4,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.16"
+export SCRIPT_VERSION="20-kevin.17"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -1938,24 +1938,26 @@ EOF_HAPROXY_GLOBAL
         fi
         cat <<'EOF_HAPROXY_INSPECT'
     tcp-request inspect-delay 5s
-    tcp-request content accept if { req.ssl_hello_type 1 }
+    acl sb_tls_client_hello req.ssl_hello_type 1
 EOF_HAPROXY_INSPECT
 
-        local domain route_count=0
+        local domain route_count=0 conditions="" i
         while IFS= read -r domain; do
             [ -n "$domain" ] || continue
             echo "    acl sb_https_${route_count} req.ssl_sni -i ${domain}"
-            echo "    use_backend sb_https_backend if sb_https_${route_count}"
             route_count=$((route_count + 1))
         done < <(jq -r '.https_routes | keys[]?' "$SNI_ROUTER_STATE_FILE")
 
+        if [ -z "$reality_host" ] && [ -z "$reality_port" ] && [ "$route_count" -gt 0 ]; then
+            for ((i=0; i<route_count; i++)); do conditions="${conditions} !sb_https_${i}"; done
+            echo "    tcp-request content reject if sb_tls_client_hello${conditions}"
+        fi
+        echo '    tcp-request content accept if sb_tls_client_hello'
+        for ((i=0; i<route_count; i++)); do
+            echo "    use_backend sb_https_backend if sb_https_${i}"
+        done
         if [ -n "$reality_host" ] && [ -n "$reality_port" ]; then
             echo '    default_backend sb_reality_backend'
-        elif [ "$route_count" -gt 0 ]; then
-            local conditions=""
-            local i
-            for ((i=0; i<route_count; i++)); do conditions="${conditions} !sb_https_${i}"; done
-            echo "    tcp-request content reject if${conditions}"
         fi
 
         if [ "$route_count" -gt 0 ]; then
