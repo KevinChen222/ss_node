@@ -1881,7 +1881,7 @@ _sni_router_init_state() {
         local tmp
         tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || return 1
         jq -n --argjson version "$SNI_ROUTER_API_VERSION" --argjson port "$SNI_ROUTER_PUBLIC_PORT" \
-            '{version:$version,public_port:$port,reality:null,https_backend:null,https_routes:{}}' > "$tmp" || {
+            '{version:$version,public_port:$port,reality:null,https_backend:null,https_routes:{},tls_routes:{}}' > "$tmp" || {
             rm -f "$tmp"
             return 1
         }
@@ -1894,10 +1894,20 @@ _sni_router_init_state() {
         _error "SNI 路由状态版本不兼容: ${SNI_ROUTER_STATE_FILE}"
         return 1
     fi
+    if ! jq -e '.tls_routes | type == "object"' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+        local migrate_tmp
+        migrate_tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || return 1
+        jq '.tls_routes={}' "$SNI_ROUTER_STATE_FILE" > "$migrate_tmp" || {
+            rm -f "$migrate_tmp"
+            return 1
+        }
+        chmod 600 "$migrate_tmp"
+        mv "$migrate_tmp" "$SNI_ROUTER_STATE_FILE"
+    fi
 }
 
 _sni_router_state_has_routes() {
-    jq -e '(.reality != null) or ((.https_routes | length) > 0)' \
+    jq -e '(.reality != null) or ((.https_routes | length) > 0) or ((.tls_routes | length) > 0)' \
         "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1
 }
 
@@ -1923,7 +1933,7 @@ _sni_router_allocate_backend_port() {
         printf '%s\n' "$port"
         return 0
     done
-    _error "未找到可用的 Reality 回环后端端口。"
+    _error "未找到可用的 TLS 回环后端端口。"
     return 1
 }
 
@@ -1990,20 +2000,30 @@ EOF_HAPROXY_GLOBAL
     acl sb_tls_client_hello req.ssl_hello_type 1
 EOF_HAPROXY_INSPECT
 
-        local domain route_count=0 conditions="" i
+        local domain route_count=0 tls_route_count=0 conditions="" i tls_host tls_port
         while IFS= read -r domain; do
             [ -n "$domain" ] || continue
             echo "    acl sb_https_${route_count} req.ssl_sni -i ${domain}"
             route_count=$((route_count + 1))
         done < <(jq -r '.https_routes | keys[]?' "$SNI_ROUTER_STATE_FILE")
 
-        if [ -z "$reality_host" ] && [ -z "$reality_port" ] && [ "$route_count" -gt 0 ]; then
+        while IFS= read -r domain; do
+            [ -n "$domain" ] || continue
+            echo "    acl sb_tls_route_${tls_route_count} req.ssl_sni -i ${domain}"
+            tls_route_count=$((tls_route_count + 1))
+        done < <(jq -r '.tls_routes | keys[]?' "$SNI_ROUTER_STATE_FILE")
+
+        if [ -z "$reality_host" ] && [ -z "$reality_port" ] && [ $((route_count + tls_route_count)) -gt 0 ]; then
             for ((i=0; i<route_count; i++)); do conditions="${conditions} !sb_https_${i}"; done
+            for ((i=0; i<tls_route_count; i++)); do conditions="${conditions} !sb_tls_route_${i}"; done
             echo "    tcp-request content reject if sb_tls_client_hello${conditions}"
         fi
         echo '    tcp-request content accept if sb_tls_client_hello'
         for ((i=0; i<route_count; i++)); do
             echo "    use_backend sb_https_backend if sb_https_${i}"
+        done
+        for ((i=0; i<tls_route_count; i++)); do
+            echo "    use_backend sb_tls_backend_${i} if sb_tls_route_${i}"
         done
         if [ -n "$reality_host" ] && [ -n "$reality_port" ]; then
             echo '    default_backend sb_reality_backend'
@@ -2016,6 +2036,16 @@ backend sb_https_backend
     server nginx ${https_host}:${https_port} send-proxy-v2 check
 EOF_HAPROXY_HTTPS
         fi
+        i=0
+        while IFS=$'\t' read -r tls_host tls_port; do
+            [ -n "$tls_host" ] && [ -n "$tls_port" ] || continue
+            cat <<EOF_HAPROXY_TLS
+
+backend sb_tls_backend_${i}
+    server singbox_${i} ${tls_host}:${tls_port} check
+EOF_HAPROXY_TLS
+            i=$((i + 1))
+        done < <(jq -r '.tls_routes | to_entries | sort_by(.key)[]? | [.value.backend_host, (.value.backend_port|tostring)] | @tsv' "$SNI_ROUTER_STATE_FILE")
         if [ -n "$reality_host" ] && [ -n "$reality_port" ]; then
             cat <<EOF_HAPROXY_REALITY
 
@@ -2087,7 +2117,7 @@ _sni_router_register_reality() {
     _sni_router_validate_port "$backend_port" || { _error "Reality 后端端口无效。"; return 1; }
     _sni_router_lock || return 1
     _sni_router_init_state || return 1
-    local existing conflicting_https backup tmp
+    local existing conflicting_https conflicting_tls backup tmp
     existing=$(jq -r '.reality.tag // empty' "$SNI_ROUTER_STATE_FILE")
     if [ -n "$existing" ] && [ "$existing" != "$tag" ]; then
         _error "公网 443 已登记 Reality 后端: ${existing}。一个 443 入口只能指定一个默认 Reality 后端。"
@@ -2096,6 +2126,11 @@ _sni_router_register_reality() {
     conflicting_https=$(jq -r --arg sni "${sni,,}" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
     if [ -n "$conflicting_https" ]; then
         _error "Reality SNI ${sni,,} 已被 HTTPS 路由 ${conflicting_https} 使用；两者必须使用不同域名。"
+        return 1
+    fi
+    conflicting_tls=$(jq -r --arg sni "${sni,,}" '.tls_routes[$sni].tag // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$conflicting_tls" ]; then
+        _error "Reality SNI ${sni,,} 已被 TLS 路由 ${conflicting_tls} 使用；两者必须使用不同域名。"
         return 1
     fi
     backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
@@ -2135,13 +2170,71 @@ _sni_router_remove_reality() {
     rm -f "$backup"
 }
 
+_sni_router_register_tls() {
+    local owner="$1" tag="$2" sni="${3,,}" backend_port="$4"
+    _is_valid_reality_domain "$sni" || { _error "TLS SNI 格式无效: ${sni}"; return 1; }
+    _sni_router_validate_port "$backend_port" || { _error "TLS 后端端口无效。"; return 1; }
+    _sni_router_lock || return 1
+    _sni_router_init_state || return 1
+    local existing_tag conflicting_https reality_sni backup tmp
+    existing_tag=$(jq -r --arg sni "$sni" '.tls_routes[$sni].tag // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$existing_tag" ] && [ "$existing_tag" != "$tag" ]; then
+        _error "TLS SNI ${sni} 已由 ${existing_tag} 登记。"
+        return 1
+    fi
+    conflicting_https=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$conflicting_https" ]; then
+        _error "TLS SNI ${sni} 已被 HTTPS 路由 ${conflicting_https} 使用。"
+        return 1
+    fi
+    reality_sni=$(jq -r '.reality.sni // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$reality_sni" ] && [ "$reality_sni" = "$sni" ]; then
+        _error "TLS SNI ${sni} 与 Reality SNI 相同；两者必须使用不同域名。"
+        return 1
+    fi
+    backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
+    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    jq --arg owner "$owner" --arg tag "$tag" --arg sni "$sni" --argjson port "$backend_port" \
+        '.tls_routes[$sni]={owner:$owner,tag:$tag,backend_host:"127.0.0.1",backend_port:$port}' \
+        "$SNI_ROUTER_STATE_FILE" > "$tmp" || { rm -f "$backup" "$tmp"; return 1; }
+    chmod 600 "$tmp"; mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    if ! _sni_router_apply; then
+        _sni_router_restore_state "$backup"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+_sni_router_remove_tls() {
+    local tag="$1"
+    _sni_router_lock || return 1
+    _sni_router_init_state || return 1
+    local sni backup tmp
+    sni=$(jq -r --arg tag "$tag" '.tls_routes | to_entries[]? | select(.value.tag == $tag) | .key' "$SNI_ROUTER_STATE_FILE" | head -n 1)
+    [ -n "$sni" ] || return 0
+    backup=$(mktemp); tmp=$(mktemp) || { rm -f "$backup"; return 1; }
+    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
+    jq --arg sni "$sni" 'del(.tls_routes[$sni])' "$SNI_ROUTER_STATE_FILE" > "$tmp" || {
+        rm -f "$backup" "$tmp"
+        return 1
+    }
+    chmod 600 "$tmp"; mv "$tmp" "$SNI_ROUTER_STATE_FILE"
+    if ! _sni_router_apply; then
+        _sni_router_restore_state "$backup"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
 _sni_router_register_https() {
     local owner="$1" sni="${2,,}" backend_port="$3"
     _is_valid_reality_domain "$sni" || { _error "HTTPS SNI 格式无效: ${sni}"; return 1; }
     _sni_router_validate_port "$backend_port" || { _error "HTTPS 后端端口无效。"; return 1; }
     _sni_router_lock || return 1
     _sni_router_init_state || return 1
-    local existing_owner existing_port reality_sni backup tmp
+    local existing_owner existing_port reality_sni conflicting_tls backup tmp
     existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
     if [ -n "$existing_owner" ] && [ "$existing_owner" != "$owner" ]; then
         _error "SNI ${sni} 已由 ${existing_owner} 登记。"
@@ -2150,6 +2243,11 @@ _sni_router_register_https() {
     reality_sni=$(jq -r '.reality.sni // empty' "$SNI_ROUTER_STATE_FILE")
     if [ -n "$reality_sni" ] && [ "$reality_sni" = "$sni" ]; then
         _error "HTTPS SNI ${sni} 与 Reality SNI 相同；两者必须使用不同域名。"
+        return 1
+    fi
+    conflicting_tls=$(jq -r --arg sni "$sni" '.tls_routes[$sni].tag // empty' "$SNI_ROUTER_STATE_FILE")
+    if [ -n "$conflicting_tls" ]; then
+        _error "HTTPS SNI ${sni} 已被 TLS 路由 ${conflicting_tls} 使用。"
         return 1
     fi
     existing_port=$(jq -r '.https_backend.port // empty' "$SNI_ROUTER_STATE_FILE")
@@ -2203,7 +2301,8 @@ _sni_router_status() {
         . as $root |
         "public=:" + (.public_port|tostring),
         (if .reality then "reality=" + .reality.sni + " -> " + .reality.backend_host + ":" + (.reality.backend_port|tostring) else "reality=未登记" end),
-        (if (.https_routes|length)>0 then (.https_routes|to_entries[]|"https="+.key+" -> "+$root.https_backend.host+":"+($root.https_backend.port|tostring)+" ("+.value.owner+")") else "https=未登记" end)
+        (if (.https_routes|length)>0 then (.https_routes|to_entries[]|"https="+.key+" -> "+$root.https_backend.host+":"+($root.https_backend.port|tostring)+" ("+.value.owner+")") else "https=未登记" end),
+        (if (.tls_routes|length)>0 then (.tls_routes|to_entries[]|"tls="+.key+" -> "+.value.backend_host+":"+(.value.backend_port|tostring)+" ("+.value.tag+")") else "tls=未登记" end)
     ' "$SNI_ROUTER_STATE_FILE"
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active haproxy >/dev/null 2>&1; then
         echo 'haproxy=active'
@@ -2348,6 +2447,14 @@ _sni_router_cli() {
             ;;
         remove-reality)
             _sni_router_remove_reality "${1:-}"
+            ;;
+        register-tls)
+            [ "$#" -eq 4 ] || { _error "用法: sb sni-router register-tls OWNER TAG SNI BACKEND_PORT"; return 2; }
+            _sni_router_register_tls "$1" "$2" "$3" "$4"
+            ;;
+        remove-tls)
+            [ "$#" -eq 1 ] || { _error "用法: sb sni-router remove-tls TAG"; return 2; }
+            _sni_router_remove_tls "$1"
             ;;
         register-https)
             [ "$#" -eq 3 ] || { _error "用法: sb sni-router register-https OWNER SNI BACKEND_PORT"; return 2; }
@@ -3871,6 +3978,14 @@ _uninstall() {
         _error "无法安全注销 HAProxy Reality 后端，卸载已中止。"
         return 1
     }
+    local router_tls_tag
+    while IFS= read -r router_tls_tag; do
+        [ -n "$router_tls_tag" ] || continue
+        _sni_router_remove_tls "$router_tls_tag" || {
+            _error "无法安全注销 HAProxy TLS 后端 ${router_tls_tag}，卸载已中止。"
+            return 1
+        }
+    done < <(jq -r '.tls_routes | to_entries[]? | select(.value.owner == "sb") | .value.tag' "$SNI_ROUTER_STATE_FILE" 2>/dev/null)
 
     # 2. 停止服务
     _manage_service "stop"
@@ -5080,12 +5195,60 @@ _add_trojan_ws_tls() {
     _show_node_link "trojan-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$password" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path"
 }
 
+_activate_anytls_sni_route() {
+    local route_kind="$1" tag="$2" server_name="$3" backend_port="$4" name="$5"
+    if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" >/dev/null 2>&1 || \
+       ! _manage_service restart; then
+        _error "Sing-box 新配置未能启动，正在撤销新节点。"
+        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+        _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
+        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+        rm -f "${SINGBOX_DIR}/${tag}.pem" "${SINGBOX_DIR}/${tag}.key"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    local listener_ready=false listener_attempt
+    for listener_attempt in 1 2 3 4 5; do
+        if _check_port_occupied "$backend_port" tcp; then
+            listener_ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$listener_ready" != true ]; then
+        _error "Sing-box 未监听 AnyTLS 回环端口 ${backend_port}，正在撤销新节点。"
+        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+        _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
+        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+        rm -f "${SINGBOX_DIR}/${tag}.pem" "${SINGBOX_DIR}/${tag}.key"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if { [ "$route_kind" = "reality" ] && ! _sni_router_register_reality sb "$tag" "$server_name" "$backend_port"; } || \
+       { [ "$route_kind" = "tls" ] && ! _sni_router_register_tls sb "$tag" "$server_name" "$backend_port"; }; then
+        _error "HAProxy AnyTLS 路由登记失败，正在撤销新节点。"
+        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+        _atomic_modify_json "$METADATA_FILE" "del(.\"$tag\")" >/dev/null 2>&1 || true
+        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
+        rm -f "${SINGBOX_DIR}/${tag}.pem" "${SINGBOX_DIR}/${tag}.key"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
+    ADD_NODE_SERVICE_RESTARTED=true
+    _info "公网 443 -> HAProxy -> 127.0.0.1:${backend_port} -> Sing-box AnyTLS"
+}
+
 _create_anytls_tls_node() {
     local node_ip="$1"
     local port="$2"
     local server_name="$3"
     local password="$4"
     local name="$5"
+    local listen_address="${6:-::}"
+    local backend_port="${7:-$port}"
+    local router_mode="${8:-false}"
 
     # --- 步骤 4: 证书选择 ---
     local cert_choice="1"
@@ -5139,7 +5302,8 @@ _create_anytls_tls_node() {
     # 不固定 padding_scheme，让当前 sing-box 自动使用并跟随上游默认填充方案。
     local inbound_json=$(jq -n \
         --arg t "$tag" \
-        --arg p "$port" \
+        --arg p "$backend_port" \
+        --arg listen "$listen_address" \
         --arg pw "$password" \
         --arg sn "$server_name" \
         --arg cp "$cert_path" \
@@ -5147,7 +5311,7 @@ _create_anytls_tls_node() {
         '{
             "type": "anytls",
             "tag": $t,
-            "listen": "::",
+            "listen": $listen,
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
             "tls": {
@@ -5189,8 +5353,13 @@ _create_anytls_tls_node() {
     
     # --- 保存元数据 ---
     local meta_json
-    meta_json=$(jq -n --arg n "$name" --arg sn "$server_name" '{name:$n, server_name:$sn, yaml:true}')
+    meta_json=$(jq -n --arg n "$name" --arg sn "$server_name" --argjson public "$port" \
+        --argjson backend "$backend_port" --argjson routed "$router_mode" \
+        '{name:$n, server_name:$sn, yaml:true, publicPort:$public, backendPort:$backend} +
+         (if $routed then {frontedBy:"haproxy",routerRole:"tls-sni"} else {} end)')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+
+    [ "$router_mode" != true ] || _activate_anytls_sni_route tls "$tag" "$server_name" "$backend_port" "$name" || return 1
     
     _success "AnyTLS 节点 [${name}] 添加成功!"
     _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify"
@@ -5204,6 +5373,9 @@ _create_anyreality_node() {
     local name="$5"
     local handshake_server="${6:-$server_name}"
     local handshake_port="${7:-443}"
+    local listen_address="${8:-::}"
+    local backend_port="${9:-$port}"
+    local router_mode="${10:-false}"
     local tag="any-reality-in-${port}"
 
     local keypair private_key public_key short_id
@@ -5214,7 +5386,8 @@ _create_anyreality_node() {
 
     local inbound_json=$(jq -n \
         --arg t "$tag" \
-        --arg p "$port" \
+        --arg p "$backend_port" \
+        --arg listen "$listen_address" \
         --arg pw "$password" \
         --arg sn "$server_name" \
         --arg hs "$handshake_server" \
@@ -5224,7 +5397,7 @@ _create_anyreality_node() {
         '{
             "type": "anytls",
             "tag": $t,
-            "listen": "::",
+            "listen": $listen,
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
             "tls": {
@@ -5258,8 +5431,14 @@ _create_anyreality_node() {
         --arg sid "$short_id" \
         --arg link "$share_link" \
         --arg n "$name" \
-        '{type:$type, name:$n, server_name:$sn, handshake_server:$hs, handshake_port:($hp|tonumber), publicKey:$pub, shortId:$sid, share_link:$link, yaml:false}')
+        --argjson public "$port" \
+        --argjson backend "$backend_port" \
+        --argjson routed "$router_mode" \
+        '{type:$type, name:$n, server_name:$sn, handshake_server:$hs, handshake_port:($hp|tonumber), publicKey:$pub, shortId:$sid, share_link:$link, yaml:false, publicPort:$public, backendPort:$backend} +
+         (if $routed then {frontedBy:"haproxy",routerRole:"reality-default"} else {} end)')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+
+    [ "$router_mode" != true ] || _activate_anytls_sni_route reality "$tag" "$server_name" "$backend_port" "$name" || return 1
 
     _success "Any-Reality 节点 [${name}] 添加成功!"
     _warning "Any-Reality 为 AnyTLS + Reality，Mihomo/Clash 不支持，已跳过写入 clash.yaml。"
@@ -5274,6 +5453,9 @@ _add_anytls() {
     local reality_handshake_server="$DEFAULT_REALITY_SNI"
     local reality_handshake_port=443
     local mode_choice="1"
+    local tls_backend_port="" reality_backend_port="" any_reality_port=""
+    local tls_listen_address="::" reality_listen_address="::"
+    local tls_router_mode=false reality_router_mode=false
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -5300,14 +5482,58 @@ _add_anytls() {
         while true; do
             read -p "请输入起始监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
-            _check_port_conflict "$port" "tcp" && continue
+            if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                _error "端口必须在 1-65535 之间。"
+                continue
+            fi
+            tls_backend_port="$port"
+            reality_backend_port="$port"
+            tls_listen_address="::"
+            reality_listen_address="::"
+            tls_router_mode=false
+            reality_router_mode=false
+            any_reality_port="$port"
             if [[ "$mode_choice" == "1,2" || "$mode_choice" == "2,1" || "$mode_choice" == "1 2" || "$mode_choice" == "2 1" ]]; then
-                local reality_port=$((port + 1))
-                if [ "$reality_port" -gt 65535 ]; then
+                any_reality_port=$((port + 1))
+                reality_backend_port="$any_reality_port"
+                if [ "$any_reality_port" -gt 65535 ]; then
                     _error "同时创建两个节点时，起始端口不能为 65535。"
                     continue
                 fi
-                _check_port_conflict "$reality_port" "tcp" && continue
+            fi
+
+            local router_target=""
+            if [[ "$mode_choice" == *"1"* ]] && [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+                router_target="AnyTLS"
+            elif [[ "$mode_choice" == *"2"* ]] && [ "$any_reality_port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+                router_target="Any-Reality"
+            fi
+            if [ -n "$router_target" ]; then
+                local use_router router_compat="与 Reality/Emby 可共存"
+                [ "$router_target" != "Any-Reality" ] || router_compat="可与 Emby 共存；Reality 默认后端只能有一个"
+                read -r -p "是否由 HAProxy 复用公网 443（${router_target} ${router_compat}）？[Y/n]: " use_router
+                if [[ ! "$use_router" =~ ^[Nn]$ ]]; then
+                    _sni_router_prepare || continue
+                    if [ "$router_target" = "Any-Reality" ]; then
+                        if jq -e '.reality != null' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+                            _error "HAProxy 443 已经登记了一个 Reality 默认后端，请先删除该节点。"
+                            continue
+                        fi
+                        reality_backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || continue
+                        reality_listen_address="127.0.0.1"
+                        reality_router_mode=true
+                    else
+                        tls_backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || continue
+                        tls_listen_address="127.0.0.1"
+                        tls_router_mode=true
+                    fi
+                fi
+            fi
+            if [[ "$mode_choice" == *"1"* ]] && [ "$tls_router_mode" != true ]; then
+                _check_port_conflict "$port" "tcp" && continue
+            fi
+            if [[ "$mode_choice" == *"2"* ]] && [ "$reality_router_mode" != true ]; then
+                _check_port_conflict "$any_reality_port" "tcp" && continue
             fi
             break
         done
@@ -5319,6 +5545,38 @@ _add_anytls() {
         else
             read -p "请输入 AnyTLS 伪装域名/SNI (默认: ${DEFAULT_SNI}): " camouflage_domain
             server_name=${camouflage_domain:-$DEFAULT_SNI}
+        fi
+    fi
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            _error "批量创建错误: AnyTLS 端口无效。"
+            return 1
+        fi
+        tls_backend_port="$port"
+        reality_backend_port="$port"
+        any_reality_port="$port"
+        if [[ "$mode_choice" == "1,2" || "$mode_choice" == "2,1" || "$mode_choice" == "1 2" || "$mode_choice" == "2 1" ]]; then
+            any_reality_port=$((port + 1))
+            reality_backend_port="$any_reality_port"
+            [ "$any_reality_port" -le 65535 ] || { _error "批量创建错误: Any-Reality 端口超出范围。"; return 1; }
+        fi
+        if [ "${BATCH_SNI_ROUTER:-false}" = "true" ]; then
+            if [[ "$mode_choice" == *"1"* ]] && [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+                _sni_router_prepare || return 1
+                tls_backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
+                tls_listen_address="127.0.0.1"
+                tls_router_mode=true
+            elif [[ "$mode_choice" == *"2"* ]] && [ "$any_reality_port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+                _sni_router_prepare || return 1
+                jq -e '.reality == null' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1 || {
+                    _error "HAProxy 443 已经登记了一个 Reality 默认后端。"
+                    return 1
+                }
+                reality_backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
+                reality_listen_address="127.0.0.1"
+                reality_router_mode=true
+            fi
         fi
     fi
 
@@ -5341,7 +5599,8 @@ _add_anytls() {
                 read -p "请输入 AnyTLS 节点名称 (默认: ${default_name}): " custom_name
                 name=${custom_name:-$default_name}
             fi
-            _create_anytls_tls_node "$node_ip" "$port" "$server_name" "$password" "$name" || return 1
+            _create_anytls_tls_node "$node_ip" "$port" "$server_name" "$password" "$name" \
+                "$tls_listen_address" "$tls_backend_port" "$tls_router_mode" || return 1
             created=true
             ;;
         2)
@@ -5354,12 +5613,13 @@ _add_anytls() {
                 name=${custom_name:-$default_name}
             fi
             _validate_reality_no_self_loop "$port" "$reality_handshake_server" "$reality_handshake_port" || return 1
-            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_handshake_server" "$reality_handshake_port" || return 1
+            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$reality_handshake_server" "$reality_handshake_port" \
+                "$reality_listen_address" "$reality_backend_port" "$reality_router_mode" || return 1
             created=true
             ;;
         1,2|2,1|"1 2"|"2 1")
             local tls_port="$port"
-            local reality_port=$((port + 1))
+            local reality_port="$any_reality_port"
             local tls_name reality_name
             if [ "$BATCH_MODE" = "true" ]; then
                 tls_name="Batch-AnyTLS-${tls_port}"
@@ -5374,8 +5634,10 @@ _add_anytls() {
                 reality_name=${custom_reality_name:-$default_reality_name}
             fi
             _validate_reality_no_self_loop "$reality_port" "$reality_handshake_server" "$reality_handshake_port" || return 1
-            _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" || return 1
-            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_handshake_server" "$reality_handshake_port" || return 1
+            _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" \
+                "$tls_listen_address" "$tls_backend_port" "$tls_router_mode" || return 1
+            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" "$reality_handshake_server" "$reality_handshake_port" \
+                "$reality_listen_address" "$reality_backend_port" "$reality_router_mode" || return 1
             created=true
             ;;
     esac
@@ -6353,6 +6615,14 @@ _delete_node() {
                 return 1
             }
         fi
+        local router_tls_tag
+        while IFS= read -r router_tls_tag; do
+            [ -n "$router_tls_tag" ] || continue
+            _sni_router_remove_tls "$router_tls_tag" || {
+                _error "无法注销 HAProxy TLS 后端 ${router_tls_tag}，已取消删除所有节点。"
+                return 1
+            }
+        done < <(jq -r 'to_entries[] | select(.value.frontedBy == "haproxy" and .value.routerRole == "tls-sni") | .key' "$METADATA_FILE" 2>/dev/null)
         
         # [安全性加固] 精准分离并销毁仅关联本脚本的 nftables 跳跃端口规则（必须在清空 metadata 之前执行！）
         if [ -f "$METADATA_FILE" ]; then
@@ -6419,20 +6689,32 @@ _delete_node() {
         node_type=$(echo "$node_metadata" | jq -r '.type // empty')
     fi
 
-    local router_backed=false router_sni="" router_backend=""
+    local router_backed=false router_sni="" router_backend="" router_role=""
     if [ -n "$node_metadata" ] && [ "$(echo "$node_metadata" | jq -r '.frontedBy // empty')" = "haproxy" ]; then
         router_backed=true
-        router_sni=$(jq -r --arg tag "$tag_to_del" '.inbounds[] | select(.tag == $tag) | .tls.server_name // empty' "$CONFIG_FILE")
+        router_role=$(echo "$node_metadata" | jq -r '.routerRole // empty')
+        router_sni=$(echo "$node_metadata" | jq -r '.server_name // empty')
+        [ -n "$router_sni" ] || router_sni=$(jq -r --arg tag "$tag_to_del" '.inbounds[] | select(.tag == $tag) | .tls.server_name // empty' "$CONFIG_FILE")
         router_backend=$(echo "$node_metadata" | jq -r '.backendPort // empty')
-        _sni_router_remove_reality "$tag_to_del" || {
-            _error "无法注销 HAProxy Reality 后端，节点未删除。"
+        if [ "$router_role" = "tls-sni" ]; then
+            _sni_router_remove_tls "$tag_to_del"
+        else
+            _sni_router_remove_reality "$tag_to_del"
+        fi || {
+            _error "无法注销 HAProxy 后端，节点未删除。"
             return 1
         }
     fi
     
     # [!] 重要修正：不使用索引删除（因为列表已过滤），改为使用 Tag 精确匹配删除
     if ! _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag_to_del\"))"; then
-        [ "$router_backed" = true ] && _sni_router_register_reality sb "$tag_to_del" "$router_sni" "$router_backend" >/dev/null 2>&1 || true
+        if [ "$router_backed" = true ]; then
+            if [ "$router_role" = "tls-sni" ]; then
+                _sni_router_register_tls sb "$tag_to_del" "$router_sni" "$router_backend" >/dev/null 2>&1 || true
+            else
+                _sni_router_register_reality sb "$tag_to_del" "$router_sni" "$router_backend" >/dev/null 2>&1 || true
+            fi
+        fi
         return
     fi
     
@@ -6858,6 +7140,11 @@ _modify_port() {
     if [ "$new_port" -eq "$old_public_port" ]; then
         _warning "新端口与当前端口相同，无需修改。"
         return
+    fi
+
+    if [ "$(jq -r --arg tag "$tag_to_modify" '.[$tag].routerRole // empty' "$METADATA_FILE" 2>/dev/null)" = "tls-sni" ]; then
+        _error "HAProxy 443 复用模式下的普通 AnyTLS 暂不支持直接修改端口，请删除后重新创建。"
+        return 1
     fi
 
     _switch_reality_public_port "$tag_to_modify" "$type_to_modify" "$old_port" "$old_public_port" "$new_port"
@@ -7835,7 +8122,7 @@ _batch_create_nodes() {
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_REALITY_HANDSHAKE_SERVER BATCH_REALITY_HANDSHAKE_PORT BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_SNI_ROUTER BATCH_REALITY_HANDSHAKE_SERVER BATCH_REALITY_HANDSHAKE_PORT BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
