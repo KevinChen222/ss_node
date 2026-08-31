@@ -6,7 +6,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.18"
+export SCRIPT_VERSION="20-kevin.19"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -19,7 +19,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="2e5d157036607dc51c978d039137e3607fefb9b512708dd6fdf331f948efa047"
+ADVANCED_RELAY_SHA256="c729615d6ee272c2b1fb74e1c5753416d2237e2e18ebfc7fa6c3bc826992ccbc"
 PARSER_SHA256="33edfbb4dc2dd2724d950b0608ae3c910db859f21701fd0e9ec8e09c2d438f31"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
@@ -2768,6 +2768,7 @@ _install_sing_box() {
     local temp_dir=""
     local archive_path=""
     local extracted_bin=""
+    local config_check_output=""
     case $arch in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
@@ -2819,6 +2820,23 @@ _install_sing_box() {
         _error "下载的 sing-box 二进制无法通过版本检查，已拒绝安装。"
         rm -rf "$temp_dir"
         return 1
+    fi
+
+    # 覆盖现有核心前，先让候选版本校验服务实际加载的合并配置。
+    if [ -s "$CONFIG_FILE" ]; then
+        if [ -s "${SINGBOX_DIR}/relay.json" ]; then
+            if ! config_check_output=$("$extracted_bin" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" 2>&1); then
+                _error "当前配置无法通过 sing-box ${version} 校验，已取消更新。"
+                printf '%s\n' "$config_check_output" >&2
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        elif ! config_check_output=$("$extracted_bin" check -c "$CONFIG_FILE" 2>&1); then
+            _error "当前配置无法通过 sing-box ${version} 校验，已取消更新。"
+            printf '%s\n' "$config_check_output" >&2
+            rm -rf "$temp_dir"
+            return 1
+        fi
     fi
 
     rm -f "$archive_path"
@@ -4338,7 +4356,8 @@ _dns_current_address() {
 
 _check_and_fix_dns() {
     # 迁移脚本旧版 DNS 格式，避免 sing-box 1.14 删除兼容入口后首次启动失败。
-    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
+    # 返回值：0=已修改，1=无需修改，2=迁移失败。
+    if [ ! -f "$CONFIG_FILE" ]; then return 2; fi
 
     local has_dns has_auto_detect dns_strategy legacy_count resolver_tag
     local needs_restart=false tmp_file dns_json legacy_address
@@ -4349,31 +4368,31 @@ _check_and_fix_dns() {
     tmp_file="${CONFIG_FILE}.tmp"
 
     if [ "$has_dns" != "true" ]; then
-        dns_json=$(_build_dns_config local "${dns_strategy:-prefer_ipv4}") || return 1
+        dns_json=$(_build_dns_config local "${dns_strategy:-prefer_ipv4}") || return 2
         jq --argjson dns "$dns_json" '
             .dns = $dns
             | .route = (.route // {rules:[],final:"direct"})
             | .route.default_domain_resolver = "dns-main"
             | del(.route.auto_detect_interface)
-        ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+        ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 2; }
         needs_restart=true
     elif [ "$legacy_count" -gt 0 ]; then
         if [ "$legacy_count" -ne 1 ] || [ "$(jq -r '.dns.servers | length' "$CONFIG_FILE")" -ne 1 ]; then
             _warn "检测到自定义的多服务器旧版 DNS 配置，无法无损自动迁移。"
             _warn "请先在 DNS 菜单重新选择服务器，再升级到 sing-box 1.14。"
-            return 1
+            return 2
         fi
         legacy_address=$(jq -r '.dns.servers[0].address // empty' "$CONFIG_FILE")
         dns_json=$(_build_dns_config "$legacy_address" "${dns_strategy:-prefer_ipv4}") || {
             _warn "旧版 DNS 地址无法自动迁移: ${legacy_address}"
-            return 1
+            return 2
         }
         jq --argjson dns "$dns_json" '
             .dns = $dns
             | .route = (.route // {rules:[],final:"direct"})
             | .route.default_domain_resolver = "dns-main"
             | del(.route.auto_detect_interface)
-        ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+        ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 2; }
         needs_restart=true
     else
         resolver_tag=$(jq -r '.dns.servers[0].tag // empty' "$CONFIG_FILE")
@@ -4383,7 +4402,7 @@ _check_and_fix_dns() {
                 | .route = (.route // {rules:[],final:"direct"})
                 | if $resolver != "" and ((.route.default_domain_resolver // "") == "") then .route.default_domain_resolver = $resolver else . end
                 | del(.route.auto_detect_interface)
-            ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+            ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 2; }
             needs_restart=true
         fi
     fi
@@ -4394,7 +4413,7 @@ _check_and_fix_dns() {
         else
             _error "DNS 配置兼容性修复失败。"
             rm -f "$tmp_file"
-            return 1
+            return 2
         fi
     fi
 
@@ -6798,9 +6817,9 @@ _check_config() {
     _info "正在检查 sing-box 配置文件..."
     # 捕获所有输出（包括 stderr 产生的大量 WARN 和 TRACE 弃用警告）
     local result
-    result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE} 2>&1)
+    result=$("${SINGBOX_BIN}" check -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json" 2>&1)
     if [[ $? -eq 0 ]]; then
-        _success "配置文件 (${CONFIG_FILE}) 格式正确。"
+        _success "主配置与中转配置合并校验通过。"
     else
         _error "配置文件检查失败:"
         echo "$result"
@@ -7510,10 +7529,58 @@ _install_or_update_singbox() {
 # 执行 sing-box 核心的安装/更新
 _do_update_singbox() {
     _info "--- 安装/更新 Sing-box 核心 ---"
+    local update_backup_dir=""
+    local had_previous_binary=false
+    local dns_fix_status=1
+    local config_check_output=""
+
     _install_dependencies true
-    _install_sing_box
-    
-    if [ $? -eq 0 ]; then
+    mkdir -p "$SINGBOX_DIR" || { _error "无法创建 sing-box 配置目录。"; return 1; }
+
+    if [ -f "$SINGBOX_BIN" ]; then
+        update_backup_dir=$(mktemp -d /root/.singbox-update.XXXXXX) || {
+            _error "无法创建升级回滚目录，已取消更新。"
+            return 1
+        }
+        if ! cp -a "$SINGBOX_BIN" "${update_backup_dir}/sing-box"; then
+            _error "备份当前 sing-box 核心失败，已取消更新。"
+            rm -rf "$update_backup_dir"
+            return 1
+        fi
+        if [ -f "$CONFIG_FILE" ] && ! cp -a "$CONFIG_FILE" "${update_backup_dir}/config.json"; then
+            _error "备份主配置失败，已取消更新。"
+            rm -rf "$update_backup_dir"
+            return 1
+        fi
+        if [ -f "${SINGBOX_DIR}/relay.json" ] && ! cp -a "${SINGBOX_DIR}/relay.json" "${update_backup_dir}/relay.json"; then
+            _error "备份中转配置失败，已取消更新。"
+            rm -rf "$update_backup_dir"
+            return 1
+        fi
+        if [ -f "$CLASH_YAML_FILE" ] && ! cp -a "$CLASH_YAML_FILE" "${update_backup_dir}/clash.yaml"; then
+            _error "备份订阅配置失败，已取消更新。"
+            rm -rf "$update_backup_dir"
+            return 1
+        fi
+        had_previous_binary=true
+    fi
+
+    if [ -f "$CONFIG_FILE" ]; then
+        if _check_and_fix_dns; then
+            dns_fix_status=0
+        else
+            dns_fix_status=$?
+            if [ "$dns_fix_status" -eq 2 ]; then
+                _error "DNS 配置无法安全迁移，已取消 sing-box 核心更新。"
+                [ -n "$update_backup_dir" ] && rm -rf "$update_backup_dir"
+                return 1
+            fi
+        fi
+    fi
+
+    if ! _install_sing_box; then
+        _error "Sing-box 核心安装/更新失败。"
+    else
         _success "sing-box 安装/更新成功！"
         # 确保配置文件存在
         if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
@@ -7521,17 +7588,45 @@ _do_update_singbox() {
             _initialize_config_files
         fi
         _init_relay_config
-        if [ ! -s "${SINGBOX_DIR}/relay.json" ]; then
-            echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
-        fi
         _create_service_files
-        _setup_log_cleanup
-        _info "正在启动/重启 [主] 服务 (sing-box)..."
-        _manage_service "restart"
-        _success "[主] 服务已就绪。"
-    else
-        _error "Sing-box 核心安装/更新失败。"
+        _setup_log_cleanup || true
+
+        if config_check_output=$("$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" 2>&1); then
+            _info "正在启动/重启 [主] 服务 (sing-box)..."
+            if _manage_service "restart"; then
+                [ -n "$update_backup_dir" ] && rm -rf "$update_backup_dir"
+                _success "[主] 服务已就绪。"
+                return 0
+            fi
+            _error "新核心启动失败。"
+        else
+            _error "新核心安装后的合并配置校验失败："
+            printf '%s\n' "$config_check_output" >&2
+        fi
     fi
+
+    if [ "$had_previous_binary" = true ] && [ -n "$update_backup_dir" ]; then
+        local rollback_ok=true
+        _warn "正在回滚到更新前的 sing-box 核心与配置..."
+        install -m 700 "${update_backup_dir}/sing-box" "$SINGBOX_BIN" || rollback_ok=false
+        if [ -f "${update_backup_dir}/config.json" ]; then
+            cp -a "${update_backup_dir}/config.json" "$CONFIG_FILE" || rollback_ok=false
+        fi
+        if [ -f "${update_backup_dir}/relay.json" ]; then
+            cp -a "${update_backup_dir}/relay.json" "${SINGBOX_DIR}/relay.json" || rollback_ok=false
+        fi
+        if [ -f "${update_backup_dir}/clash.yaml" ]; then
+            cp -a "${update_backup_dir}/clash.yaml" "$CLASH_YAML_FILE" || rollback_ok=false
+        fi
+        if [ "$rollback_ok" = true ] && _manage_service "restart"; then
+            _success "已恢复更新前版本，原服务已重新启动。"
+        else
+            _error "自动回滚未完全成功，请从 ${update_backup_dir} 手动恢复并检查服务日志。"
+            return 1
+        fi
+    fi
+    [ -n "$update_backup_dir" ] && rm -rf "$update_backup_dir"
+    return 1
 }
 
 # --- 进阶功能 (子脚本) ---
@@ -8236,8 +8331,14 @@ main() {
         fi
         
         # 3.3 [热修复] 检测并补充 DNS 模块
+        local dns_fix_status=1
         if _check_and_fix_dns; then
             config_updated=true
+        else
+            dns_fix_status=$?
+            if [ "$dns_fix_status" -eq 2 ]; then
+                _warn "DNS 配置自动迁移失败；升级核心前必须先处理该配置。"
+            fi
         fi
         
         if [ "$config_updated" = true ]; then

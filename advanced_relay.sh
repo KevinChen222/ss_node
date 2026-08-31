@@ -4,7 +4,7 @@
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.8"
+SCRIPT_VERSION="16-kevin.9"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -1429,6 +1429,22 @@ _import_link_config() {
     local dest_type=$(echo "$outbound_json" | jq -r '.type')
     local dest_addr=$(echo "$outbound_json" | jq -r '.server')
     local dest_port=$(echo "$outbound_json" | jq -r '.server_port')
+
+    if [ "$dest_type" == "hysteria2" ]; then
+        local core_version core_major core_minor
+        core_version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
+        if [[ "$core_version" =~ ^([0-9]+)\.([0-9]+) ]]; then
+            core_major="${BASH_REMATCH[1]}"
+            core_minor="${BASH_REMATCH[2]}"
+        fi
+        if [ -n "$core_major" ] && { [ "$core_major" -gt 1 ] || { [ "$core_major" -eq 1 ] && [ "$core_minor" -ge 14 ]; }; }; then
+            _warn "sing-box 1.14+ 的 Chrome QUIC 模拟不兼容 Ed25519 服务端证书。"
+            read -p "落地端使用 Ed25519 证书或出现 QUIC 握手失败？禁用该模拟 (y/N): " disable_parrot_choice
+            if [[ "$disable_parrot_choice" == "y" || "$disable_parrot_choice" == "Y" ]]; then
+                outbound_json=$(echo "$outbound_json" | jq '.disable_chrome_parrot = true')
+            fi
+        fi
+    fi
     
     # [屏蔽逻辑] 检查是否为 SS-2022
     if [ "$dest_type" == "shadowsocks" ]; then
@@ -1857,7 +1873,7 @@ _offer_existing_inbound_relay() {
     local outbound_tag="relay-out-reuse-${safe_tag}-$(date +%s)-$$"
     outbound_json=$(printf '%s' "$outbound_json" | jq --arg t "$outbound_tag" '.tag = $t') || return 2
     local rule_json
-    rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound":$it,"outbound":$ot}') || return 2
+    rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound":$it,"outbound":$ot,"action":"route"}') || return 2
 
     local config_backup="${RELAY_CONFIG_FILE}.bak.reuse.$$"
     local links_file="${RELAY_AUX_DIR}/relay_links.json"
@@ -2064,7 +2080,7 @@ _finalize_relay_setup() {
     fi
 
     # 构造路由规则内容 (修复：定义被误删的变量)
-    local rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound": $it, "outbound": $ot}')
+    local rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound": $it, "outbound": $ot, "action": "route"}')
     
     # [作用域修复] 统一获取公网IP，避免在每个分支中重复声明 local server_ip
     local relay_server_ip
