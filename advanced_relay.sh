@@ -1,10 +1,11 @@
 #!/bin/bash
+# PROXYALL_COMPONENT=advanced_relay.sh
 
 # 中转配置、节点凭据与私钥默认仅允许 root 读取。
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.9"
+SCRIPT_VERSION="16-kevin.10"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -17,7 +18,7 @@ REALITY_LOCAL_ORIGIN_PORT=8443
 SNI_ROUTER_API_VERSION=1
 SNI_ROUTER_PUBLIC_PORT=443
 SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
-PARSER_SHA256="33edfbb4dc2dd2724d950b0608ae3c910db859f21701fd0e9ec8e09c2d438f31"
+PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -1430,21 +1431,6 @@ _import_link_config() {
     local dest_addr=$(echo "$outbound_json" | jq -r '.server')
     local dest_port=$(echo "$outbound_json" | jq -r '.server_port')
 
-    if [ "$dest_type" == "hysteria2" ]; then
-        local core_version core_major core_minor
-        core_version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
-        if [[ "$core_version" =~ ^([0-9]+)\.([0-9]+) ]]; then
-            core_major="${BASH_REMATCH[1]}"
-            core_minor="${BASH_REMATCH[2]}"
-        fi
-        if [ -n "$core_major" ] && { [ "$core_major" -gt 1 ] || { [ "$core_major" -eq 1 ] && [ "$core_minor" -ge 14 ]; }; }; then
-            _warn "sing-box 1.14+ 的 Chrome QUIC 模拟不兼容 Ed25519 服务端证书。"
-            read -p "落地端使用 Ed25519 证书或出现 QUIC 握手失败？禁用该模拟 (y/N): " disable_parrot_choice
-            if [[ "$disable_parrot_choice" == "y" || "$disable_parrot_choice" == "Y" ]]; then
-                outbound_json=$(echo "$outbound_json" | jq '.disable_chrome_parrot = true')
-            fi
-        fi
-    fi
     
     # [屏蔽逻辑] 检查是否为 SS-2022
     if [ "$dest_type" == "shadowsocks" ]; then
@@ -1561,7 +1547,13 @@ _landing_config() {
     IFS=$'\t' read -r tag type port <<< "$_sel_fields"
     
     # 自动检测地址
-    local token_addr="$server_ip"
+    local token_addr="$server_ip" fronted_by=""
+    if [ -s "$MAIN_METADATA_FILE" ]; then
+        fronted_by=$(jq -r --arg t "$tag" '.[$t].frontedBy // empty' "$MAIN_METADATA_FILE")
+        if [ "$fronted_by" = haproxy ]; then
+            port=$(jq -r --arg t "$tag" '.[$t].publicPort // 443' "$MAIN_METADATA_FILE")
+        fi
+    fi
     local use_auto_detect=false
     if [ -f "$MAIN_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
         local detected_addr=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}') | .server' "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
@@ -1574,7 +1566,7 @@ _landing_config() {
     
     # 检测落地机监听地址 (适配层强制 127.0.0.1)
     local listen_addr=$(echo "$selected_node" | jq -r '.listen // "::"')
-    if [[ "$listen_addr" == "127.0.0.1" || "$listen_addr" == "localhost" ]]; then
+    if [ "$fronted_by" != haproxy ] && [[ "$listen_addr" == "127.0.0.1" || "$listen_addr" == "localhost" ]]; then
         token_addr="127.0.0.1"
     fi
 
@@ -1719,9 +1711,9 @@ _landing_config() {
             ;;
 
         "anytls")
-            # [资源优化] 合并2次jq为1次
             local password sni
-            IFS=$'\t' read -r password sni <<< "$(echo "$selected_node" | jq -r '[.users[0].password, (.tls.server_name // "")] | @tsv')"
+            password=$(echo "$selected_node" | jq -r '.users[0].password')
+            sni=$(echo "$selected_node" | jq -r '.tls.server_name // ""')
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
@@ -1735,6 +1727,22 @@ _landing_config() {
             return
             ;;
     esac
+
+    # Transport 同时覆盖 WS early-data 与 gRPC；不能把 gRPC Token 导出成裸 TCP。
+    local transport_json
+    transport_json=$(echo "$selected_node" | jq -c '.transport // empty')
+    if [ -n "$transport_json" ]; then
+        outbound_json=$(echo "$outbound_json" | jq --argjson transport "$transport_json" '.transport = ((.transport // {}) + $transport)') || return 1
+    fi
+    if [ "$type" = anytls ] && echo "$selected_node" | jq -e '.tls.reality.enabled == true' >/dev/null; then
+        local pbk sid
+        pbk=$(jq -r --arg t "$tag" '.[$t].publicKey // empty' "$MAIN_METADATA_FILE")
+        sid=$(jq -r --arg t "$tag" '.[$t].shortId // empty' "$MAIN_METADATA_FILE")
+        [ -n "$pbk" ] || { _error "Reality 公钥缺失，无法导出 Token。"; return 1; }
+        outbound_json=$(echo "$outbound_json" | jq --arg pbk "$pbk" --arg sid "$sid" --arg fp "$DEFAULT_FINGERPRINT" '
+            del(.tls.insecure) | .tls.reality={enabled:true,public_key:$pbk,short_id:$sid}
+            | .tls.utls={enabled:true,fingerprint:$fp}') || return 1
+    fi
     
     if [ -n "$outbound_json" ]; then
         # [安全增强] 使用 AES-256-CBC 加密 Token，防止明文泄露敏感信息
@@ -1954,22 +1962,31 @@ _finalize_relay_setup() {
     local dest_addr="$2"
     local dest_port="$3"
     local outbound_json="$4"
+    # Token 和分享链接统一处理 1.14 的 Hysteria2 QUIC 行为变化。
+    if [ "$dest_type" = hysteria2 ]; then
+        local core_version core_major core_minor disable_parrot_choice
+        core_version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
+        if [[ "$core_version" =~ ^([0-9]+)\.([0-9]+) ]]; then
+            core_major="${BASH_REMATCH[1]}"
+            core_minor="${BASH_REMATCH[2]}"
+            if { [ "$core_major" -gt 1 ] || { [ "$core_major" -eq 1 ] && [ "$core_minor" -ge 14 ]; }; } && \
+               ! jq -e '.disable_chrome_parrot == true' <<< "$outbound_json" >/dev/null; then
+                _warn "sing-box 1.14+ 默认 Chrome QUIC 模拟不兼容 Ed25519 服务端证书。"
+                read -r -p "落地端使用 Ed25519 证书或 QUIC 握手失败？禁用该模拟 [y/N]: " disable_parrot_choice || return 1
+                if [[ "$disable_parrot_choice" =~ ^[Yy]$ ]]; then
+                    outbound_json=$(jq '.disable_chrome_parrot=true' <<< "$outbound_json") || return 1
+                fi
+            fi
+        fi
+    fi
     
-    # [核心连通性拦截] 拦截强制启用 Vision 的第三方节点
+    # sing-box 的 VLESS 出站负责封装 Vision，入口无需使用同一协议。
     if [ "$dest_type" == "vless" ]; then
         local flow_val=$(echo "$outbound_json" | jq -r '.flow // empty')
-        if [ "$flow_val" == "xtls-rprx-vision" ]; then
-            echo ""
-            _error "检测到目标落地节点强制启用了 [xtls-rprx-vision] 流控！"
-            _error "根据底层的物理核心限制，跨协议应用层中转无法处理 Vision 流量。"
-            _warn  "请按回车键返回主菜单，然后改用端口转发！"
-            echo ""
-            read -p "  按回车键返回..."
+        if [ -n "$flow_val" ] && [ "$flow_val" != "xtls-rprx-vision" ]; then
+            _error "不支持的 VLESS flow: ${flow_val}"
             return 1
         fi
-        
-        # 对于其它可能遗留的未知 flow 属性，为求安全也一律安全剥离
-        outbound_json=$(echo "$outbound_json" | jq 'del(.flow)')
     fi
 
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
@@ -2002,8 +2019,17 @@ _finalize_relay_setup() {
     local inbound_listen="::"
     local router_mode=false
     while true; do
-        read -p "  请输入本机监听端口 (回车随机): " listen_port
+        if [ "$relay_type" = vless-reality ]; then
+            read -r -p "  请输入公网端口 (默认: 443，共享 SNI 入口): " listen_port || return 1
+            listen_port="${listen_port:-443}"
+        else
+            read -r -p "  请输入本机监听端口 (回车随机): " listen_port || return 1
+        fi
         [[ -z "$listen_port" ]] && listen_port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 40001 + 10000 ))
+        if ! [[ "$listen_port" =~ ^[0-9]+$ ]] || [ "$listen_port" -lt 1 ] || [ "$listen_port" -gt 65535 ]; then
+            _error "端口必须在 1-65535 之间。"
+            continue
+        fi
 
         if [ "$relay_type" = "vless-reality" ] && [ "$listen_port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
             local use_router
@@ -2018,7 +2044,9 @@ _finalize_relay_setup() {
             fi
         fi
 
-        if _check_port_occupied "$listen_port"; then
+        local listen_protocol=tcp
+        [[ "$relay_type" == hysteria2 || "$relay_type" == tuic ]] && listen_protocol=udp
+        if _check_port_occupied "$listen_port" "$listen_protocol"; then
             _error "端口 $listen_port 已被系统占用，请重新输入！"
         elif [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" ]]; then
             hop_conflict=$(_pf_find_hy2_hop_conflict "$listen_port")

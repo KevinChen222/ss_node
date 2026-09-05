@@ -6,7 +6,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.19"
+export SCRIPT_VERSION="20-kevin.20"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -19,8 +19,8 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="c729615d6ee272c2b1fb74e1c5753416d2237e2e18ebfc7fa6c3bc826992ccbc"
-PARSER_SHA256="33edfbb4dc2dd2724d950b0608ae3c910db859f21701fd0e9ec8e09c2d438f31"
+ADVANCED_RELAY_SHA256="39083485d7e4ab178e6dbf9cca9f11692fe9980f5ac94c5162531bd8ee1e85a1"
+PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -1871,13 +1871,13 @@ _sni_router_lock() {
     command -v flock >/dev/null 2>&1 || _pkg_install util-linux || return 1
     mkdir -p "$(dirname "$SNI_ROUTER_LOCK_FILE")" || return 1
     exec 9>"$SNI_ROUTER_LOCK_FILE"
-    flock -x 9
+    flock -x -w 30 9 || { _error "SNI 路由正在被其他进程修改，请稍后重试。"; return 1; }
 }
 
 _sni_router_init_state() {
     mkdir -p "$SNI_ROUTER_STATE_DIR" || return 1
     chmod 700 "$SNI_ROUTER_STATE_DIR" 2>/dev/null || true
-    if [ ! -s "$SNI_ROUTER_STATE_FILE" ]; then
+    if [ ! -e "$SNI_ROUTER_STATE_FILE" ]; then
         local tmp
         tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || return 1
         jq -n --argjson version "$SNI_ROUTER_API_VERSION" --argjson port "$SNI_ROUTER_PUBLIC_PORT" \
@@ -1895,6 +1895,10 @@ _sni_router_init_state() {
         return 1
     fi
     if ! jq -e '.tls_routes | type == "object"' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+        if jq -e 'has("tls_routes") and .tls_routes != null' "$SNI_ROUTER_STATE_FILE" >/dev/null; then
+            _error "SNI tls_routes 状态损坏，拒绝清空。"
+            return 1
+        fi
         local migrate_tmp
         migrate_tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || return 1
         jq '.tls_routes={}' "$SNI_ROUTER_STATE_FILE" > "$migrate_tmp" || {
@@ -2111,7 +2115,8 @@ _sni_router_restore_state() {
     _sni_router_apply >/dev/null 2>&1 || true
 }
 
-_sni_router_register_reality() {
+_sni_router_register_reality() (
+    # 子 shell 在所有返回路径释放路由锁，避免交互菜单长期持锁。
     local owner="$1" tag="$2" sni="$3" backend_port="$4"
     _is_valid_reality_domain "$sni" || { _error "Reality SNI 格式无效: ${sni}"; return 1; }
     _sni_router_validate_port "$backend_port" || { _error "Reality 后端端口无效。"; return 1; }
@@ -2145,9 +2150,9 @@ _sni_router_register_reality() {
         return 1
     fi
     rm -f "$backup"
-}
+)
 
-_sni_router_remove_reality() {
+_sni_router_remove_reality() (
     local tag="${1:-}"
     _sni_router_lock || return 1
     _sni_router_init_state || return 1
@@ -2168,9 +2173,9 @@ _sni_router_remove_reality() {
         return 1
     fi
     rm -f "$backup"
-}
+)
 
-_sni_router_register_tls() {
+_sni_router_register_tls() (
     local owner="$1" tag="$2" sni="${3,,}" backend_port="$4"
     _is_valid_reality_domain "$sni" || { _error "TLS SNI 格式无效: ${sni}"; return 1; }
     _sni_router_validate_port "$backend_port" || { _error "TLS 后端端口无效。"; return 1; }
@@ -2204,9 +2209,9 @@ _sni_router_register_tls() {
         return 1
     fi
     rm -f "$backup"
-}
+)
 
-_sni_router_remove_tls() {
+_sni_router_remove_tls() (
     local tag="$1"
     _sni_router_lock || return 1
     _sni_router_init_state || return 1
@@ -2226,9 +2231,9 @@ _sni_router_remove_tls() {
         return 1
     fi
     rm -f "$backup"
-}
+)
 
-_sni_router_register_https() {
+_sni_router_register_https() (
     local owner="$1" sni="${2,,}" backend_port="$3"
     _is_valid_reality_domain "$sni" || { _error "HTTPS SNI 格式无效: ${sni}"; return 1; }
     _sni_router_validate_port "$backend_port" || { _error "HTTPS 后端端口无效。"; return 1; }
@@ -2267,9 +2272,9 @@ _sni_router_register_https() {
         return 1
     fi
     rm -f "$backup"
-}
+)
 
-_sni_router_remove_https() {
+_sni_router_remove_https() (
     local owner="$1" sni="${2,,}"
     _sni_router_lock || return 1
     _sni_router_init_state || return 1
@@ -2292,7 +2297,7 @@ _sni_router_remove_https() {
         return 1
     fi
     rm -f "$backup"
-}
+)
 
 _sni_router_status() {
     _sni_router_init_state || return 1
@@ -4359,10 +4364,9 @@ _check_and_fix_dns() {
     # 返回值：0=已修改，1=无需修改，2=迁移失败。
     if [ ! -f "$CONFIG_FILE" ]; then return 2; fi
 
-    local has_dns has_auto_detect dns_strategy legacy_count resolver_tag
-    local needs_restart=false tmp_file dns_json legacy_address
+    local has_dns dns_strategy legacy_count resolver_tag
+    local needs_restart=false tmp_file dns_json legacy_address legacy_tag
     has_dns=$(jq -r '(.dns.servers? | type == "array") and ((.dns.servers | length) > 0)' "$CONFIG_FILE" 2>/dev/null)
-    has_auto_detect=$(jq -r 'try (.route.auto_detect_interface == true) catch false' "$CONFIG_FILE" 2>/dev/null)
     dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
     legacy_count=$(jq -r '[.dns.servers[]? | select(has("address"))] | length' "$CONFIG_FILE" 2>/dev/null)
     tmp_file="${CONFIG_FILE}.tmp"
@@ -4370,10 +4374,9 @@ _check_and_fix_dns() {
     if [ "$has_dns" != "true" ]; then
         dns_json=$(_build_dns_config local "${dns_strategy:-prefer_ipv4}") || return 2
         jq --argjson dns "$dns_json" '
-            .dns = $dns
+            .dns = ((.dns // {}) + $dns)
             | .route = (.route // {rules:[],final:"direct"})
             | .route.default_domain_resolver = "dns-main"
-            | del(.route.auto_detect_interface)
         ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 2; }
         needs_restart=true
     elif [ "$legacy_count" -gt 0 ]; then
@@ -4382,26 +4385,30 @@ _check_and_fix_dns() {
             _warn "请先在 DNS 菜单重新选择服务器，再升级到 sing-box 1.14。"
             return 2
         fi
+        if ! jq -e '(.dns.servers[0] | keys - ["address","tag"]) | length == 0' "$CONFIG_FILE" >/dev/null; then
+            _warn "旧 DNS 服务器包含额外自定义选项，不能无损自动迁移；请手动按官方迁移指南处理。"
+            return 2
+        fi
         legacy_address=$(jq -r '.dns.servers[0].address // empty' "$CONFIG_FILE")
+        legacy_tag=$(jq -r '.dns.servers[0].tag // "dns-main"' "$CONFIG_FILE")
         dns_json=$(_build_dns_config "$legacy_address" "${dns_strategy:-prefer_ipv4}") || {
             _warn "旧版 DNS 地址无法自动迁移: ${legacy_address}"
             return 2
         }
-        jq --argjson dns "$dns_json" '
-            .dns = $dns
+        dns_json=$(jq --arg tag "$legacy_tag" '.servers[0].tag=$tag' <<< "$dns_json") || return 2
+        jq --argjson dns "$dns_json" --arg tag "$legacy_tag" '
+            .dns = (.dns + $dns)
             | .route = (.route // {rules:[],final:"direct"})
-            | .route.default_domain_resolver = "dns-main"
-            | del(.route.auto_detect_interface)
+            | .route.default_domain_resolver = (.route.default_domain_resolver // $tag)
         ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 2; }
         needs_restart=true
     else
         resolver_tag=$(jq -r '.dns.servers[0].tag // empty' "$CONFIG_FILE")
-        if [ "$has_auto_detect" = "true" ] || [ -z "$dns_strategy" ] || { [ -n "$resolver_tag" ] && ! jq -e '.route.default_domain_resolver? | strings | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; }; then
+        if [ -z "$dns_strategy" ] || { [ -n "$resolver_tag" ] && ! jq -e '.route.default_domain_resolver? | (type == "object") or (type == "string" and length > 0)' "$CONFIG_FILE" >/dev/null 2>&1; }; then
             jq --arg strategy "${dns_strategy:-prefer_ipv4}" --arg resolver "$resolver_tag" '
                 .dns.strategy = $strategy
                 | .route = (.route // {rules:[],final:"direct"})
                 | if $resolver != "" and ((.route.default_domain_resolver // "") == "") then .route.default_domain_resolver = $resolver else . end
-                | del(.route.auto_detect_interface)
             ' "$CONFIG_FILE" > "$tmp_file" || { rm -f "$tmp_file"; return 2; }
             needs_restart=true
         fi
@@ -5687,7 +5694,7 @@ _add_vless_reality() {
         name="Batch-Reality-${port}"
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
-        if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ] && [ "${BATCH_SNI_ROUTER:-false}" = "true" ]; then
+        if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ] && [ "${BATCH_SNI_ROUTER:-true}" = "true" ]; then
             _sni_router_prepare || return 1
             backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
             listen_address="127.0.0.1"
@@ -5703,8 +5710,9 @@ _add_vless_reality() {
         handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
         handshake_port="$SELECTED_REALITY_HANDSHAKE_PORT"
         while true; do
-            read -p "请输入监听端口: " port
-            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            read -r -p "请输入监听端口 (默认: 443，共享 SNI 入口): " port || return 1
+            port="${port:-443}"
+            _sni_router_validate_port "$port" || { _error "端口必须在 1-65535 之间。"; continue; }
             if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
                 local use_router
                 read -r -p "是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: " use_router
@@ -7460,6 +7468,10 @@ _ensure_component_script() {
 }
 
 _update_script() {
+    if [ "${PROXYALL_MANAGED:-0}" = 1 ]; then
+        _info "请返回 proxyall 主菜单选择【检查脚本更新】，统一更新配套组件。"
+        return 0
+    fi
     _info "--- 更新脚本 ---"
     
     # 更新主脚本。时间戳查询参数用于绕过代理/CDN 的旧文件缓存。
@@ -7562,6 +7574,12 @@ _do_update_singbox() {
             rm -rf "$update_backup_dir"
             return 1
         fi
+        if [ -n "$SERVICE_FILE" ] && [ -f "$SERVICE_FILE" ] && \
+           ! cp -a "$SERVICE_FILE" "${update_backup_dir}/service"; then
+            _error "备份原服务文件失败，已取消更新。"
+            rm -rf "$update_backup_dir"
+            return 1
+        fi
         had_previous_binary=true
     fi
 
@@ -7608,7 +7626,14 @@ _do_update_singbox() {
     if [ "$had_previous_binary" = true ] && [ -n "$update_backup_dir" ]; then
         local rollback_ok=true
         _warn "正在回滚到更新前的 sing-box 核心与配置..."
-        install -m 700 "${update_backup_dir}/sing-box" "$SINGBOX_BIN" || rollback_ok=false
+        # 新核心可能还在运行；写临时文件后 rename，避免 ETXTBSY 导致无法回滚。
+        local rollback_binary
+        rollback_binary=$(mktemp "${SINGBOX_BIN}.rollback.XXXXXX") || return 1
+        if ! install -m 700 "${update_backup_dir}/sing-box" "$rollback_binary" || \
+           ! mv -f "$rollback_binary" "$SINGBOX_BIN"; then
+            rm -f "$rollback_binary"
+            rollback_ok=false
+        fi
         if [ -f "${update_backup_dir}/config.json" ]; then
             cp -a "${update_backup_dir}/config.json" "$CONFIG_FILE" || rollback_ok=false
         fi
@@ -7617,6 +7642,12 @@ _do_update_singbox() {
         fi
         if [ -f "${update_backup_dir}/clash.yaml" ]; then
             cp -a "${update_backup_dir}/clash.yaml" "$CLASH_YAML_FILE" || rollback_ok=false
+        fi
+        if [ -f "${update_backup_dir}/service" ]; then
+            cp -a "${update_backup_dir}/service" "$SERVICE_FILE" || rollback_ok=false
+            if [ "$INIT_SYSTEM" = systemd ]; then
+                systemctl daemon-reload || rollback_ok=false
+            fi
         fi
         if [ "$rollback_ok" = true ] && _manage_service "restart"; then
             _success "已恢复更新前版本，原服务已重新启动。"
@@ -8324,53 +8355,26 @@ main() {
         # 3.1 初始化中转配置 (配置隔离)
         _init_relay_config
         
-        # 3.2 [关键修复] 清理主配置文件中的旧版残留
-        local config_updated=false
-        if _cleanup_legacy_config; then
-            config_updated=true
-        fi
-        
-        # 3.3 [热修复] 检测并补充 DNS 模块
-        local dns_fix_status=1
-        if _check_and_fix_dns; then
-            config_updated=true
-        else
-            dns_fix_status=$?
-            if [ "$dns_fix_status" -eq 2 ]; then
-                _warn "DNS 配置自动迁移失败；升级核心前必须先处理该配置。"
-            fi
-        fi
-        
-        if [ "$config_updated" = true ]; then
-            _manage_service restart
-        fi
+        # 打开管理菜单不删除旧中转、不改 DNS 或默认出口、不重启业务。
+        # DNS 迁移仅在用户选择核心更新时执行，并由更新事务备份和校验。
         
         # [BUG FIX] 检查并修复旧版服务文件
         if [ -f "$SERVICE_FILE" ]; then
             local need_update=false
             if grep -q "\-C " "$SERVICE_FILE"; then
-                _warn "检测到旧版服务配置(目录加载模式导致冲突)，正在修复..."
+                _warn "检测到旧版服务目录加载模式，需要迁移..."
                 need_update=true
             fi
             if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
-                _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
+                _warn "检测到旧版 OpenRC 服务配置，需要迁移以兼容 Alpine..."
                 need_update=true
             fi
             if grep -q "ENABLE_DEPRECATED_" "$SERVICE_FILE"; then
-                _warn "检测到 sing-box 旧版 DNS 兼容环境变量，正在移除..."
+                _warn "检测到 sing-box 旧版 DNS 兼容环境变量，需要在配置迁移后移除..."
                 need_update=true
             fi
             if [ "$need_update" = true ]; then
-                if [ "$INIT_SYSTEM" == "systemd" ]; then
-                     _create_systemd_service
-                     systemctl daemon-reload
-                elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                     _create_openrc_service
-                fi
-                if { [ "$INIT_SYSTEM" == "systemd" ] && systemctl is-active sing-box >/dev/null 2>&1; } || { [ "$INIT_SYSTEM" == "openrc" ] && rc-service sing-box status >/dev/null 2>&1; }; then
-                    _manage_service restart
-                fi
-                _success "服务配置修复完成。"
+                _warn "保留现有服务文件；请通过【核心管理】安装/更新，在配置校验成功后统一迁移服务。"
             fi
         fi
 

@@ -1,4 +1,5 @@
 #!/bin/bash
+# PROXYALL_COMPONENT=parser.sh
 
 # 节点链接中可能包含密码、UUID 等凭据，临时文件默认仅允许当前用户读取。
 umask 077
@@ -60,6 +61,7 @@ _split_host_port() {
     local port=""
 
     input="${input%%\?*}"
+    input="${input%/}"
 
     if [[ "$input" =~ ^(\[[^]]+\]):([0-9]+)$ ]]; then
         host="${BASH_REMATCH[1]}"
@@ -100,7 +102,7 @@ _decode_base64_urlsafe() {
 _parse_vless() {
     local link="$1"
     local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="vless://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
+    local regex="vless://([^@]+)@${host_regex}:([0-9]+)/?\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local uuid="${BASH_REMATCH[1]}"
         local server=$(_strip_ipv6_brackets "${BASH_REMATCH[2]}")
@@ -180,7 +182,7 @@ _parse_vmess() {
 _parse_trojan() {
     local link="$1"
     local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="trojan://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
+    local regex="trojan://([^@]+)@${host_regex}:([0-9]+)/?\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local password
         password=$(_decode "${BASH_REMATCH[1]}")
@@ -250,7 +252,7 @@ _parse_ss() {
 _parse_hy2() {
     local link="$1"
     local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="(hysteria2|hy2)://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
+    local regex="(hysteria2|hy2)://([^@]+)@${host_regex}:([0-9]+)/?\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local password=$(_decode "${BASH_REMATCH[2]}")
         local server=$(_strip_ipv6_brackets "${BASH_REMATCH[3]}")
@@ -271,7 +273,7 @@ _parse_hy2() {
 _parse_tuic() {
     local link="$1"
     local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="tuic://([^:]+):([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
+    local regex="tuic://([^:]+):([^@]+)@${host_regex}:([0-9]+)/?\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local uuid="${BASH_REMATCH[1]}"
         local password=$(_decode "${BASH_REMATCH[2]}")
@@ -291,7 +293,7 @@ _parse_tuic() {
 _parse_anytls() {
     local link="$1"
     local host_regex='(\[[^]]+\]|[^:/?#]+)'
-    local regex="anytls://([^@]+)@${host_regex}:([0-9]+)\??([^#]*)#?(.*)"
+    local regex="anytls://([^@]+)@${host_regex}:([0-9]+)/?\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local password=$(_decode "${BASH_REMATCH[1]}")
         local server=$(_strip_ipv6_brackets "${BASH_REMATCH[2]}")
@@ -340,14 +342,100 @@ _parse_socks() {
     fi
 }
 
-case "$1" in
-    vless://*) _parse_vless "$1" ;;
-    vmess://*) _parse_vmess "$1" ;;
-    trojan://*) _parse_trojan "$1" ;;
-    ss://*) _parse_ss "$1" ;;
-    hysteria2://*|hy2://*) _parse_hy2 "$1" ;;
-    tuic://*) _parse_tuic "$1" ;;
-    anytls://*) _parse_anytls "$1" ;;
-    socks5://*) _parse_socks "$1" ;;
-    *) echo "{\"error\": \"不支持的协议\"}"; exit 1 ;;
-esac
+_parse_link() {
+    case "$1" in
+        vless://*) _parse_vless "$1" ;;
+        vmess://*) _parse_vmess "$1" ;;
+        trojan://*) _parse_trojan "$1" ;;
+        ss://*) _parse_ss "$1" ;;
+        hysteria2://*|hy2://*) _parse_hy2 "$1" ;;
+        tuic://*) _parse_tuic "$1" ;;
+        anytls://*) _parse_anytls "$1" ;;
+        socks5://*) _parse_socks "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+_normalize_outbound() {
+    local link="$1" outbound="$2" params="" transport security value ws_path ed decoded
+    if [[ "$link" == *\?* ]]; then
+        params="${link#*\?}"
+        params="${params%%#*}"
+    fi
+    if [[ "$link" == ss://* ]] && [ -n "$(_get_param "$params" plugin)" ]; then
+        echo '{"error":"不支持 Shadowsocks 插件，不能忽略 plugin 参数后导入"}'
+        return 1
+    fi
+    transport=$(_get_param "$params" type)
+    if [[ "$link" == vmess://* ]]; then
+        decoded=$(_decode_base64_urlsafe "${link#vmess://}") || return 1
+        transport=$(jq -r '.net // "tcp"' <<< "$decoded") || return 1
+    fi
+    if [[ "$link" == vless://* || "$link" == trojan://* || "$link" == vmess://* ]]; then
+        case "${transport:-tcp}" in
+            tcp) ;;
+            ws) ;;
+            grpc)
+                value=$(_get_param "$params" serviceName)
+                if [[ "$link" == vmess://* ]]; then value=$(jq -r '.path // ""' <<< "$decoded"); fi
+                outbound=$(jq --arg service "$value" '.transport={type:"grpc",service_name:$service}' <<< "$outbound") || return 1
+                ;;
+            *) echo '{"error":"不支持的传输类型，已拒绝将其错误地导入为 TCP"}'; return 1 ;;
+        esac
+    fi
+    if [[ "$link" == vless://* ]]; then
+        security=$(_get_param "$params" security)
+        case "${security:-none}" in
+            none|tls|reality) ;;
+            *) echo '{"error":"不支持的 VLESS security"}'; return 1 ;;
+        esac
+    fi
+    if jq -e '.tls.enabled == true and (.tls.reality.enabled != true)' <<< "$outbound" >/dev/null; then
+        value=$(_get_param "$params" insecure)
+        [ -n "$value" ] || value=$(_get_param "$params" allowInsecure)
+        [ -n "$value" ] || value=$(_get_param "$params" skip-cert-verify)
+        case "$value" in 1|true) value=true ;; *) value=false ;; esac
+        outbound=$(jq --argjson insecure "$value" '.tls.insecure=$insecure' <<< "$outbound") || return 1
+    fi
+    value=$(_get_param "$params" alpn)
+    if [ -n "$value" ] && jq -e '.tls.enabled == true' <<< "$outbound" >/dev/null; then
+        outbound=$(jq --arg alpn "$value" '.tls.alpn=($alpn|split(","))' <<< "$outbound") || return 1
+    fi
+    if jq -e '.transport.type == "ws"' <<< "$outbound" >/dev/null; then
+        ws_path=$(jq -r '.transport.path // "/"' <<< "$outbound")
+        if [[ "$ws_path" == *\?* ]]; then
+            ed=$(_get_param "${ws_path#*\?}" ed)
+            if [ -n "$ed" ]; then
+                [[ "$ed" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$ed))" -le 65535 ] || return 1
+                outbound=$(jq --argjson ed "$((10#$ed))" '
+                    .transport.max_early_data=$ed
+                    | .transport.early_data_header_name="Sec-WebSocket-Protocol"
+                    | .transport.path |= (split("?") | .[0] as $base
+                        | (.[1:]|join("?")|split("&")|map(select(startswith("ed=")|not))|join("&")) as $query
+                        | $base + (if $query == "" then "" else "?"+$query end))' <<< "$outbound") || return 1
+            fi
+        fi
+    fi
+    jq -e 'type == "object" and (.type | type == "string")
+        and (.server | type == "string" and length > 0)
+        and (.server_port | type == "number" and . >= 1 and . <= 65535 and floor == .)
+        and (if .tls.reality.enabled == true then (.tls.reality.public_key | type == "string" and length > 0) else true end)' \
+        <<< "$outbound" >/dev/null || return 1
+    printf '%s\n' "$outbound"
+}
+
+main() {
+    local parsed result
+    parsed=$(_parse_link "${1:-}") || { echo '{"error":"节点链接格式错误或协议不支持"}'; return 1; }
+    if ! result=$(_normalize_outbound "${1:-}" "$parsed") || [ -z "$result" ]; then
+        if jq -e '.error | strings' <<< "$result" >/dev/null 2>&1; then
+            printf '%s\n' "$result"
+        else
+            echo '{"error":"节点参数无效，无法生成有效出站配置"}'
+        fi
+        return 1
+    fi
+    printf '%s\n' "$result"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
