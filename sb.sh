@@ -6,7 +6,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.20"
+export SCRIPT_VERSION="20-kevin.21"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -1771,7 +1771,7 @@ _manage_service() {
 
     # [关键核心修复] 动态注入内置 NTP 时间同步模块
     # 解决部分廉价 LXC/Docker 容器无法修改母机系统时间，导致 SS-2022 触发 30s 重放保护直接爆 bad timestamp 拒连的断流问题
-    if [[ "$action" == "restart" || "$action" == "start" ]]; then
+    if [[ "$action" == "restart" || "$action" == "start" ]] && [ "${CORE_UPGRADE_TRANSACTION:-0}" != 1 ]; then
         if [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
             _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
             _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
@@ -2766,6 +2766,272 @@ _ensure_nftables() {
     return 0
 }
 
+# 每次更新均基于候选核心迁移配置副本；此函数不修改运行中的配置。
+_prepare_core_config_upgrade() {
+    local candidate="$1" stage="$2" version major minor file index output deprecated_var
+    local -a sources=() names=() check_args=()
+    mkdir -p "$stage" || return 1
+    version=$("$candidate" version 2>/dev/null | sed -n 's/^sing-box version \([^ ]*\).*/\1/p')
+    if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\. ]]; then
+        _error "无法识别候选核心版本，已取消更新。"; return 1
+    fi
+    major=${BASH_REMATCH[1]}; minor=${BASH_REMATCH[2]}
+    for file in "$CONFIG_FILE" "${SINGBOX_DIR}/relay.json"; do
+        if [ -e "$file" ]; then
+            [ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || {
+                _error "配置不是有效的普通文件，已保留: $file"; return 1;
+            }
+            sources+=("$file")
+            if [ "$file" = "$CONFIG_FILE" ]; then names+=(config.json); else names+=(relay.json); fi
+        fi
+    done
+    [ "${#sources[@]}" -gt 0 ] || return 0
+    _info "检查并适配 sing-box ${version}：主配置 + 中转配置（临时副本）..."
+    if ! jq -s --argjson modern "$((major > 1 || minor >= 12))" \
+        --argjson hy2 "$((major > 1 || minor >= 14))" '
+        def arr: if . == null then [] elif type == "array" then . else [.] end;
+        def rename($old; $new):
+            if has($old) then
+                if has($new) and .[$new] != .[$old] then error("新旧字段冲突: \($old) / \($new)")
+                else .[$new]=.[$old] | del(.[$old]) end
+            else . end;
+        def rule_walk(f):
+            if has("rules") then .rules |= map(rule_walk(f)) else . end | f;
+        def endpoint:
+            if startswith("[") then (capture("^\\[(?<host>[^]]+)\\](?::(?<port>[0-9]+))?$") // error("无效的 DNS IPv6 地址"))
+            elif test("^[^:]+:[0-9]+$") then capture("^(?<host>[^:]+):(?<port>[0-9]+)$")
+            else {host:.} end
+            | if .host == "" then error("DNS 地址为空") else . end;
+        def dns_server($fake; $default_out; $strategy):
+            if has("address") | not then . else
+                . as $old
+                | if has("type") then error("DNS 同时包含新旧格式") else . end
+                | del(.address,.address_resolver,.address_strategy,.strategy,.client_subnet)
+                | if $old.address == "local" then .type="local"
+                  elif $old.address == "fakeip" then . + {type:"fakeip"} + ($fake | del(.enabled))
+                  elif ($old.address | startswith("dhcp://")) then
+                    .type="dhcp" | if $old.address != "dhcp://auto" then .interface=($old.address|ltrimstr("dhcp://")) else . end
+                  else
+                    ($old.address | if contains("://") then capture("^(?<kind>[^:]+)://(?<rest>.*)$") else {kind:"udp",rest:.} end) as $url
+                    | if (["udp","tcp","tls","https","quic","h3"] | index($url.kind)) == null
+                      then error("无法转换的 DNS 协议: \($url.kind)") else . end
+                    | ($url.rest | split("/")) as $parts
+                    | ($parts[0] | endpoint) as $ep
+                    | . + {type:$url.kind,server:$ep.host}
+                    | if $ep.port != null then .server_port=($ep.port|tonumber) else . end
+                    | if ($parts|length) > 1 then
+                        if $url.kind == "https" or $url.kind == "h3" then .path=("/"+($parts[1:]|join("/")))
+                        else error("非 HTTP DNS 地址包含路径") end
+                      else . end
+                    # 旧 DNS 默认走默认出站，新格式默认直连；显式保留旧路径。
+                    | if (.detour // "") == "" and $default_out != "" then .detour=$default_out else . end
+                  end
+                | if ($old.address_resolver // "") != "" then
+                    .domain_resolver={server:$old.address_resolver}
+                    | if ($old.address_strategy // $strategy // "") != "" then
+                        .domain_resolver.strategy=($old.address_strategy // $strategy)
+                      else . end
+                  elif ($old.address_strategy // "") != "" then error("DNS address_strategy 缺少 address_resolver")
+                  else . end
+            end;
+        if all(.[]; type == "object") | not then error("配置顶层必须是对象") else . end
+        | if $modern == 0 then . else
+          # 为需要新规则的无标签旧入站分配标签；已有标签一律保留。
+          [.[].inbounds[]?.tag] as $used_tags
+          | [.[].dns.servers[]?.tag] as $used_dns_tags
+          | to_entries | map(.key as $doc | .value |
+              if .inbounds then .inbounds |= (to_entries | map(.key as $idx | .value |
+                if (.tag // "") == "" and (.sniff == true or
+                    ((.domain_strategy // "as_is") != "as_is") or .udp_disable_domain_unmapping == true) then
+                    ("sb-upgrade-in-\($doc)-\($idx)") as $tag
+                    | if ($used_tags | index($tag)) != null then error("自动入站标签冲突") else .tag=$tag end
+                else . end))
+              else . end
+              | if .dns.servers then .dns.servers |= (to_entries | map(.key as $idx | .value |
+                  if (.tag // "") == "" then
+                    ("sb-upgrade-dns-\($doc)-\($idx)") as $tag
+                    | if ($used_dns_tags|index($tag)) != null then error("自动 DNS 标签冲突") else .tag=$tag end
+                  else . end))
+                else . end)
+          | [.[].outbounds[]?] as $outs
+          | ([.[].route.final? | select(. != null and . != "")] | last // $outs[0].tag // "") as $default_out
+          | [.[].dns.servers[]?] as $servers
+          | if any($servers[]; has("address") and
+                ((keys-["address","tag","address_resolver","address_strategy","strategy","detour","client_subnet"])|length)>0) then
+                error("旧 DNS 服务器包含未支持的自定义字段，不能无损迁移")
+            else . end
+          | ([.[].dns.final? | select(. != null and . != "")] | last // $servers[0].tag // "") as $dns_final
+          | ([.[].dns.strategy? | select(. != null)] | last // "") as $dns_strategy
+          | (reduce $servers[] as $s ({}; if $s.tag != null then .[$s.tag]=$s else . end)) as $dns_map
+          | [.[].dns.rules[]? | select(has("outbound"))] as $resolve_rules
+          | if any($resolve_rules[]; ((keys-["outbound","server","action","strategy","disable_cache","rewrite_ttl","client_subnet"])|length)>0
+                or (.action // "route") != "route" or .server == null) then
+                error("带条件的 outbound DNS 规则无法等价转换为固定域名解析器")
+            else . end
+          | def resolver_options:
+              . as $rule | $dns_map[.server] as $server
+              | {server:.server}
+                + ($server | {strategy,client_subnet} | with_entries(select(.value != null and .value != "")))
+                + ($rule | {strategy,disable_cache,rewrite_ttl,client_subnet} | with_entries(select(.value != null)));
+          def resolver_for($tag):
+              ([$resolve_rules[] | select((.outbound|arr|index("any")) != null or
+                    (.outbound|arr|index($tag)) != null)] | first) as $rule
+              | if $rule != null then ($rule | resolver_options) else null end;
+          ([.[].route.default_domain_resolver? | select(. != null and . != "")] | last) as $existing_resolver
+          | (resolver_for("any") // $existing_resolver //
+                (if $dns_final != "" and (($dns_map[$dns_final].address // "" | startswith("rcode://"))|not)
+                    then ({server:$dns_final} | resolver_options) else null end)) as $default_resolver
+          | (reduce $outs[] as $o ({}; if $o.type == "block" or $o.type == "dns" then
+                if ($o.tag // "") == "" then error("无标签的旧特殊出站无法安全迁移")
+                else .[$o.tag]=(if $o.type=="block" then "reject" else "hijack-dns" end) end
+              else . end)) as $special
+          | (reduce $outs[] as $o ({}; if $o.type=="direct" and ($o|has("override_address") or has("override_port")) then
+                if ($o.tag // "")=="" then error("旧 direct override 出站缺少 tag")
+                else .[$o.tag]=($o|{override_address,override_port}|with_entries(select(.value != null))) end
+              else . end)) as $overrides
+          | def dns_rule:
+              if .server != null and $dns_map[.server].address != null then
+                $dns_map[.server] as $s
+                | if ($s.address | startswith("rcode://")) then
+                    ($s.address | ltrimstr("rcode://")) as $rcode
+                    | .action="predefined" | .rcode=({"success":"NOERROR","format_error":"FORMERR","server_failure":"SERVFAIL","name_error":"NXDOMAIN","not_implemented":"NOTIMP","refused":"REFUSED"}[$rcode] // error("未知 DNS RCode"))
+                    | del(.server,.disable_cache,.rewrite_ttl,.client_subnet,.strategy)
+                  else
+                    if .strategy == null and ($s.strategy // "") != "" then .strategy=$s.strategy else . end
+                    | if .client_subnet == null and $s.client_subnet != null then .client_subnet=$s.client_subnet else . end
+                  end
+              else . end;
+          def route_rule:
+              rename("rule_set_ipcidr_match_source";"rule_set_ip_cidr_match_source")
+              | if .outbound != null and $special[.outbound] != null then
+                  .action=$special[.outbound] | del(.outbound)
+                elif .outbound != null and $overrides[.outbound] != null then
+                  . as $rule | $overrides[.outbound] as $options
+                  | if any($options|keys[]; $rule[.] != null and $rule[.] != $options[.]) then
+                        error("direct 出站与规则的目标覆盖选项冲突")
+                    else . + $options end
+                else . end;
+          # 两份文件生成的入站动作统一放到主路由最前，避免被旧终止规则截断。
+          if any(.[].inbounds[]?; .sniff_override_destination == true) then
+                error("sniff_override_destination=true 没有等价新选项，请先明确目标地址覆盖策略")
+            else . end
+          | [.[].inbounds[]? |
+            if (.sniff == true or ((.domain_strategy // "as_is") != "as_is")) and (.tag // "") == ""
+              then error("旧 sniff/domain_strategy 入站缺少 tag，无法保持规则作用范围") else empty end,
+            (if ((.domain_strategy // "as_is") != "as_is") then
+                {inbound:.tag,action:"resolve",strategy:.domain_strategy} else empty end),
+            (if .sniff == true then
+                {inbound:.tag,action:"sniff"} + (if .sniff_timeout then {timeout:.sniff_timeout} else {} end)
+                else empty end),
+            (if .udp_disable_domain_unmapping == true then
+                if (.tag // "") == "" then error("旧 UDP 入站缺少 tag")
+                else {inbound:.tag,action:"route-options",udp_disable_domain_unmapping:true} end
+                else empty end)
+          ] as $in_rules
+          | if any($outs[]; any(.outbounds[]?, .detour?; . != null and $special[.] != null)) then
+              error("selector/urltest/detour 引用了旧 block/dns 出站，无法保持选择语义")
+            else . end
+          | if any($outs[]; any(.outbounds[]?, .detour?; . != null and $overrides[.] != null)) then
+              error("selector/urltest/detour 引用了旧 direct override 出站，无法保持目标覆盖语义")
+            else . end
+          | if any($servers[]; ((if (.detour // "")=="" then $default_out else .detour end) as $tag | $overrides[$tag] != null)
+                and (.address // "local") != "local" and .address != "fakeip") then
+              error("DNS 使用了旧 direct override 出站，无法用普通路由动作保持 DNS 目标覆盖语义")
+            else . end
+          | map(
+              if has("dns") then
+                .dns as $dns
+                | if .dns.servers then
+                    .dns.servers |= map(select((.address // "" | startswith("rcode://")) | not)
+                        | dns_server($dns.fakeip // {}; $default_out; $dns_strategy))
+                  else . end
+                | if .dns.rules then .dns.rules |= map(select(has("outbound")|not) | rule_walk(dns_rule)) else . end
+                | if $dns.fakeip != null and any($servers[]; .address == "fakeip") then del(.dns.fakeip) else . end
+                | if $dns_map[$dns_final].address != null then
+                    if ($dns_map[$dns_final].address | startswith("rcode://")) then del(.dns.final)
+                    else
+                      if ($dns_map[$dns_final].strategy // "") != "" then .dns.strategy=$dns_map[$dns_final].strategy else . end
+                      | if $dns_map[$dns_final].client_subnet != null then .dns.client_subnet=$dns_map[$dns_final].client_subnet else . end
+                    end
+                  else . end
+              else . end
+              | if .route.rules then .route.rules |= map(rule_walk(route_rule)) else . end
+              | if .outbounds then .outbounds |= map(select(.type != "block" and .type != "dns")
+                    | . as $out
+                    | (resolver_for(.tag // "") // .domain_resolver // $default_resolver) as $resolver
+                    | if resolver_for(.tag // "") != null and .domain_resolver == null then .domain_resolver=$resolver else . end
+                    | if (.domain_strategy // "") != "" and .domain_strategy != "as_is" then
+                        if $resolver == null then error("domain_strategy 缺少可用 DNS 解析器") else
+                            .domain_resolver=(if ($resolver|type)=="string" then {server:$resolver} else $resolver end)
+                            | if .domain_resolver.strategy != null and .domain_resolver.strategy != $out.domain_strategy
+                              then error("domain_strategy 与 domain_resolver.strategy 冲突")
+                              else .domain_resolver.strategy=$out.domain_strategy end
+                        end
+                      else . end | del(.domain_strategy)
+                    | if .type=="direct" then del(.override_address,.override_port) else . end)
+                else . end
+              | if .inbounds then .inbounds |= map(
+                    del(.sniff,.sniff_timeout,.sniff_override_destination,.domain_strategy,.udp_disable_domain_unmapping)
+                    | if .type == "tun" then
+                        reduce ["address","route_address","route_exclude_address"][] as $key (.;
+                            if has("inet4_"+$key) or has("inet6_"+$key) then
+                                .[$key]=((.[$key]|arr)+(.["inet4_"+$key]|arr)+(.["inet6_"+$key]|arr)
+                                    | reduce .[] as $ip ([]; if index($ip)==null then .+[$ip] else . end))
+                                | del(.["inet4_"+$key],.["inet6_"+$key])
+                            else . end)
+                        | del(.gso)
+                      else . end
+                ) else . end
+              | walk(if type=="object" and has("ech") and (.ech|type)=="object" then
+                    .ech |= del(.pq_signature_schemes_enabled,.dynamic_record_sizing_disabled)
+                  else . end)
+            )
+          | if ($in_rules|length)>0 then .[0].route.rules=($in_rules+(.[0].route.rules // [])) else . end
+          | if $existing_resolver == null and $default_resolver != null then
+                .[0].route.default_domain_resolver=$default_resolver
+            else . end
+          | if ($dns_map[$dns_final].address // "" | startswith("rcode://")) then
+                .[-1].dns.rules=((.[-1].dns.rules // []) + [({server:$dns_final} | dns_rule)])
+            else . end
+          | if $special[$default_out] != null then
+                map(if .route.final then del(.route.final) else . end)
+                | .[-1].route.rules=((.[-1].route.rules // [])+[{action:$special[$default_out]}])
+            elif $overrides[$default_out] != null then
+                .[-1].route.rules=((.[-1].route.rules // [])+[{action:"route",outbound:$default_out}+$overrides[$default_out]])
+            else . end
+        end
+        | if $hy2 == 1 then map(
+            if .outbounds then .outbounds |= map(
+                if .type=="hysteria2" and (has("disable_chrome_parrot")|not)
+                  then .disable_chrome_parrot=true else . end)
+            else . end)
+          else . end
+    ' "${sources[@]}" > "$stage/bundle.json"; then
+        _error "配置自动适配失败，运行中的配置和核心未改动。请根据上方字段说明处理后重试。"
+        return 1
+    fi
+    for index in "${!sources[@]}"; do
+        file="$stage/${names[$index]}"
+        jq --argjson index "$index" '.[$index]' "$stage/bundle.json" > "$file" || return 1
+        # 无语义变化则保留原始字节，避免每次升级无意义地重排配置。
+        if [ "$(jq -Sc . "${sources[$index]}")" = "$(jq -Sc . "$file")" ]; then
+            cp -p "${sources[$index]}" "$file" || return 1
+        else
+            _info "已在副本中适配: ${names[$index]}"
+        fi
+        check_args+=(-c "$file")
+    done
+    if ! output=$(
+        for deprecated_var in ${!ENABLE_DEPRECATED_@}; do unset "$deprecated_var"; done
+        "$candidate" check "${check_args[@]}" 2>&1
+    ); then
+        _error "自动适配后仍未通过 sing-box ${version} 合并校验；取消更新，保留原服务。"
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    _success "配置已通过目标核心 ${version} 校验。"
+}
+
 _install_sing_box() {
     _info "正在安装最新稳定版 sing-box..."
     local arch=$(uname -m)
@@ -2773,7 +3039,6 @@ _install_sing_box() {
     local temp_dir=""
     local archive_path=""
     local extracted_bin=""
-    local config_check_output=""
     case $arch in
         x86_64|amd64) arch_tag='amd64' ;;
         aarch64|arm64) arch_tag='arm64' ;;
@@ -2827,22 +3092,22 @@ _install_sing_box() {
         return 1
     fi
 
-    # 覆盖现有核心前，先让候选版本校验服务实际加载的合并配置。
-    if [ -s "$CONFIG_FILE" ]; then
-        if [ -s "${SINGBOX_DIR}/relay.json" ]; then
-            if ! config_check_output=$("$extracted_bin" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" 2>&1); then
-                _error "当前配置无法通过 sing-box ${version} 校验，已取消更新。"
-                printf '%s\n' "$config_check_output" >&2
-                rm -rf "$temp_dir"
-                return 1
-            fi
-        elif ! config_check_output=$("$extracted_bin" check -c "$CONFIG_FILE" 2>&1); then
-            _error "当前配置无法通过 sing-box ${version} 校验，已取消更新。"
-            printf '%s\n' "$config_check_output" >&2
-            rm -rf "$temp_dir"
-            return 1
+    _prepare_core_config_upgrade "$extracted_bin" "$temp_dir/compat" || {
+        rm -rf "$temp_dir"; return 1;
+    }
+    # 全部通过才应用；外层升级事务负责核心、配置与服务文件的回滚。
+    CORE_UPGRADE_APPLIED=1
+    local config_source config_target config_tmp
+    for config_source in "$temp_dir/compat/config.json" "$temp_dir/compat/relay.json"; do
+        [ -f "$config_source" ] || continue
+        if [[ "$config_source" == */config.json ]]; then config_target="$CONFIG_FILE"
+        else config_target="${SINGBOX_DIR}/relay.json"; fi
+        cmp -s "$config_source" "$config_target" && continue
+        config_tmp=$(mktemp "${config_target}.upgrade.XXXXXX") || return 1
+        if ! install -m 600 "$config_source" "$config_tmp" || ! mv -f "$config_tmp" "$config_target"; then
+            rm -f "$config_tmp"; return 1
         fi
-    fi
+    done
 
     rm -f "$archive_path"
 
@@ -2851,17 +3116,14 @@ _install_sing_box() {
         _error "创建安装目录失败: $(dirname "$SINGBOX_BIN")"
         return 1
     }
-    if ! mv -f "$extracted_bin" "$SINGBOX_BIN"; then
+    local binary_tmp
+    binary_tmp=$(mktemp "${SINGBOX_BIN}.upgrade.XXXXXX") || return 1
+    if ! install -m 700 "$extracted_bin" "$binary_tmp" || ! mv -f "$binary_tmp" "$SINGBOX_BIN"; then
+        rm -f "$binary_tmp"
         _error "安装 sing-box 二进制文件失败: $SINGBOX_BIN"
         _error "临时目录保留: $temp_dir"
         return 1
     fi
-    if ! chmod 700 "$SINGBOX_BIN"; then
-        _error "设置 sing-box 可执行权限失败: $SINGBOX_BIN"
-        _error "临时目录保留: $temp_dir"
-        return 1
-    fi
-
     touch "${SINGBOX_DIR}/.managed_sing_box"
     rm -rf "$temp_dir"
     _release_install_cache
@@ -7538,16 +7800,58 @@ _install_or_update_singbox() {
     _do_update_singbox
 }
 
-# 执行 sing-box 核心的安装/更新
-_do_update_singbox() {
+_rollback_core_upgrade() {
+    local backup="$1" tmp name target failed=0
+    _warn "正在恢复升级前的 sing-box 核心、配置与服务文件..."
+    tmp=$(mktemp "${SINGBOX_BIN}.rollback.XXXXXX") || return 1
+    if ! install -m 700 "$backup/sing-box" "$tmp" || ! mv -f "$tmp" "$SINGBOX_BIN"; then
+        rm -f "$tmp"; failed=1
+    fi
+    for name in config.json relay.json clash.yaml service; do
+        case "$name" in
+            config.json) target="$CONFIG_FILE" ;;
+            relay.json) target="${SINGBOX_DIR}/relay.json" ;;
+            clash.yaml) target="$CLASH_YAML_FILE" ;;
+            service) target="$SERVICE_FILE" ;;
+        esac
+        [ -n "$target" ] || continue
+        if [ -f "$backup/$name" ]; then cp -a "$backup/$name" "$target" || failed=1
+        else rm -f "$target" || failed=1; fi
+    done
+    if [ "$INIT_SYSTEM" = systemd ]; then systemctl daemon-reload || failed=1; fi
+    if [ "$failed" = 0 ] && _manage_service restart; then
+        _success "已恢复升级前版本与配置。备份保留在 $backup"
+        return 0
+    fi
+    _error "自动恢复未完全成功，请从 $backup 手动恢复并检查日志。"
+    return 1
+}
+
+# 子 shell 将升级锁和中断回滚 trap 限定在本次操作，不影响菜单/SSH。
+_do_update_singbox() (
     _info "--- 安装/更新 Sing-box 核心 ---"
     local update_backup_dir=""
     local had_previous_binary=false
-    local dns_fix_status=1
     local config_check_output=""
+    local CORE_UPGRADE_APPLIED=0 CORE_UPGRADE_TRANSACTION=1
 
-    _install_dependencies true
+    _install_dependencies true || return 1
     mkdir -p "$SINGBOX_DIR" || { _error "无法创建 sing-box 配置目录。"; return 1; }
+    command -v flock >/dev/null 2>&1 || _pkg_install util-linux || return 1
+    exec 9>"$SINGBOX_DIR/.core-upgrade.lock" || return 1
+    flock -n 9 || { _error "另一个内核升级正在进行，请稍后再试。"; return 1; }
+    _core_upgrade_exit() {
+        local status="$1"
+        trap - EXIT INT TERM HUP
+        if [ "$CORE_UPGRADE_APPLIED" = 1 ] && [ "$had_previous_binary" = true ]; then
+            _rollback_core_upgrade "$update_backup_dir" || true
+        fi
+        exit "$status"
+    }
+    trap '_core_upgrade_exit "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
 
     if [ -f "$SINGBOX_BIN" ]; then
         update_backup_dir=$(mktemp -d /root/.singbox-update.XXXXXX) || {
@@ -7583,21 +7887,13 @@ _do_update_singbox() {
         had_previous_binary=true
     fi
 
-    if [ -f "$CONFIG_FILE" ]; then
-        if _check_and_fix_dns; then
-            dns_fix_status=0
-        else
-            dns_fix_status=$?
-            if [ "$dns_fix_status" -eq 2 ]; then
-                _error "DNS 配置无法安全迁移，已取消 sing-box 核心更新。"
-                [ -n "$update_backup_dir" ] && rm -rf "$update_backup_dir"
-                return 1
-            fi
-        fi
-    fi
-
     if ! _install_sing_box; then
         _error "Sing-box 核心安装/更新失败。"
+        if [ "$CORE_UPGRADE_APPLIED" = 0 ]; then
+            _info "升级前检查未通过，原核心、配置和运行服务保持不变。"
+            [ -z "$update_backup_dir" ] || _info "升级前备份已保留: $update_backup_dir"
+            return 1
+        fi
     else
         _success "sing-box 安装/更新成功！"
         # 确保配置文件存在
@@ -7612,7 +7908,8 @@ _do_update_singbox() {
         if config_check_output=$("$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" 2>&1); then
             _info "正在启动/重启 [主] 服务 (sing-box)..."
             if _manage_service "restart"; then
-                [ -n "$update_backup_dir" ] && rm -rf "$update_backup_dir"
+                CORE_UPGRADE_APPLIED=0
+                [ -z "$update_backup_dir" ] || _info "升级前核心与配置备份已保留: ${update_backup_dir}"
                 _success "[主] 服务已就绪。"
                 return 0
             fi
@@ -7623,42 +7920,10 @@ _do_update_singbox() {
         fi
     fi
 
-    if [ "$had_previous_binary" = true ] && [ -n "$update_backup_dir" ]; then
-        local rollback_ok=true
-        _warn "正在回滚到更新前的 sing-box 核心与配置..."
-        # 新核心可能还在运行；写临时文件后 rename，避免 ETXTBSY 导致无法回滚。
-        local rollback_binary
-        rollback_binary=$(mktemp "${SINGBOX_BIN}.rollback.XXXXXX") || return 1
-        if ! install -m 700 "${update_backup_dir}/sing-box" "$rollback_binary" || \
-           ! mv -f "$rollback_binary" "$SINGBOX_BIN"; then
-            rm -f "$rollback_binary"
-            rollback_ok=false
-        fi
-        if [ -f "${update_backup_dir}/config.json" ]; then
-            cp -a "${update_backup_dir}/config.json" "$CONFIG_FILE" || rollback_ok=false
-        fi
-        if [ -f "${update_backup_dir}/relay.json" ]; then
-            cp -a "${update_backup_dir}/relay.json" "${SINGBOX_DIR}/relay.json" || rollback_ok=false
-        fi
-        if [ -f "${update_backup_dir}/clash.yaml" ]; then
-            cp -a "${update_backup_dir}/clash.yaml" "$CLASH_YAML_FILE" || rollback_ok=false
-        fi
-        if [ -f "${update_backup_dir}/service" ]; then
-            cp -a "${update_backup_dir}/service" "$SERVICE_FILE" || rollback_ok=false
-            if [ "$INIT_SYSTEM" = systemd ]; then
-                systemctl daemon-reload || rollback_ok=false
-            fi
-        fi
-        if [ "$rollback_ok" = true ] && _manage_service "restart"; then
-            _success "已恢复更新前版本，原服务已重新启动。"
-        else
-            _error "自动回滚未完全成功，请从 ${update_backup_dir} 手动恢复并检查服务日志。"
-            return 1
-        fi
-    fi
-    [ -n "$update_backup_dir" ] && rm -rf "$update_backup_dir"
+    # EXIT trap 对失败和中断统一回滚，备份不自动删除。
+    [ -z "$update_backup_dir" ] || _info "升级前备份已保留: ${update_backup_dir}"
     return 1
-}
+)
 
 # --- 进阶功能 (子脚本) ---
 _advanced_features() {
