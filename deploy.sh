@@ -40,7 +40,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.06-local9'
+SCRIPT_VERSION='2026.09.06-local10'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -290,7 +290,7 @@ show_help() {
   -h, --help                   显示帮助
 
 交互模式中，主源站输入完成后会连续询问推流源站；直接回车结束。
-Emby 前端根路径 / 返回无跳转欢迎页，Web UI 仍可通过 /web/ 访问。
+Emby 前端根路径 / 返回无跳转欢迎页；新建和导入的 Emby 链路默认禁用 Web UI，客户端 API 与播放路径保留。
 EOF
 }
 
