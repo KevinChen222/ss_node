@@ -48,6 +48,18 @@ proxyall
 
 ## 菜单与目录
 
+### 1.1.1：会话锁与 Emby 网页入口
+
+本次需配套更新 `proxyall`、`sb.sh`、`deploy.sh`。统一菜单的 fd 8 不再传给子脚本；核心升级锁的 fd 9 不再传给服务启动流程，防止后台服务在菜单退出后继续占锁。旧版已经启动的后台进程不会因为更新文件而自动关闭继承的锁；如仍提示占用，在 VPS 运行 `fuser -v /var/lib/proxyall/manager.lock` 查看相关进程，先确认实际持锁者再处理。不要删除锁文件、批量杀进程或重启整台 VPS 来绕过检查。
+
+新建 Emby 反代默认禁用 `/web`、`/emby/web` 及对应前缀下的网页资源和 index.html。规则在 server rewrite 阶段执行，推流路径的 `^~` location 不能绕过它。根路径保留普通 Welcome 页面供原有 Reality 检测使用，已移除指向 Emby 网页的链接。
+
+已有站点不会因安装新版脚本而自动改动。启用方式：`proxyall → Emby 反代 → [4] 更改或删除反代链路 → 选择链路 → [3] 禁用 Emby 网页入口`；选 `[4]` 可以恢复。此操作先备份，只改所选站点的网页访问规则，经 `nginx -t` 后 reload，失败则恢复；不重做证书、监听或 HAProxy SNI 路由。后续修改同一链路时保留其网页访问状态。
+
+不按 User-Agent 区分客户端，API、视频、图片、字幕与 WebSocket 路径保留。依赖 `/web` 的 WebView/网页封装客户端同样会受限；此功能隐藏网页端，不是“只有官方客户端才能访问”的认证机制。持有有效账号或令牌的人仍能调用 API，浏览器也能模拟客户端请求。已有网页缓存不能靠服务器删掉。[Nginx rewrite 文档](https://nginx.org/en/docs/http/ngx_http_rewrite_module.html)
+
+新增测试 `tests/test_web_and_locks.py` 使用真实 Nginx 检查网页拒绝、API/推流路径保留、恢复与失败回滚，并验证子进程和孙进程不继承菜单锁。需设置 `NGINX_TEST_BIN` 或确保 nginx 在 PATH 中。
+
 菜单包含 Emby 反代、sing-box 配置、检查脚本更新、卸载脚本、退出；选项间保留空行。中转和解析功能仍从 sing-box 菜单的进阶功能进入，不另建第二套配置。
 
 | VPS 路径 | 行为 |

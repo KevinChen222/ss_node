@@ -6,7 +6,7 @@
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.21"
+export SCRIPT_VERSION="20-kevin.22"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -7819,7 +7819,7 @@ _rollback_core_upgrade() {
         else rm -f "$target" || failed=1; fi
     done
     if [ "$INIT_SYSTEM" = systemd ]; then systemctl daemon-reload || failed=1; fi
-    if [ "$failed" = 0 ] && _manage_service restart; then
+    if [ "$failed" = 0 ] && _manage_service restart 9>&-; then
         _success "已恢复升级前版本与配置。备份保留在 $backup"
         return 0
     fi
@@ -7907,7 +7907,7 @@ _do_update_singbox() (
 
         if config_check_output=$("$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" 2>&1); then
             _info "正在启动/重启 [主] 服务 (sing-box)..."
-            if _manage_service "restart"; then
+            if _manage_service "restart" 9>&-; then
                 CORE_UPGRADE_APPLIED=0
                 [ -z "$update_backup_dir" ] || _info "升级前核心与配置备份已保留: ${update_backup_dir}"
                 _success "[主] 服务已就绪。"

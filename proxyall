@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下四个值。
-PROXYALL_VERSION="1.1.0"
-SB_SHA256="b78fa9de1ece754d460df9720795acfe528489013671f09f5dd1a03ce28da748"
-DEPLOY_SHA256="2bdc55c019bd3a649813b83b010aee1e06f8c1319ccb532e2423ed265c9153c8"
+PROXYALL_VERSION="1.1.1"
+SB_SHA256="7f64a3a2bf99e607c3946ecf3373fe0ae6724b1ce14850c3a182e7c65cd615dc"
+DEPLOY_SHA256="0c0442627ff39beaa492c1c20132721164fc2dbd6f5bbcb1bbe9dfd5d815ec22"
 RELAY_SHA256="39083485d7e4ab178e6dbf9cca9f11692fe9980f5ac94c5162531bd8ee1e85a1"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 
@@ -88,7 +88,11 @@ pa_prepare_state() {
     install -d -m 700 "$PA_STATE" || return 1
     printf '%s\n' "$PA_MARKER" > "$PA_STATE/.managed" || return 1
     exec 8>"$PA_STATE/manager.lock" || return 1
-    flock -n 8 || { pa_error '已有一个 proxyall 会话，请先退出另一个菜单。'; return 1; }
+    flock -n 8 || {
+        pa_error '已有一个 proxyall 会话或旧版后台进程持锁。请先退出另一个菜单。'
+        pa_info "若没有其他菜单，请运行 fuser -v $PA_STATE/manager.lock 查看持锁进程；不要删除锁文件或直接杀服务。"
+        return 1
+    }
 }
 
 # 提取常量而不 source 下载文件。每个字段必须恰好出现一次。
@@ -287,7 +291,8 @@ pa_run() {
     local component="$1" status=0
     [ -f "$component" ] && bash -n "$component" || { pa_error '组件缺失或语法损坏，请先检查脚本更新。'; return 1; }
     # 必须作为子进程运行，避免 deploy 的 errexit/trap/变量污染统一菜单。
-    PROXYALL_MANAGED=1 bash "$component" || status=$?
+    # 只有菜单持锁；子脚本启动的后台服务不能继承这个文件描述符。
+    PROXYALL_MANAGED=1 bash "$component" 8>&- || status=$?
     [ "$status" = 0 ] || pa_error "子脚本返回状态 $status，已返回统一菜单。"
     return 0
 }
