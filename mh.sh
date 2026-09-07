@@ -254,6 +254,7 @@ sni() {
   "$SNI" sni-router "$@" 9>&-
 }
 new_name() {
+  CERT=; KEY=; CERT_MANAGED=false; CERT_DOMAINS_JSON='[]'
   IFS= read -r -p "节点名称: " NAME
   [ -n "$NAME" ] || fail "名称不能为空。"
   [[ ! "$NAME" =~ [[:cntrl:]] ]] || fail "名称不能包含控制字符。"
@@ -331,12 +332,16 @@ get_cert() {
       KEY=$(sed -n 's/^MH_KEY_PATH=//p' "$output_file" | tail -n 1)
       rm -f "$output_file"
       [ -r "$CERT" ] && [ -r "$KEY" ] || fail "证书已签发，但返回的证书路径无效。"
+      CERT_MANAGED=true
+      CERT_DOMAINS_JSON=$(printf '%s\n' "$@" | jq -Rsc 'split("\n")[:-1]')
       say "证书已就绪，并已配置自动续期：$CERT"
       ;;
     2)
       read -r -p "证书路径（须覆盖全部节点域名）: " CERT
       read -r -p "私钥路径: " KEY
       [ -r "$CERT" ] && [ -r "$KEY" ] || fail "证书或私钥不可读。"
+      CERT_MANAGED=false
+      CERT_DOMAINS_JSON=$(printf '%s\n' "$@" | jq -Rsc 'split("\n")[:-1]')
       ;;
     *) fail "证书方式无效。" ;;
   esac
@@ -398,8 +403,10 @@ commit_node() {
   MH_YQ_NAME="$NAME" yq eval -i '.proxies[0].name = strenv(MH_YQ_NAME)' "$CC"
   yq eval-all 'select(fileIndex == 0) *+ {"listeners": (select(fileIndex == 1).listeners)}' "$CFG" "$LC" >"$NC"
   yq eval-all 'select(fileIndex == 0) *+ {"proxies": (select(fileIndex == 1).proxies)}' "$CLIENTS" "$CC" >"$CL"
-  jq --arg n "$NAME" --arg p "$protocol" --arg l "$link" --arg r "$ROUTE" --arg s "$SNI_NAME" --arg t "$ROUTE_TAG" --arg e "$EXTRA_SNI" --argjson x "$public" --argjson b "$PORT" \
-    '.nodes += [{name:$n,protocol:$p,link:$l,route:$r,sni:$s,route_tag:$t,extra_sni:$e,public_port:$x,backend_port:$b}]' "$META" >"$NM"
+  jq --arg n "$NAME" --arg p "$protocol" --arg l "$link" --arg r "$ROUTE" --arg s "$SNI_NAME" --arg t "$ROUTE_TAG" --arg e "$EXTRA_SNI" \
+    --arg c "${CERT:-}" --arg k "${KEY:-}" --argjson cm "${CERT_MANAGED:-false}" --argjson cd "${CERT_DOMAINS_JSON:-[]}" \
+    --argjson x "$public" --argjson b "$PORT" \
+    '.nodes += [{name:$n,protocol:$p,link:$l,route:$r,sni:$s,route_tag:$t,extra_sni:$e,public_port:$x,backend_port:$b,cert_managed:$cm,cert_path:$c,key_path:$k,cert_domains:$cd}]' "$META" >"$NM"
   if ! "$BIN" -t -f "$NC" >/dev/null || ! "$BIN" -t -f "$CL" >/dev/null; then
     fail "候选服务端或客户端 Mihomo 配置未通过校验。"
   fi
@@ -756,14 +763,55 @@ export_nodes() {
 }
 delete_node() {
   check_ready
-  local asked route route_tag extra backend_port relay_proxy nc nl nm oldcfg oldclients oldmeta route_status
-  list_nodes summary; IFS= read -r -p "要删除的节点名称: " asked
-  route=$(jq -r --arg n "$asked" '[.nodes[] | select(.name==$n) | .route][0] // empty' "$META")
-  [ -n "$route" ] && [ "$route" != null ] || fail "节点不存在。"
+  local asked choice node_count index route route_tag extra backend_port relay_proxy nc nl nm oldcfg oldclients oldmeta route_status
+  local cert_path cert_primary cert_flag_present cert_managed expected_cert cleanup_candidate=false cleanup_output cleanup_status yes
+  if ! jq -e '.nodes | length > 0' "$META" >/dev/null; then
+    say "当前没有 Mihomo 节点。"
+    return 0
+  fi
+  say ""
+  say "请选择要删除的节点："
+  if command -v column >/dev/null 2>&1; then
+    { printf '序号\t节点名称\t协议\t端口\t域名/SNI\n'; jq -r '.nodes | to_entries[] | [(.key + 1 | tostring),.value.name,.value.protocol,(.value.public_port | tostring),(.value.sni // "-")] | @tsv' "$META"; } | column -t -s $'\t'
+  else
+    jq -r '.nodes | to_entries[] | "[\(.key + 1)] \(.value.name)  \(.value.protocol)  \(.value.public_port)  \(.value.sni // "-")"' "$META"
+  fi
+  say "[0] 取消"
+  IFS= read -r -p "请输入节点序号: " choice || return 0
+  [ "$choice" = 0 ] && { say "已取消删除。"; return 0; }
+  [[ "$choice" =~ ^[0-9]+$ ]] || fail "请输入列表中的数字序号。"
+  node_count=$(jq '.nodes | length' "$META")
+  [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "$node_count" ] || fail "节点序号不存在。"
+  index=$((10#$choice - 1))
+  asked=$(jq -r --argjson i "$index" '.nodes[$i].name' "$META")
+  route=$(jq -r --argjson i "$index" '.nodes[$i].route // "none"' "$META")
   route_tag=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.route_tag // .name)' "$META")
   extra=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.extra_sni // "")' "$META")
   backend_port=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.backend_port // .public_port)' "$META")
   relay_proxy=$(jq -r --arg n "$asked" '[.relays[] | select(.listener==$n) | .proxy][0] // ""' "$META")
+  cert_flag_present=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | has("cert_managed")' "$META")
+  cert_managed=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.cert_managed // false)' "$META")
+  cert_path=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.cert_path // "")' "$META")
+  cert_primary=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.cert_domains[0] // .sni // "")' "$META")
+  if [ -z "$cert_path" ]; then
+    cert_path=$(MH_YQ_NAME="$asked" yq eval -r '.listeners[] | select(.name==strenv(MH_YQ_NAME)) | .certificate // ""' "$CFG")
+  fi
+  if [ -n "$cert_primary" ]; then
+    cert_primary=${cert_primary,,}
+    expected_cert="/etc/nginx/certs/${cert_primary}/cert"
+    if [ "$cert_managed" = true ] || { [ "$cert_flag_present" = false ] && [ "$cert_path" = "$expected_cert" ]; }; then
+      cleanup_candidate=true
+    fi
+  fi
+  say ""
+  [ -n "$relay_proxy" ] && say "将同步删除出站映射：$asked → $relay_proxy"
+  [ "$route" != none ] && say "将同步删除共享 443 的 SNI 路由。"
+  if [ "$cleanup_candidate" = true ]; then
+    say "将尝试删除自动签发证书及其续期记录：$cert_primary"
+    say "若证书仍被其他节点、Emby 或 sing-box 配置引用，将自动保留。"
+  elif [ -n "$cert_path" ]; then
+    say "检测到手工/非本脚本证书，将保留证书文件：$cert_path"
+  fi
   read -r -p "确认删除 $asked？输入 yes: " yes
   [ "$yes" = yes ] || return
   nc=$(mktemp "$MH_TMP/config.XXXXXX"); nl=$(mktemp "$MH_TMP/clients.XXXXXX"); nm=$(mktemp "$MH_TMP/meta.XXXXXX")
@@ -784,8 +832,23 @@ delete_node() {
     fi
     fail "SNI 路由删除失败，节点配置恢复也失败；备份仍在 $oldcfg、$oldclients、$oldmeta。"
   fi
-  rm -f "$nc" "$nl" "$nm" "$oldcfg" "$oldclients" "$oldmeta"
   say "已删除：$asked"
+  [ -z "$relay_proxy" ] || say "关联出站映射已删除：$relay_proxy"
+  [ "$route" = none ] || say "关联 SNI 路由已删除。"
+  rm -f "$nc" "$nl" "$nm" "$oldcfg" "$oldclients" "$oldmeta"
+  if [ "$cleanup_candidate" = true ]; then
+    if cleanup_output=$("$SNI" remove-mihomo-certificate "$cert_primary" "$cert_path" 9>&-); then
+      cleanup_status=$(printf '%s\n' "$cleanup_output" | sed -n 's/^MH_CERT_CLEANUP=//p' | tail -n 1)
+      case "$cleanup_status" in
+        deleted) say "关联域名证书、ACME 续期记录和验证配置已删除：$cert_primary" ;;
+        shared) say "关联证书仍被其他配置共用，已安全保留：$cert_primary" ;;
+        unmanaged) say "关联证书不属于 Mihomo 自动签发资源，已保留：$cert_primary" ;;
+        *) say "注意：节点已删除，但证书清理组件没有返回可识别状态，请人工检查：$cert_primary" >&2 ;;
+      esac
+    else
+      say "注意：节点及已关联转发资源已删除，但关联证书清理失败，请人工检查：$cert_primary" >&2
+    fi
+  fi
 }
 url_decode() {
   local value=$1 output= character hex
