@@ -60,6 +60,7 @@ uri_host() {
 normalize_host() {
   if [[ "$1" =~ ^\[([^]]+)\]$ ]]; then printf '%s' "${BASH_REMATCH[1]}"; else printf '%s' "$1"; fi
 }
+url_encode() { printf '%s' "$1" | jq -sRr @uri; }
 
 init() {
   [ ! -L "$ROOT" ] || fail "$ROOT 是符号链接，拒绝写入。"
@@ -253,13 +254,19 @@ sni() {
   "$SNI" sni-router "$@" 9>&-
 }
 new_name() {
-  read -r -p "节点名称: " NAME
+  IFS= read -r -p "节点名称: " NAME
   [ -n "$NAME" ] || fail "名称不能为空。"
-  [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || fail "名称只能包含字母、数字、点、下划线和连字符。"
+  [[ ! "$NAME" =~ [[:cntrl:]] ]] || fail "名称不能包含控制字符。"
   if jq -e --arg n "$NAME" '.nodes[] | select(.name==$n)' "$META" >/dev/null; then fail "节点名称已存在。"; fi
   if MH_YQ_NAME="$NAME" yq eval -e '(.listeners[]?, .proxies[]?) | select(.name == strenv(MH_YQ_NAME))' "$CFG" >/dev/null 2>&1; then
     fail "Mihomo 配置中已存在同名入口或出站。"
   fi
+  while :; do
+    NODE_ID=$(rand_text 16)
+    ROUTE_TAG="mh:$NODE_ID"
+    if ! jq -e --arg t "$ROUTE_TAG" '.nodes[] | select((.route_tag // "") == $t)' "$META" >/dev/null; then break; fi
+  done
+  LINK_NAME=$(url_encode "$NAME")
   return 0
 }
 tcp_endpoint() {
@@ -273,6 +280,7 @@ tcp_endpoint() {
     sni prepare
     read -r -p "分流域名/SNI: " SNI_NAME
     domain_ok "$SNI_NAME" || fail "域名无效。"
+    sni check-sni-free "$SNI_NAME" || fail "该完整域名不能用于新的共享 443 入站。"
     preferred=2543
     for ((attempts=0; attempts<100; attempts++)); do
       PORT=$(sni allocate-backend "$preferred") || fail "无法分配 SNI 回环后端端口。"
@@ -298,9 +306,35 @@ reality_endpoint() {
   fi
 }
 get_cert() {
-  read -r -p "证书路径（须覆盖节点域名）: " CERT
-  read -r -p "私钥路径: " KEY
-  [ -r "$CERT" ] && [ -r "$KEY" ] || fail "证书或私钥不可读。"
+  local choice output domain automatic=1
+  [ "$#" -ge 1 ] || fail "未提供证书域名。"
+  for domain in "$@"; do domain_ok "$domain" || automatic=0; done
+  if [ "$automatic" = 1 ]; then
+    say "证书方式："
+    say "  [1] 自动申请/续期 Let's Encrypt（默认）"
+    say "  [2] 使用已有证书"
+    read -r -p "请选择 [1-2]: " choice
+    [ -n "$choice" ] || choice=1
+  else
+    say "服务器地址包含 IP 或无效域名，无法自动申请公网证书，请使用已有证书。"
+    choice=2
+  fi
+  case "$choice" in
+    1)
+      [ -x "$SNI" ] || fail "未找到证书管理组件 $SNI；请先安装或更新 proxyall。"
+      output=$("$SNI" issue-mihomo-certificate "$@" 9>&-) || fail "证书申请失败；请确认域名解析正确、TCP 80 可访问，且 CDN 未拦截 ACME challenge。"
+      CERT=$(printf '%s\n' "$output" | sed -n 's/^MH_CERT_PATH=//p' | tail -n 1)
+      KEY=$(printf '%s\n' "$output" | sed -n 's/^MH_KEY_PATH=//p' | tail -n 1)
+      [ -r "$CERT" ] && [ -r "$KEY" ] || fail "证书已签发，但返回的证书路径无效。"
+      say "证书已就绪，并已配置自动续期：$CERT"
+      ;;
+    2)
+      read -r -p "证书路径（须覆盖全部节点域名）: " CERT
+      read -r -p "私钥路径: " KEY
+      [ -r "$CERT" ] && [ -r "$KEY" ] || fail "证书或私钥不可读。"
+      ;;
+    *) fail "证书方式无效。" ;;
+  esac
 }
 direct_domain() {
   HOST=$SNI_NAME
@@ -318,7 +352,6 @@ begin_files() {
   NM=$(mktemp "$MH_TMP/meta.XXXXXX")
 }
 register_routes() {
-  ROUTE_TAG="mh:$NAME"
   [ "$ROUTE" = none ] && return 0
   if [ "$ROUTE" = reality ]; then
     sni register-reality mh "$ROUTE_TAG" "$SNI_NAME" "$PORT" || return 1
@@ -356,7 +389,8 @@ unregister_routes() {
 }
 commit_node() {
   local protocol=$1 link=$2 public=$3 route_status
-  ROUTE_TAG="mh:$NAME"
+  MH_YQ_NAME="$NAME" yq eval -i '.listeners[0].name = strenv(MH_YQ_NAME)' "$LC"
+  MH_YQ_NAME="$NAME" yq eval -i '.proxies[0].name = strenv(MH_YQ_NAME)' "$CC"
   yq eval-all 'select(fileIndex == 0) *+ {"listeners": (select(fileIndex == 1).listeners)}' "$CFG" "$LC" >"$NC"
   yq eval-all 'select(fileIndex == 0) *+ {"proxies": (select(fileIndex == 1).proxies)}' "$CLIENTS" "$CC" >"$CL"
   jq --arg n "$NAME" --arg p "$protocol" --arg l "$link" --arg r "$ROUTE" --arg s "$SNI_NAME" --arg t "$ROUTE_TAG" --arg e "$EXTRA_SNI" --argjson x "$public" --argjson b "$PORT" \
@@ -398,7 +432,7 @@ add_reality() {
   begin_files
   cat >"$LC" <<EOF
 listeners:
-  - name: "$NAME"
+  - name: "__MH_NODE_NAME__"
     type: vless
     listen: $BIND
     port: $PORT
@@ -416,7 +450,7 @@ EOF
   id=$(yq eval '.listeners[0].users[0].uuid' "$LC"); pp=$(public_port)
   cat >"$CC" <<EOF
 proxies:
-  - name: "$NAME"
+  - name: "__MH_NODE_NAME__"
     type: vless
     server: "$HOST"
     port: $pp
@@ -429,16 +463,16 @@ proxies:
     reality-opts: {public-key: "$pub", short-id: "$sid"}
 EOF
   link_host=$(uri_host "$HOST")
-  link="vless://$id@$link_host:$pp?encryption=none&security=reality&sni=$SNI_NAME&fp=firefox&pbk=$pub&sid=$sid&type=tcp&flow=xtls-rprx-vision#$NAME"
+  link="vless://$id@$link_host:$pp?encryption=none&security=reality&sni=$SNI_NAME&fp=firefox&pbk=$pub&sid=$sid&type=tcp&flow=xtls-rprx-vision#$LINK_NAME"
   commit_node vless-reality "$link" "$pp"
 }
 add_anytls() {
-  check_ready; new_name; tcp_endpoint; get_cert; direct_domain
+  check_ready; new_name; tcp_endpoint; direct_domain; get_cert "$HOST"
   local pass pp link link_host
   pass=$(rand_text 24); pp=$(public_port); begin_files
   cat >"$LC" <<EOF
 listeners:
-  - name: "$NAME"
+  - name: "__MH_NODE_NAME__"
     type: anytls
     listen: $BIND
     port: $PORT
@@ -448,35 +482,59 @@ listeners:
 EOF
   cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: anytls, server: "$HOST", port: $pp, password: "$pass", tls: true, sni: "$HOST"}
+  - {name: "__MH_NODE_NAME__", type: anytls, server: "$HOST", port: $pp, password: "$pass", tls: true, sni: "$HOST"}
 EOF
   link_host=$(uri_host "$HOST")
-  link="anytls://$pass@$link_host:$pp?sni=$HOST#$NAME"
+  link="anytls://$pass@$link_host:$pp?sni=$HOST#$LINK_NAME"
   commit_node anytls "$link" "$pp"
 }
+xhttp_domain_guide() {
+  cat <<'EOF'
+
+XHTTP 域名要求：
+  1. 共享 TCP 443 时，主域名/SNI 必须是一个尚未分配给其他入站的完整域名。
+     不能与现有 Emby、Reality 或其他 TLS 节点使用完全相同的域名。
+  2. 可以使用同一根域名下的不同子域名，例如 x.example.com 和 down.example.com。
+  3. 独立下行域名是可选项，仅在需要上下行分离或单独使用 CDN 时配置。
+     它必须与主域名不同，也不能占用其他共享 443 入站正在使用的完整域名。
+  4. 使用独立下行域名时，证书必须同时覆盖主域名和下行域名；自动申请会处理这一点。
+  5. 自动申请证书要求域名解析正确、TCP 80 可访问；经过 CDN 时不能拦截 ACME challenge。
+  6. 如果使用非 443 独立端口，不存在共享 443 的 SNI 唯一性限制。
+EOF
+}
 add_xhttp() {
-  check_ready; new_name; tcp_endpoint; direct_domain
-  local id path mode pp link split server_host link_host
+  check_ready; new_name; xhttp_domain_guide; tcp_endpoint; direct_domain
+  local id path mode pp link split server_host link_host confirm route_summary down_summary
   id=$(uuid); path=$(rand_path)
   read -r -p "XHTTP 模式 [auto/stream-one/stream-up/packet-up]（默认 auto）: " mode
   [ -n "$mode" ] || mode=auto
   case "$mode" in auto|stream-one|stream-up|packet-up) ;; *) fail "模式无效。" ;; esac
   server_host=$HOST
   if [ "$ROUTE" = tls ]; then
-    read -r -p "是否为下行配置独立 CDN 域名？[y/N]: " split
+    read -r -p "是否配置独立下行域名（仅上下行分离/CDN 场景需要）？[y/N]: " split
     if [[ "$split" =~ ^[Yy]$ ]]; then
-      read -r -p "独立下行域名/SNI: " EXTRA_SNI
+      read -r -p "独立下行完整域名/SNI（不能与主域名或其他 443 入站相同）: " EXTRA_SNI
       domain_ok "$EXTRA_SNI" || fail "下行域名无效。"
-      [ "$EXTRA_SNI" != "$HOST" ] || fail "下行域名应与主域名不同。"
+      [ "${EXTRA_SNI,,}" != "${HOST,,}" ] || fail "独立下行域名不能与主域名相同。"
+      sni check-sni-free "$EXTRA_SNI" || fail "该下行完整域名不能用于新的共享 443 入站。"
       server_host=
     fi
   fi
-  [ -n "$EXTRA_SNI" ] && say "证书必须同时覆盖 $HOST 和 $EXTRA_SNI。"
-  get_cert
+  if [ "$ROUTE" = tls ]; then route_summary="共享 TCP 443（由 HAProxy 按 SNI 分流）"; else route_summary="TCP $PORT 独立监听"; fi
+  if [ -n "$EXTRA_SNI" ]; then down_summary="$EXTRA_SNI（独立下行/CDN）"; else down_summary="$HOST（上下行共用）"; fi
+  say ""
+  say "XHTTP 配置摘要："
+  say "  入口方式：$route_summary"
+  say "  主域名：  $HOST"
+  say "  下行域名：$down_summary"
+  if [ -n "$EXTRA_SNI" ]; then say "  证书范围：$HOST + $EXTRA_SNI"; else say "  证书范围：$HOST"; fi
+  read -r -p "确认以上域名配置并继续？[Y/n]: " confirm
+  [[ "$confirm" != n && "$confirm" != N ]] || return 0
+  if [ -n "$EXTRA_SNI" ]; then get_cert "$HOST" "$EXTRA_SNI"; else get_cert "$HOST"; fi
   pp=$(public_port); begin_files
   cat >"$LC" <<EOF
 listeners:
-  - name: "$NAME"
+  - name: "__MH_NODE_NAME__"
     type: vless
     listen: $BIND
     port: $PORT
@@ -492,7 +550,7 @@ listeners:
 EOF
   cat >"$CC" <<EOF
 proxies:
-  - name: "$NAME"
+  - name: "__MH_NODE_NAME__"
     type: vless
     server: "$HOST"
     port: $pp
@@ -519,11 +577,11 @@ EOF
 EOF
   fi
   link_host=$(uri_host "$HOST")
-  link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=xhttp&path=$path&host=$HOST&mode=$mode#$NAME"
+  link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=xhttp&path=$path&host=$HOST&mode=$mode#$LINK_NAME"
   commit_node vless-xhttp "$link" "$pp"
 }
 add_tls_transport() {
-  check_ready; new_name; tcp_endpoint; get_cert; direct_domain
+  check_ready; new_name; tcp_endpoint; direct_domain; get_cert "$HOST"
   local type=$1 id pass path service pp link link_host
   pp=$(public_port); begin_files
   link_host=$(uri_host "$HOST")
@@ -532,35 +590,35 @@ add_tls_transport() {
       id=$(uuid); path=$(rand_path)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: vless, listen: $BIND, port: $PORT, users: [{username: default, uuid: "$id"}], certificate: "$CERT", private-key: "$KEY", ws-path: "$path"}
+  - {name: "__MH_NODE_NAME__", type: vless, listen: $BIND, port: $PORT, users: [{username: default, uuid: "$id"}], certificate: "$CERT", private-key: "$KEY", ws-path: "$path"}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: vless, server: "$HOST", port: $pp, uuid: "$id", network: ws, tls: true, servername: "$HOST", ws-opts: {path: "$path"}}
+  - {name: "__MH_NODE_NAME__", type: vless, server: "$HOST", port: $pp, uuid: "$id", network: ws, tls: true, servername: "$HOST", ws-opts: {path: "$path"}}
 EOF
-      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=ws&path=$path#$NAME" ;;
+      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=ws&path=$path#$LINK_NAME" ;;
     vless-grpc)
       id=$(uuid); service=$(rand_text 12)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: vless, listen: $BIND, port: $PORT, users: [{username: default, uuid: "$id"}], certificate: "$CERT", private-key: "$KEY", grpc-service-name: "$service"}
+  - {name: "__MH_NODE_NAME__", type: vless, listen: $BIND, port: $PORT, users: [{username: default, uuid: "$id"}], certificate: "$CERT", private-key: "$KEY", grpc-service-name: "$service"}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: vless, server: "$HOST", port: $pp, uuid: "$id", network: grpc, tls: true, servername: "$HOST", grpc-opts: {grpc-service-name: "$service"}}
+  - {name: "__MH_NODE_NAME__", type: vless, server: "$HOST", port: $pp, uuid: "$id", network: grpc, tls: true, servername: "$HOST", grpc-opts: {grpc-service-name: "$service"}}
 EOF
-      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=grpc&serviceName=$service#$NAME" ;;
+      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=grpc&serviceName=$service#$LINK_NAME" ;;
     trojan-ws)
       pass=$(rand_text 24); path=$(rand_path)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: trojan, listen: $BIND, port: $PORT, users: [{username: default, password: "$pass"}], certificate: "$CERT", private-key: "$KEY", ws-path: "$path"}
+  - {name: "__MH_NODE_NAME__", type: trojan, listen: $BIND, port: $PORT, users: [{username: default, password: "$pass"}], certificate: "$CERT", private-key: "$KEY", ws-path: "$path"}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: trojan, server: "$HOST", port: $pp, password: "$pass", sni: "$HOST", network: ws, ws-opts: {path: "$path"}}
+  - {name: "__MH_NODE_NAME__", type: trojan, server: "$HOST", port: $pp, password: "$pass", sni: "$HOST", network: ws, ws-opts: {path: "$path"}}
 EOF
-      link="trojan://$pass@$link_host:$pp?sni=$HOST&type=ws&path=$path#$NAME" ;;
+      link="trojan://$pass@$link_host:$pp?sni=$HOST&type=ws&path=$path#$LINK_NAME" ;;
   esac
   commit_node "$type" "$link" "$pp"
 }
@@ -581,35 +639,35 @@ add_plain() {
       id=$(uuid)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: vless, listen: 0.0.0.0, port: $PORT, allow-insecure: true, users: [{username: default, uuid: "$id"}]}
+  - {name: "__MH_NODE_NAME__", type: vless, listen: 0.0.0.0, port: $PORT, allow-insecure: true, users: [{username: default, uuid: "$id"}]}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: vless, server: "$host", port: $PORT, uuid: "$id", tls: false}
+  - {name: "__MH_NODE_NAME__", type: vless, server: "$host", port: $PORT, uuid: "$id", tls: false}
 EOF
-      commit_node vless-tcp "vless://$id@$link_host:$PORT?encryption=none&security=none&type=tcp#$NAME" "$PORT" ;;
+      commit_node vless-tcp "vless://$id@$link_host:$PORT?encryption=none&security=none&type=tcp#$LINK_NAME" "$PORT" ;;
     shadowsocks)
       pass=$(rand_text 24); method=aes-256-gcm
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: shadowsocks, listen: 0.0.0.0, port: $PORT, cipher: "$method", password: "$pass"}
+  - {name: "__MH_NODE_NAME__", type: shadowsocks, listen: 0.0.0.0, port: $PORT, cipher: "$method", password: "$pass"}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: ss, server: "$host", port: $PORT, cipher: "$method", password: "$pass"}
+  - {name: "__MH_NODE_NAME__", type: ss, server: "$host", port: $PORT, cipher: "$method", password: "$pass"}
 EOF
-      commit_node shadowsocks "ss://$(printf '%s' "$method:$pass" | base64 -w0 | tr '+/' '-_' | tr -d '=')@$link_host:$PORT#$NAME" "$PORT" ;;
+      commit_node shadowsocks "ss://$(printf '%s' "$method:$pass" | base64 -w0 | tr '+/' '-_' | tr -d '=')@$link_host:$PORT#$LINK_NAME" "$PORT" ;;
     socks)
       pass=$(rand_text 20)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: socks, listen: 0.0.0.0, port: $PORT, users: [{username: default, password: "$pass"}]}
+  - {name: "__MH_NODE_NAME__", type: socks, listen: 0.0.0.0, port: $PORT, users: [{username: default, password: "$pass"}]}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: socks5, server: "$host", port: $PORT, username: default, password: "$pass"}
+  - {name: "__MH_NODE_NAME__", type: socks5, server: "$host", port: $PORT, username: default, password: "$pass"}
 EOF
-      commit_node socks5 "socks5://default:$pass@$link_host:$PORT#$NAME" "$PORT" ;;
+      commit_node socks5 "socks5://default:$pass@$link_host:$PORT#$LINK_NAME" "$PORT" ;;
   esac
 }
 add_quic() {
@@ -620,29 +678,29 @@ add_quic() {
   [[ "$asked" =~ ^[0-9]+$ ]] && [ "$asked" -ge 1 ] && [ "$asked" -le 65535 ] && [ "$asked" != 443 ] || fail "UDP 端口无效，且 HY2/TUIC 不能使用当前 TCP SNI 复用 443。"
   check_port udp "$asked"
   read -r -p "服务器域名: " host; domain_ok "$host" || fail "需要有效域名。"
-  get_cert; pass=$(rand_text 24); BIND=0.0.0.0; PORT=$asked; ROUTE=none; SNI_NAME=$host; EXTRA_SNI=; begin_files
+  get_cert "$host"; pass=$(rand_text 24); BIND=0.0.0.0; PORT=$asked; ROUTE=none; SNI_NAME=$host; EXTRA_SNI=; begin_files
   case "$type" in
     hysteria2)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: hysteria2, listen: 0.0.0.0, port: $PORT, users: {default: "$pass"}, certificate: "$CERT", private-key: "$KEY"}
+  - {name: "__MH_NODE_NAME__", type: hysteria2, listen: 0.0.0.0, port: $PORT, users: {default: "$pass"}, certificate: "$CERT", private-key: "$KEY"}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: hysteria2, server: "$host", port: $PORT, password: "$pass", sni: "$host"}
+  - {name: "__MH_NODE_NAME__", type: hysteria2, server: "$host", port: $PORT, password: "$pass", sni: "$host"}
 EOF
-      commit_node hysteria2 "hysteria2://$pass@$host:$PORT?sni=$host#$NAME" "$PORT" ;;
+      commit_node hysteria2 "hysteria2://$pass@$host:$PORT?sni=$host#$LINK_NAME" "$PORT" ;;
     tuic)
       id=$(uuid)
       cat >"$LC" <<EOF
 listeners:
-  - {name: "$NAME", type: tuic, listen: 0.0.0.0, port: $PORT, users: {"$id": "$pass"}, certificate: "$CERT", private-key: "$KEY", congestion-controller: bbr}
+  - {name: "__MH_NODE_NAME__", type: tuic, listen: 0.0.0.0, port: $PORT, users: {"$id": "$pass"}, certificate: "$CERT", private-key: "$KEY", congestion-controller: bbr}
 EOF
       cat >"$CC" <<EOF
 proxies:
-  - {name: "$NAME", type: tuic, server: "$host", port: $PORT, uuid: "$id", password: "$pass", sni: "$host", congestion-controller: bbr}
+  - {name: "__MH_NODE_NAME__", type: tuic, server: "$host", port: $PORT, uuid: "$id", password: "$pass", sni: "$host", congestion-controller: bbr}
 EOF
-      commit_node tuic "tuic://$id:$pass@$host:$PORT?sni=$host&congestion_control=bbr#$NAME" "$PORT" ;;
+      commit_node tuic "tuic://$id:$pass@$host:$PORT?sni=$host&congestion_control=bbr#$LINK_NAME" "$PORT" ;;
   esac
 }
 list_nodes() {
@@ -668,7 +726,7 @@ export_nodes() {
 delete_node() {
   check_ready
   local asked route route_tag extra backend_port relay_proxy nc nl nm oldcfg oldclients oldmeta route_status
-  list_nodes; read -r -p "要删除的节点名称: " asked
+  list_nodes; IFS= read -r -p "要删除的节点名称: " asked
   route=$(jq -r --arg n "$asked" '[.nodes[] | select(.name==$n) | .route][0] // empty' "$META")
   [ -n "$route" ] && [ "$route" != null ] || fail "节点不存在。"
   route_tag=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.route_tag // .name)' "$META")
@@ -832,15 +890,31 @@ build_anytls_outbound() {
   [[ "$insecure" =~ ^(1|true)$ ]] && yq eval -i '.proxies[0].skip-cert-verify=true' "$out"
   return 0
 }
+list_relays() {
+  init
+  if ! jq -e '.relays | length > 0' "$META" >/dev/null; then
+    say "当前没有入站 → 出站映射。"
+    return 0
+  fi
+  say "当前入站 → 出站映射："
+  if command -v column >/dev/null 2>&1; then
+    jq -r '.relays[] | [.listener,.proxy] | @tsv' "$META" | column -t -s $'\t'
+  else
+    jq -r '.relays[] | "\(.listener) -> \(.proxy)"' "$META"
+  fi
+}
 relay_add() {
   check_ready
   local listener link pname nc nm in cl existing_proxy
-  list_nodes; read -r -p "作为入口的本机节点名称: " listener
-  MH_YQ_NAME="$listener" yq eval '.listeners[] | select(.name==strenv(MH_YQ_NAME)) | .name' "$CFG" | grep -qx "$listener" || fail "入口不存在。"
-  if jq -e --arg n "$listener" '.relays[] | select(.listener==$n)' "$META" >/dev/null; then fail "该入口已有中转，请先解除。"; fi
+  say "选择一个已搭建的 Mihomo 入站，并为它指定一个外部出站节点。"
+  say "设置后，该入站收到的流量会直接交给该出站，不经过全局 rules。"
+  say "支持导入 VLESS、Trojan、AnyTLS 分享链接；本功能不创建端口转发规则。"
+  list_nodes; IFS= read -r -p "本机入站节点名称: " listener
+  if ! MH_YQ_NAME="$listener" yq eval -e '.listeners[]? | select(.name==strenv(MH_YQ_NAME))' "$CFG" >/dev/null 2>&1; then fail "入口不存在。"; fi
+  if jq -e --arg n "$listener" '.relays[] | select(.listener==$n)' "$META" >/dev/null; then fail "该入口已有出站映射，请先删除原映射。"; fi
   existing_proxy=$(MH_YQ_NAME="$listener" yq eval -r '.listeners[] | select(.name==strenv(MH_YQ_NAME)) | .proxy // ""' "$CFG")
   [ -z "$existing_proxy" ] || fail "该入口已有 proxy=$existing_proxy，但元数据未登记；请先人工核对配置。"
-  read -r -s -p "外部 VLESS/Trojan/AnyTLS 分享链接（输入不回显）: " link
+  read -r -s -p "对应的外部出站分享链接（输入不回显）: " link
   printf '\n'
   case "$link" in vless://*|trojan://*|anytls://*) ;; *) fail "目前支持导入 VLESS、Trojan、AnyTLS 分享链接。" ;; esac
   while :; do
@@ -860,7 +934,7 @@ relay_add() {
   jq --arg l "$listener" --arg p "$pname" --arg u "$link" '.relays += [{listener:$l,proxy:$p,link:$u}]' "$META" >"$nm"
   if ! apply_state "$nc" "$cl" "$nm"; then fail "中转配置提交失败。"; fi
   rm -f "$in" "$nc" "$cl" "$nm"
-  say "中转已启用：$listener → $pname"
+  say "出站映射已启用：$listener → $pname"
 }
 relay_remove() {
   check_ready
@@ -870,18 +944,38 @@ relay_remove() {
   else
     jq -r '.relays[] | [.listener,.proxy] | @tsv' "$META"
   fi
-  read -r -p "要解除中转的入口名称: " listener
+  IFS= read -r -p "要解除中转的入口名称: " listener
   proxy=$(jq -r --arg n "$listener" '[.relays[] | select(.listener==$n) | .proxy][0] // empty' "$META")
-  [ -n "$proxy" ] && [ "$proxy" != null ] || fail "该入口没有中转。"
+  [ -n "$proxy" ] && [ "$proxy" != null ] || fail "该入口没有出站映射。"
   [ "$(MH_YQ_NAME="$listener" yq eval -r '.listeners[] | select(.name==strenv(MH_YQ_NAME)) | .proxy // ""' "$CFG")" = "$proxy" ] ||
     fail "入口 proxy 与元数据不一致，拒绝自动删除。"
   nc=$(mktemp "$MH_TMP/config.XXXXXX"); nm=$(mktemp "$MH_TMP/meta.XXXXXX"); cl=$(mktemp "$MH_TMP/clients.XXXXXX")
   cp "$CLIENTS" "$cl"
   MH_YQ_NAME="$listener" MH_YQ_PROXY="$proxy" yq eval 'del((.listeners[] | select(.name==strenv(MH_YQ_NAME))).proxy) | del(.proxies[] | select(.name==strenv(MH_YQ_PROXY)))' "$CFG" >"$nc"
   jq --arg n "$listener" 'del(.relays[] | select(.listener==$n))' "$META" >"$nm"
-  if ! apply_state "$nc" "$cl" "$nm"; then fail "解除中转失败，原状态已保留。"; fi
+  if ! apply_state "$nc" "$cl" "$nm"; then fail "删除出站映射失败，原状态已保留。"; fi
   rm -f "$nc" "$cl" "$nm"
-  say "已解除中转：$listener"
+  say "已删除出站映射：$listener"
+}
+relay_menu() {
+  local choice
+  while :; do
+    printf '\n╔══════════════════════════════════════════╗\n'
+    printf '║          Mihomo 入站 → 出站映射          ║\n'
+    printf '╚══════════════════════════════════════════╝\n\n'
+    printf '    [1] 新增指定入站 → 出站映射\n'
+    printf '    [2] 查看现有映射\n'
+    printf '    [3] 删除映射（保留入站节点）\n'
+    printf '    [0] 返回主菜单\n\n'
+    read -r -p "  请输入选项 [0-3]: " choice
+    case "$choice" in
+      1) relay_add ;;
+      2) list_relays ;;
+      3) relay_remove ;;
+      0) return 0 ;;
+      *) say "无效选择。" ;;
+    esac
+  done
 }
 install_core() {
   root_only
@@ -1062,21 +1156,20 @@ menu() {
     printf '  【节点管理】\n'
     printf '    [1] 添加节点            [2] 查看节点\n'
     printf '    [3] 导出节点            [4] 删除节点\n\n'
-    printf '  【中转管理】\n'
-    printf '    [5] 设置入口中转        [6] 解除入口中转\n\n'
+    printf '  【出站映射】\n'
+    printf '    [5] 管理指定入站 → 出站映射\n\n'
     printf '  【核心管理】\n'
-    printf '    [7] 安装/更新 Mihomo 核心和服务\n\n'
+    printf '    [6] 安装/更新 Mihomo 核心和服务\n\n'
     printf '  ──────────────────────────────────────────\n'
     printf '    [0] 退出脚本\n\n'
-    read -r -p "  请输入选项 [0-7]: " choice
+    read -r -p "  请输入选项 [0-6]: " choice
     case "$choice" in
       1) add_node_menu ;;
       2) list_nodes ;;
       3) read -r -p "导出文件（默认 /root/mihomo-nodes.txt）: " out; export_nodes "$out" ;;
       4) delete_node ;;
-      5) relay_add ;;
-      6) relay_remove ;;
-      7) install_core; install_service ;;
+      5) relay_menu ;;
+      6) install_core; install_service ;;
       0) return ;;
       *) say "无效选择。" ;;
     esac
