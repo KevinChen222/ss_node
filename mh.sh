@@ -119,14 +119,14 @@ yq_is_v4() {
 check_yq() { need yq; yq_is_v4 || fail "需要 mikefarah/yq v4。"; }
 check_runtime_deps() {
   local command_name
-  for command_name in jq yq gzip sha256sum install mktemp shuf base64 od ss flock; do
+  for command_name in jq yq gzip sha256sum install mktemp shuf base64 od ss flock tee; do
     need "$command_name"
   done
   check_yq
 }
 install_base_deps() {
   local command_name missing=0
-  for command_name in curl jq gzip sha256sum install mktemp shuf base64 od ss flock; do
+  for command_name in curl jq gzip sha256sum install mktemp shuf base64 od ss flock tee; do
     command -v "$command_name" >/dev/null 2>&1 || missing=1
   done
   [ "$missing" = 0 ] && return 0
@@ -306,7 +306,7 @@ reality_endpoint() {
   fi
 }
 get_cert() {
-  local choice output domain automatic=1
+  local choice output_file domain automatic=1
   [ "$#" -ge 1 ] || fail "未提供证书域名。"
   for domain in "$@"; do domain_ok "$domain" || automatic=0; done
   if [ "$automatic" = 1 ]; then
@@ -322,9 +322,14 @@ get_cert() {
   case "$choice" in
     1)
       [ -x "$SNI" ] || fail "未找到证书管理组件 $SNI；请先安装或更新 proxyall。"
-      output=$("$SNI" issue-mihomo-certificate "$@" 9>&-) || fail "证书申请失败；请确认域名解析正确、TCP 80 可访问，且 CDN 未拦截 ACME challenge。"
-      CERT=$(printf '%s\n' "$output" | sed -n 's/^MH_CERT_PATH=//p' | tail -n 1)
-      KEY=$(printf '%s\n' "$output" | sed -n 's/^MH_KEY_PATH=//p' | tail -n 1)
+      output_file=$(mktemp "$MH_TMP/cert-output.XXXXXX") || fail "无法创建证书操作临时文件。"
+      if ! "$SNI" issue-mihomo-certificate "$@" 9>&- | tee "$output_file" | sed '/^MH_CERT_PATH=/d; /^MH_KEY_PATH=/d'; then
+        rm -f "$output_file"
+        fail "证书申请失败；请确认域名解析正确、TCP 80 可访问，且 CDN 未拦截 ACME challenge。"
+      fi
+      CERT=$(sed -n 's/^MH_CERT_PATH=//p' "$output_file" | tail -n 1)
+      KEY=$(sed -n 's/^MH_KEY_PATH=//p' "$output_file" | tail -n 1)
+      rm -f "$output_file"
       [ -r "$CERT" ] && [ -r "$KEY" ] || fail "证书已签发，但返回的证书路径无效。"
       say "证书已就绪，并已配置自动续期：$CERT"
       ;;
@@ -388,7 +393,7 @@ unregister_routes() {
   return 0
 }
 commit_node() {
-  local protocol=$1 link=$2 public=$3 route_status
+  local protocol=$1 link=$2 public=$3 route_status oldcfg oldclients oldmeta
   MH_YQ_NAME="$NAME" yq eval -i '.listeners[0].name = strenv(MH_YQ_NAME)' "$LC"
   MH_YQ_NAME="$NAME" yq eval -i '.proxies[0].name = strenv(MH_YQ_NAME)' "$CC"
   yq eval-all 'select(fileIndex == 0) *+ {"listeners": (select(fileIndex == 1).listeners)}' "$CFG" "$LC" >"$NC"
@@ -398,21 +403,40 @@ commit_node() {
   if ! "$BIN" -t -f "$NC" >/dev/null || ! "$BIN" -t -f "$CL" >/dev/null; then
     fail "候选服务端或客户端 Mihomo 配置未通过校验。"
   fi
+  oldcfg=$(mktemp "$MH_TMP/pre-route-config.XXXXXX")
+  oldclients=$(mktemp "$MH_TMP/pre-route-clients.XXXXXX")
+  oldmeta=$(mktemp "$MH_TMP/pre-route-meta.XXXXXX")
+  cp "$CFG" "$oldcfg"; cp "$CLIENTS" "$oldclients"; cp "$META" "$oldmeta"
+  if ! apply_state "$NC" "$CL" "$NM"; then
+    rm -f "$oldcfg" "$oldclients" "$oldmeta"
+    fail "节点状态提交失败，未登记 SNI 路由。"
+  fi
   if register_routes; then
     :
   else
     route_status=$?
-    [ "$route_status" = 2 ] && fail "SNI 路由登记失败且自动回收不完整；节点未写入，请运行 sb sni-router status 检查残留路由。"
-    fail "SNI 路由登记失败，节点未写入。"
-  fi
-  if ! apply_state "$NC" "$CL" "$NM"; then
-    if unregister_routes "$ROUTE" "$ROUTE_TAG" "$EXTRA_SNI" "$PORT"; then
-      fail "节点状态提交失败，已撤销 SNI 路由。"
+    if apply_state "$oldcfg" "$oldclients" "$oldmeta"; then
+      rm -f "$oldcfg" "$oldclients" "$oldmeta"
+      [ "$route_status" = 2 ] && fail "SNI 路由登记失败，节点配置已恢复，但路由自动回收不完整；请运行 sb sni-router status 检查。"
+      fail "SNI 路由登记失败，节点配置已恢复。"
     fi
-    fail "节点状态提交失败，且 SNI 路由回收失败；请运行 sb sni-router status 检查残留路由。"
+    fail "SNI 路由登记失败，且节点配置自动恢复失败；恢复材料保留在 $oldcfg、$oldclients、$oldmeta。"
   fi
-  rm -f "$LC" "$CC" "$NC" "$CL" "$NM"
-  say "已创建：$NAME"
+  rm -f "$LC" "$CC" "$NC" "$CL" "$NM" "$oldcfg" "$oldclients" "$oldmeta"
+  say ""
+  say "══════════════════ 节点创建成功 ══════════════════"
+  say "名称：$NAME"
+  say "协议：$protocol"
+  say "公网端口：$public"
+  [ -n "$SNI_NAME" ] && say "域名/SNI：$SNI_NAME"
+  say ""
+  say "分享链接（可复制到 v2rayN 或支持该协议的客户端导入）："
+  say "$link"
+  if [ "$protocol" = vless-xhttp ] && [ -n "$EXTRA_SNI" ]; then
+    say ""
+    say "注意：通用 URL 无法完整表达独立下行配置；请使用 $CLIENTS 中的 Mihomo YAML 保留下行域名。"
+  fi
+  say "═══════════════════════════════════════════════════"
 }
 public_port() { if [ "$ROUTE" = none ]; then printf '%s' "$PORT"; else printf 443; fi; }
 
@@ -485,7 +509,7 @@ proxies:
   - {name: "__MH_NODE_NAME__", type: anytls, server: "$HOST", port: $pp, password: "$pass", tls: true, sni: "$HOST"}
 EOF
   link_host=$(uri_host "$HOST")
-  link="anytls://$pass@$link_host:$pp?sni=$HOST#$LINK_NAME"
+  link="anytls://$(url_encode "$pass")@$link_host:$pp/?sni=$(url_encode "$HOST")#$LINK_NAME"
   commit_node anytls "$link" "$pp"
 }
 xhttp_domain_guide() {
@@ -577,7 +601,7 @@ EOF
 EOF
   fi
   link_host=$(uri_host "$HOST")
-  link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=xhttp&path=$path&host=$HOST&mode=$mode#$LINK_NAME"
+  link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=xhttp&path=$(url_encode "$path")&host=$HOST&mode=$mode#$LINK_NAME"
   commit_node vless-xhttp "$link" "$pp"
 }
 add_tls_transport() {
@@ -596,7 +620,7 @@ EOF
 proxies:
   - {name: "__MH_NODE_NAME__", type: vless, server: "$HOST", port: $pp, uuid: "$id", network: ws, tls: true, servername: "$HOST", ws-opts: {path: "$path"}}
 EOF
-      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=ws&path=$path#$LINK_NAME" ;;
+      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=ws&host=$HOST&path=$(url_encode "$path")#$LINK_NAME" ;;
     vless-grpc)
       id=$(uuid); service=$(rand_text 12)
       cat >"$LC" <<EOF
@@ -607,7 +631,7 @@ EOF
 proxies:
   - {name: "__MH_NODE_NAME__", type: vless, server: "$HOST", port: $pp, uuid: "$id", network: grpc, tls: true, servername: "$HOST", grpc-opts: {grpc-service-name: "$service"}}
 EOF
-      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=grpc&serviceName=$service#$LINK_NAME" ;;
+      link="vless://$id@$link_host:$pp?encryption=none&security=tls&sni=$HOST&type=grpc&serviceName=$(url_encode "$service")&authority=$HOST#$LINK_NAME" ;;
     trojan-ws)
       pass=$(rand_text 24); path=$(rand_path)
       cat >"$LC" <<EOF
@@ -618,7 +642,7 @@ EOF
 proxies:
   - {name: "__MH_NODE_NAME__", type: trojan, server: "$HOST", port: $pp, password: "$pass", sni: "$HOST", network: ws, ws-opts: {path: "$path"}}
 EOF
-      link="trojan://$pass@$link_host:$pp?sni=$HOST&type=ws&path=$path#$LINK_NAME" ;;
+      link="trojan://$(url_encode "$pass")@$link_host:$pp?security=tls&sni=$HOST&type=ws&host=$HOST&path=$(url_encode "$path")#$LINK_NAME" ;;
   esac
   commit_node "$type" "$link" "$pp"
 }
@@ -705,10 +729,17 @@ EOF
 }
 list_nodes() {
   init
+  local mode=${1:-full}
+  if ! jq -e '.nodes | length > 0' "$META" >/dev/null; then say "当前没有 Mihomo 节点。"; return 0; fi
   if command -v column >/dev/null 2>&1; then
     jq -r '.nodes[] | [.name,.protocol,(.public_port|tostring),.sni] | @tsv' "$META" | column -t -s $'\t'
   else
     jq -r '.nodes[] | [.name,.protocol,(.public_port|tostring),.sni] | @tsv' "$META"
+  fi
+  if [ "$mode" = full ]; then
+    say ""
+    say "分享链接："
+    jq -r '.nodes[] | "  \(.name):\n  \(.link)\n"' "$META"
   fi
 }
 export_nodes() {
@@ -726,7 +757,7 @@ export_nodes() {
 delete_node() {
   check_ready
   local asked route route_tag extra backend_port relay_proxy nc nl nm oldcfg oldclients oldmeta route_status
-  list_nodes; IFS= read -r -p "要删除的节点名称: " asked
+  list_nodes summary; IFS= read -r -p "要删除的节点名称: " asked
   route=$(jq -r --arg n "$asked" '[.nodes[] | select(.name==$n) | .route][0] // empty' "$META")
   [ -n "$route" ] && [ "$route" != null ] || fail "节点不存在。"
   route_tag=$(jq -r --arg n "$asked" '.nodes[] | select(.name==$n) | (.route_tag // .name)' "$META")
@@ -909,7 +940,7 @@ relay_add() {
   say "选择一个已搭建的 Mihomo 入站，并为它指定一个外部出站节点。"
   say "设置后，该入站收到的流量会直接交给该出站，不经过全局 rules。"
   say "支持导入 VLESS、Trojan、AnyTLS 分享链接；本功能不创建端口转发规则。"
-  list_nodes; IFS= read -r -p "本机入站节点名称: " listener
+  list_nodes summary; IFS= read -r -p "本机入站节点名称: " listener
   if ! MH_YQ_NAME="$listener" yq eval -e '.listeners[]? | select(.name==strenv(MH_YQ_NAME))' "$CFG" >/dev/null 2>&1; then fail "入口不存在。"; fi
   if jq -e --arg n "$listener" '.relays[] | select(.listener==$n)' "$META" >/dev/null; then fail "该入口已有出站映射，请先删除原映射。"; fi
   existing_proxy=$(MH_YQ_NAME="$listener" yq eval -r '.listeners[] | select(.name==strenv(MH_YQ_NAME)) | .proxy // ""' "$CFG")
@@ -969,9 +1000,9 @@ relay_menu() {
     printf '    [0] 返回主菜单\n\n'
     read -r -p "  请输入选项 [0-3]: " choice
     case "$choice" in
-      1) relay_add ;;
-      2) list_relays ;;
-      3) relay_remove ;;
+      1) relay_add; pause_return "按任意键返回出站映射菜单..." ;;
+      2) list_relays; pause_return "按任意键返回出站映射菜单..." ;;
+      3) relay_remove; pause_return "按任意键返回出站映射菜单..." ;;
       0) return 0 ;;
       *) say "无效选择。" ;;
     esac
@@ -1115,8 +1146,28 @@ EOF
   fi
   rm -f "$backup"
 }
+pause_return() {
+  local prompt=${1:-按任意键返回...}
+  printf '\n'
+  if [ -t 0 ]; then read -r -n 1 -s -p "$prompt" || true; fi
+  printf '\n'
+}
+ensure_core_for_add() {
+  local answer
+  [ -x "$BIN" ] && return 0
+  say "尚未检测到 Mihomo 内核。添加节点前需要先安装最新稳定版内核和系统服务。"
+  read -r -p "是否现在自动安装？[Y/n]: " answer
+  if [[ "$answer" = n || "$answer" = N ]]; then
+    say "已取消安装，返回 Mihomo 主菜单。"
+    return 1
+  fi
+  install_core
+  install_service
+  [ -x "$BIN" ] || fail "Mihomo 内核安装后仍不可用。"
+  say "Mihomo 最新稳定版内核和服务已就绪，继续进入添加节点。"
+}
 add_node_menu() {
-  local choice
+  local choice added=0
   printf '\n╔══════════════════════════════════════════╗\n'
   printf '║            Mihomo 添加节点               ║\n'
   printf '╚══════════════════════════════════════════╝\n\n'
@@ -1133,20 +1184,21 @@ add_node_menu() {
   printf '    [0] 返回主菜单\n\n'
   read -r -p "  请输入选项 [0-11]: " choice
   case "$choice" in
-    1) add_reality ;;
-    2) add_tls_transport vless-ws ;;
-    3) add_tls_transport trojan-ws ;;
-    4) add_tls_transport vless-grpc ;;
-    5) add_anytls ;;
-    6) add_xhttp ;;
-    7) add_plain vless-tcp ;;
-    8) add_plain shadowsocks ;;
-    9) add_plain socks ;;
-    10) add_quic hysteria2 ;;
-    11) add_quic tuic ;;
+    1) add_reality; added=1 ;;
+    2) add_tls_transport vless-ws; added=1 ;;
+    3) add_tls_transport trojan-ws; added=1 ;;
+    4) add_tls_transport vless-grpc; added=1 ;;
+    5) add_anytls; added=1 ;;
+    6) add_xhttp; added=1 ;;
+    7) add_plain vless-tcp; added=1 ;;
+    8) add_plain shadowsocks; added=1 ;;
+    9) add_plain socks; added=1 ;;
+    10) add_quic hysteria2; added=1 ;;
+    11) add_quic tuic; added=1 ;;
     0) return 0 ;;
     *) say "无效选择。" ;;
   esac
+  [ "$added" = 0 ] || pause_return "按任意键返回 Mihomo 主菜单..."
 }
 menu() {
   while :; do
@@ -1164,12 +1216,12 @@ menu() {
     printf '    [0] 退出脚本\n\n'
     read -r -p "  请输入选项 [0-6]: " choice
     case "$choice" in
-      1) add_node_menu ;;
-      2) list_nodes ;;
-      3) read -r -p "导出文件（默认 /root/mihomo-nodes.txt）: " out; export_nodes "$out" ;;
-      4) delete_node ;;
+      1) if ensure_core_for_add; then add_node_menu; fi ;;
+      2) list_nodes; pause_return "按任意键返回 Mihomo 主菜单..." ;;
+      3) read -r -p "导出文件（默认 /root/mihomo-nodes.txt）: " out; export_nodes "$out"; pause_return "按任意键返回 Mihomo 主菜单..." ;;
+      4) delete_node; pause_return "按任意键返回 Mihomo 主菜单..." ;;
       5) relay_menu ;;
-      6) install_core; install_service ;;
+      6) install_core; install_service; pause_return "按任意键返回 Mihomo 主菜单..." ;;
       0) return ;;
       *) say "无效选择。" ;;
     esac

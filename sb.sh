@@ -564,19 +564,28 @@ _install_managed_nginx_config() {
 }
 
 _ensure_local_origin_dependencies() {
+    local nginx_was_missing=0 nginx_version
     _info "正在安装/检查 Nginx 与证书依赖..."
     if ! command -v nginx >/dev/null 2>&1; then
+        nginx_was_missing=1
         _warn "首次安装 Nginx 时包管理器可能数分钟没有输出，请勿重复运行或中断脚本。"
+        _info "正在调用系统包管理器安装 Nginx、cron 与 socat..."
     fi
     if command -v apk >/dev/null 2>&1; then
-        _pkg_install nginx dcron || return 1
+        SB_PKG_VERBOSE=1 _pkg_install nginx dcron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     elif command -v apt-get >/dev/null 2>&1; then
-        _pkg_install nginx cron || return 1
+        SB_PKG_VERBOSE=1 _pkg_install nginx cron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     else
-        _pkg_install nginx cronie || return 1
+        SB_PKG_VERBOSE=1 _pkg_install nginx cronie socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     fi
     command -v nginx >/dev/null 2>&1 || { _error "Nginx 安装失败。"; return 1; }
-    _success "Nginx 与证书依赖已就绪。"
+    nginx_version=$(nginx -v 2>&1 | sed 's#^nginx version: ##')
+    if [ "$nginx_was_missing" = 1 ]; then
+        _success "Nginx 已安装并通过命令检查：${nginx_version:-版本未知}。"
+    else
+        _success "检测到已有 Nginx，继续复用：${nginx_version:-版本未知}。"
+    fi
+    command -v socat >/dev/null 2>&1 || { _error "socat 安装失败。"; return 1; }
     install -d -m 755 "$NGINX_CONF_DIR" "$NGINX_CERT_DIR" "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
     install -d -m 700 "$NGINX_BACKUP_DIR" || return 1
     _ensure_nginx_conf_d_include
@@ -1928,22 +1937,31 @@ _manage_service() {
 
 # 智能包管理
 _pkg_install() {
-    local pkgs="$*"
+    local pkgs="$*" verbose="${SB_PKG_VERBOSE:-0}"
     [ -z "$pkgs" ] && return 0
     if command -v apk &>/dev/null; then
-        apk add --no-cache $pkgs >/dev/null 2>&1
+        if [ "$verbose" = 1 ]; then apk add --no-cache $pkgs; else apk add --no-cache $pkgs >/dev/null 2>&1; fi
     elif command -v apt-get &>/dev/null; then
         # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
-            apt-get update -qq >/dev/null 2>&1
+            if [ "$verbose" = 1 ]; then apt-get update; else apt-get update -qq >/dev/null 2>&1; fi
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-            # 兜底：如果安装失败，强制刷新索引后重试
-            apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-        }
-    elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
-    elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
+        if [ "$verbose" = 1 ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs || {
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs
+            }
+        else
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+                # 兜底：如果安装失败，强制刷新索引后重试
+                apt-get update -qq >/dev/null 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+            }
+        fi
+    elif command -v yum &>/dev/null; then
+        if [ "$verbose" = 1 ]; then yum install -y $pkgs; else yum install -y $pkgs >/dev/null 2>&1; fi
+    elif command -v dnf &>/dev/null; then
+        if [ "$verbose" = 1 ]; then dnf install -y $pkgs; else dnf install -y $pkgs >/dev/null 2>&1; fi
     else
         return 1
     fi

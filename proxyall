@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb/mh 的哈希，再更新以下值。
-PROXYALL_VERSION="1.4.0"
-SB_SHA256="969d527eff95df77e9d441b09a46aaff03276025badfcbc843b9ac03884a3615"
+PROXYALL_VERSION="1.5.0"
+SB_SHA256="ccd7912adeb7ff418cc147212875e1da63ff7ff7886f4788c47438b8e9aa63df"
 DEPLOY_SHA256="6bb5dbe72027b2854e17f12781a6260cb61d6bef8533aeb3f77f9519b4d5d09c"
 RELAY_SHA256="39083485d7e4ab178e6dbf9cca9f11692fe9980f5ac94c5162531bd8ee1e85a1"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
-MH_SHA256="86774071d82ea94231007360dab164638e988be8016f5f35a8a729e9155563db"
+MH_SHA256="9ee10c7ff268973b5f7f910e14c6dc1f8dd3aa1af2828a596b72d6473943e5aa"
 
 umask 077
 set -o pipefail
@@ -307,7 +307,7 @@ pa_menu() {
         printf '       proxyall  %s\n\n' "$PROXYALL_VERSION"
         printf '  1) Emby 反代\n\n\n'
         printf '  2) sing-box 配置（含中转 / 节点解析）\n\n\n'
-        printf '  3) mihomo 配置（含 XHTTP / 入口中转）\n\n\n'
+        printf '  3) mihomo 配置（含 XHTTP / 入站→出站映射）\n\n\n'
         printf '  4) 检查脚本更新\n\n\n'
         printf '  5) 卸载脚本（仅统一入口，保留服务）\n\n\n'
         printf '  0) 退出脚本\n\n'
