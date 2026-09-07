@@ -1021,18 +1021,64 @@ EOF
   fi
   rm -f "$backup"
 }
+add_node_menu() {
+  local choice
+  printf '\n╔══════════════════════════════════════════╗\n'
+  printf '║            Mihomo 添加节点               ║\n'
+  printf '╚══════════════════════════════════════════╝\n\n'
+  printf '  【TLS / 可共享 TCP 443】\n'
+  printf '    [1] VLESS Reality       [2] VLESS WS + TLS\n'
+  printf '    [3] Trojan WS + TLS     [4] VLESS gRPC + TLS\n'
+  printf '    [5] AnyTLS + TLS        [6] VLESS XHTTP + TLS/CDN\n\n'
+  printf '  【TCP 直连】\n'
+  printf '    [7] VLESS TCP           [8] Shadowsocks AES-256-GCM\n'
+  printf '    [9] SOCKS5\n\n'
+  printf '  【QUIC / UDP 直连】\n'
+  printf '    [10] Hysteria2          [11] TUIC v5\n\n'
+  printf '  ──────────────────────────────────────────\n'
+  printf '    [0] 返回主菜单\n\n'
+  read -r -p "  请输入选项 [0-11]: " choice
+  case "$choice" in
+    1) add_reality ;;
+    2) add_tls_transport vless-ws ;;
+    3) add_tls_transport trojan-ws ;;
+    4) add_tls_transport vless-grpc ;;
+    5) add_anytls ;;
+    6) add_xhttp ;;
+    7) add_plain vless-tcp ;;
+    8) add_plain shadowsocks ;;
+    9) add_plain socks ;;
+    10) add_quic hysteria2 ;;
+    11) add_quic tuic ;;
+    0) return 0 ;;
+    *) say "无效选择。" ;;
+  esac
+}
 menu() {
   while :; do
-    printf '\n=== Mihomo 节点管理 ===\n'
-    printf '1) 安装/更新核心和服务\n2) VLESS Reality（TCP/443 可 SNI 共用）\n3) AnyTLS + TLS\n4) VLESS XHTTP + TLS/CDN\n5) VLESS WS + TLS\n6) VLESS gRPC + TLS\n7) Trojan WS + TLS\n8) VLESS TCP\n9) Shadowsocks AES-256-GCM\n10) SOCKS5\n11) Hysteria2\n12) TUIC v5\n13) 查看节点\n14) 导出节点\n15) 设置入口中转\n16) 解除入口中转\n17) 删除节点\n0) 退出\n'
-    read -r -p "选择: " choice
+    printf '\n╔══════════════════════════════════════════╗\n'
+    printf '║            Mihomo 节点管理               ║\n'
+    printf '╚══════════════════════════════════════════╝\n\n'
+    printf '  【节点管理】\n'
+    printf '    [1] 添加节点            [2] 查看节点\n'
+    printf '    [3] 导出节点            [4] 删除节点\n\n'
+    printf '  【中转管理】\n'
+    printf '    [5] 设置入口中转        [6] 解除入口中转\n\n'
+    printf '  【核心管理】\n'
+    printf '    [7] 安装/更新 Mihomo 核心和服务\n\n'
+    printf '  ──────────────────────────────────────────\n'
+    printf '    [0] 退出脚本\n\n'
+    read -r -p "  请输入选项 [0-7]: " choice
     case "$choice" in
-      1) install_core; install_service ;; 2) add_reality ;; 3) add_anytls ;; 4) add_xhttp ;;
-      5) add_tls_transport vless-ws ;; 6) add_tls_transport vless-grpc ;; 7) add_tls_transport trojan-ws ;;
-      8) add_plain vless-tcp ;; 9) add_plain shadowsocks ;; 10) add_plain socks ;;
-      11) add_quic hysteria2 ;; 12) add_quic tuic ;; 13) list_nodes ;;
-      14) read -r -p "导出文件（默认 /root/mihomo-nodes.txt）: " out; export_nodes "$out" ;;
-      15) relay_add ;; 16) relay_remove ;; 17) delete_node ;; 0) return ;; *) say "无效选择。" ;;
+      1) add_node_menu ;;
+      2) list_nodes ;;
+      3) read -r -p "导出文件（默认 /root/mihomo-nodes.txt）: " out; export_nodes "$out" ;;
+      4) delete_node ;;
+      5) relay_add ;;
+      6) relay_remove ;;
+      7) install_core; install_service ;;
+      0) return ;;
+      *) say "无效选择。" ;;
     esac
   done
 }
