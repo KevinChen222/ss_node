@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
-# 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下四个值。
-PROXYALL_VERSION="1.1.2"
+# 配套发布时先更新 parser -> advanced_relay -> sb/mh 的哈希，再更新以下值。
+PROXYALL_VERSION="1.2.0"
 SB_SHA256="7f64a3a2bf99e607c3946ecf3373fe0ae6724b1ce14850c3a182e7c65cd615dc"
 DEPLOY_SHA256="6bb5dbe72027b2854e17f12781a6260cb61d6bef8533aeb3f77f9519b4d5d09c"
 RELAY_SHA256="39083485d7e4ab178e6dbf9cca9f11692fe9980f5ac94c5162531bd8ee1e85a1"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
+MH_SHA256="b448dcc8498de42a8e705fbdfe041672c76bea609583b27a20b87d033a5731f2"
 
 umask 077
 set -o pipefail
@@ -16,10 +17,10 @@ PA_MARKER="# PROXYALL_MANAGED_COMMAND=1"
 PA_STAGE=""
 PA_BACKUP=""
 PA_TRANSACTION=0
-PA_FILES=(sb.sh deploy.sh advanced_relay.sh parser.sh proxyall)
+PA_FILES=(sb.sh deploy.sh advanced_relay.sh parser.sh mh.sh proxyall)
 PA_TARGETS=(/usr/local/bin/sb /usr/local/bin/nginxproxy
     /usr/local/etc/sing-box/advanced_relay.sh /usr/local/etc/sing-box/parser.sh
-    /usr/local/bin/proxyall)
+    /usr/local/bin/mh /usr/local/bin/proxyall)
 PA_CHANGED=()
 
 pa_info() { printf '\n[proxyall] %s\n' "$*" >&2; }
@@ -28,7 +29,7 @@ pa_hash() { sha256sum -- "$1" | awk '{print $1}'; }
 
 pa_help() {
     cat <<'EOF'
-proxyall：Emby / sing-box 统一管理
+proxyall：Emby / sing-box / mihomo 统一管理
 
   proxyall                 打开菜单（首次运行下载并安装配套脚本）
   proxyall --install       安装或更新全部脚本，然后打开菜单
@@ -36,7 +37,7 @@ proxyall：Emby / sing-box 统一管理
   proxyall --uninstall     卸载统一入口，保留服务及原有管理脚本
   proxyall --version       显示版本
 
-脚本更新不升级 sing-box 核心，也不迁移现有监听端口。
+脚本更新不升级 sing-box 或 mihomo 核心，也不迁移现有监听端口。
 新建 Emby 默认使用 HAProxy；新建 Reality 默认端口 443、默认启用 SNI 分流。
 共享入口要求 Linux + systemd，Emby 域名和 Reality SNI 必须不同。
 请勿同时在其他终端用 sb / nginxproxy 修改同一份配置。
@@ -105,10 +106,11 @@ pa_constant() {
 
 pa_validate_bundle() {
     local dir="$1" file key expected actual i
-    local keys=(SB_SHA256 DEPLOY_SHA256 RELAY_SHA256 PARSER_SHA256)
+    local keys=(SB_SHA256 DEPLOY_SHA256 RELAY_SHA256 PARSER_SHA256 MH_SHA256)
     grep -Fqx "$PA_MARKER" "$dir/proxyall" || return 1
     grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$dir/sb.sh" || return 1
     grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$dir/deploy.sh" || return 1
+    grep -Fqx '# MH_MANAGER_MANAGED_COMMAND=1' "$dir/mh.sh" || return 1
     for file in "${PA_FILES[@]}"; do
         [ -s "$dir/$file" ] && bash -n "$dir/$file" || return 1
         if LC_ALL=C grep -q $'\r' "$dir/$file"; then
@@ -116,7 +118,7 @@ pa_validate_bundle() {
             return 1
         fi
     done
-    for i in 0 1 2 3; do
+    for i in 0 1 2 3 4; do
         file=${PA_FILES[$i]}; key=${keys[$i]}
         expected=$(pa_constant "$dir/proxyall" "$key") || return 1
         actual=$(pa_hash "$dir/$file") || return 1
@@ -132,7 +134,7 @@ pa_download_bundle() {
     local ref_file commit file raw
     PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX") || return 1
     ref_file="$PA_STAGE/ref.json"
-    pa_info '查询仓库 main 的提交，下载同一提交的五个脚本...'
+    pa_info '查询仓库 main 的提交，下载同一提交的六个脚本...'
     pa_fetch "https://api.github.com/repos/$PA_REPO/git/ref/heads/main" "$ref_file" || {
         pa_error '无法读取 GitHub 提交（也可能是 API 限流）。本地文件未改动。'; return 1;
     }
@@ -142,7 +144,7 @@ pa_download_bundle() {
     for file in "${PA_FILES[@]}"; do
         pa_fetch "$raw/$file" "$PA_STAGE/$file" || { pa_error "下载失败: $file"; return 1; }
     done
-    pa_validate_bundle "$PA_STAGE" || { pa_error '整套脚本校验失败，本地文件未改动。请确保五个文件配套上传。'; return 1; }
+    pa_validate_bundle "$PA_STAGE" || { pa_error '整套脚本校验失败，本地文件未改动。请确保六个文件配套上传。'; return 1; }
     printf '%s\n' "$commit" > "$PA_STAGE/commit"
 }
 
@@ -170,6 +172,7 @@ pa_known_target() {
     case "$file" in
         sb.sh) grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$target" ;;
         deploy.sh) grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$target" ;;
+        mh.sh) grep -Fqx '# MH_MANAGER_MANAGED_COMMAND=1' "$target" ;;
         proxyall) grep -Fqx "$PA_MARKER" "$target" ;;
         advanced_relay.sh|parser.sh)
             if grep -Fqx "# PROXYALL_COMPONENT=$file" "$target"; then return 0; fi
@@ -276,14 +279,14 @@ pa_update() {
 
 pa_uninstall() {
     local answer
-    pa_info '只卸载 proxyall 入口；保留 sb、nginxproxy、组件、备份以及全部运行服务。'
+    pa_info '只卸载 proxyall 入口；保留 sb、mh、nginxproxy、组件、备份以及全部运行服务。'
     read -r -p '输入 UNINSTALL 确认，其他输入返回: ' answer || return 1
     [ "$answer" = UNINSTALL ] || return 0
     if [ -L "$PA_COMMAND" ] || { [ -e "$PA_COMMAND" ] && ! grep -Fqx "$PA_MARKER" "$PA_COMMAND"; }; then
         pa_error '入口文件不属于 proxyall，已保留。'; return 1
     fi
     rm -f -- "$PA_COMMAND" || return 1
-    pa_info 'proxyall 入口已卸载。现有服务继续运行，可用 sb / nginxproxy 管理。'
+    pa_info 'proxyall 入口已卸载。现有服务继续运行，可用 sb / mh / nginxproxy 管理。'
     exit 0
 }
 
@@ -304,18 +307,20 @@ pa_menu() {
         printf '       proxyall  %s\n\n' "$PROXYALL_VERSION"
         printf '  1) Emby 反代\n\n\n'
         printf '  2) sing-box 配置（含中转 / 节点解析）\n\n\n'
-        printf '  3) 检查脚本更新\n\n\n'
-        printf '  4) 卸载脚本（仅统一入口，保留服务）\n\n\n'
+        printf '  3) mihomo 配置（含 XHTTP / 入口中转）\n\n\n'
+        printf '  4) 检查脚本更新\n\n\n'
+        printf '  5) 卸载脚本（仅统一入口，保留服务）\n\n\n'
         printf '  0) 退出脚本\n\n'
         printf '  ════════════════════════════════════\n\n'
-        read -r -p '  请选择 [0-4]: ' choice || return 0
+        read -r -p '  请选择 [0-5]: ' choice || return 0
         case "$choice" in
             1) pa_run /usr/local/bin/nginxproxy ;;
             2) pa_run /usr/local/bin/sb ;;
-            3) pa_update || true ;;
-            4) pa_uninstall || true ;;
+            3) pa_run /usr/local/bin/mh ;;
+            4) pa_update || true ;;
+            5) pa_uninstall || true ;;
             0) return 0 ;;
-            *) pa_error '请输入 0-4。' ;;
+            *) pa_error '请输入 0-5。' ;;
         esac
     done
 }
