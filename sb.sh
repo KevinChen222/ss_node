@@ -8907,6 +8907,22 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 _prepare_local_reality_origin "$local_origin_domain"
                 exit $?
                 ;;
+            select-mihomo-reality)
+                _check_root
+                _detect_init_system
+                mkdir -p "$SINGBOX_DIR"
+                _install_dependencies
+                _select_reality_sni || exit 1
+                printf 'MH_REALITY_SNI=%s\nMH_REALITY_HOST=%s\nMH_REALITY_PORT=%s\n' \
+                    "$SELECTED_REALITY_SNI" "$SELECTED_REALITY_HANDSHAKE_SERVER" "$SELECTED_REALITY_HANDSHAKE_PORT"
+                exit 0
+                ;;
+            check-mihomo-reality)
+                _check_root
+                [ "$#" -eq 4 ] || exit 2
+                _validate_reality_no_self_loop "$2" "$3" "$4"
+                exit $?
+                ;;
             issue-mihomo-certificate)
                 _check_root
                 shift
