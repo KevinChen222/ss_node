@@ -44,21 +44,7 @@ apt-get update && apt-get install -y bash curl ca-certificates
 )
 ```
 
-已有 VPS，尤其是旧六组件版本，先退出所有管理菜单，再使用最新安装器更新：
 
-```bash
-(
-  set -e
-  installer=$(mktemp)
-  trap 'rm -f "$installer"' EXIT
-  curl --proto '=https' --tlsv1.2 -fL --retry 3 \
-    https://raw.githubusercontent.com/KevinChen222/ss_node/main/proxyall \
-    -o "$installer"
-  bash "$installer" --update
-)
-```
-
-旧六组件安装器会尝试下载已删除的组件，因此第一次跨版本更新应使用上面的临时安装器。升级完成后可直接使用 `proxyall --update` 或主菜单 **3**。
 
 安装器只替换五个管理脚本，不升级内核、不重启业务、不迁移监听端口。旧脚本备份位于 `/var/lib/proxyall/backup.*`，安装失败会回滚；这不是完整业务配置备份。遇到无法识别的现有目标文件会在写入前停止，不应先删除原文件。
 
