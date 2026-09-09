@@ -1,5 +1,26 @@
 #!/usr/bin/env bash
 
+# 所有组件固定先取配置写锁，再取 SNI/端口转发资源锁。
+_config_write_lock() {
+    local lock_file="${PROXYALL_WRITE_LOCK_FILE:-/run/lock/proxyall-config.lock}"
+    if [ "${PROXYALL_WRITE_LOCK_HELD:-}" = "$lock_file" ] && [ /dev/fd/8 -ef "$lock_file" ]; then
+        return 0
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        if declare -F _pkg_install >/dev/null; then _pkg_install util-linux || return 1
+        elif command -v apk >/dev/null 2>&1; then apk add --no-cache util-linux || return 1
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y util-linux || return 1
+        else echo '请先安装 util-linux（flock）；拒绝无锁修改配置。' >&2; return 1; fi
+        command -v flock >/dev/null 2>&1 || return 1
+    fi
+    mkdir -p "$(dirname "$lock_file")" || return 1
+    exec 8>"$lock_file" || return 1
+    flock -x -w 30 8 || { echo '配置正被其他管理进程修改，请稍后重试。' >&2; return 1; }
+    export PROXYALL_WRITE_LOCK_HELD="$lock_file"
+}
+
+
 # NGINXPROXY_MANAGED_COMMAND=1
 
 # Nginx Emby reverse-proxy deployment script with optional HAProxy SNI sharing.
@@ -440,6 +461,7 @@ local_sni_router_lock() {
         return 1
     }
     mkdir -p "$(dirname "$SNI_ROUTER_LOCK_FILE")" || return 1
+    _config_write_lock || return 1
     exec 9>"$SNI_ROUTER_LOCK_FILE"
     flock -x -w 30 9 || { log_error 'SNI 路由正被其他进程修改，请稍后重试。'; return 1; }
 }
@@ -2929,7 +2951,7 @@ remove_acme_ecc_record_and_files() {
     log_success "已移除证书续期记录及 acme.sh 内部文件: $cert_name"
 }
 
-remove_domain_config() {
+remove_domain_config_locked() {
     local parsed proto domain port path default_port clean_domain conf_path
     parsed=$(parse_url "$domain_to_remove") || {
         log_error '请使用完整 URL，例如 https://emby.example.com:443'
@@ -2971,7 +2993,7 @@ remove_domain_config() {
         [[ $answer == yes ]] || { log_info '已取消。'; exit 0; }
     fi
 
-    local cert_path cert_dir='' cert_dir_real='' cert_path_real='' cert_root cert_name refs
+    local cert_path cert_dir='' cert_dir_real='' cert_path_real='' cert_root cert_name
     cert_path=$($SUDO awk '/ssl_certificate[[:space:]]+/ {gsub(/;/, "", $2); print $2; exit}' "$conf_path")
     if [[ -n $cert_path ]]; then
         cert_root=$(readlink -m /etc/nginx/certs)
@@ -3016,18 +3038,9 @@ remove_domain_config() {
     commit_config_changes
     sni_route_removed_for_delete=no
 
+    # 配置删除与证书销毁分离。缺少跨组件所有权证明时，一律保留。
     if [[ -n $cert_path ]]; then
-        refs=$($SUDO grep -RslF "$cert_path" /etc/nginx/conf.d 2>/dev/null || true)
-        if [[ -z $refs ]]; then
-            remove_acme_ecc_record_and_files "$cert_name" || true
-            $SUDO rm -f -- "$cert_dir/cert" "$cert_dir/key"
-            if ! $SUDO rmdir -- "$cert_dir" 2>/dev/null; then
-                log_warn "证书目录中仍有其他文件，未递归删除: $cert_dir"
-            fi
-            log_success "已移除该链路的独占 Nginx 证书: $cert_name"
-        else
-            log_warn "证书仍被其他站点引用，已保留证书及续期记录: $cert_dir"
-        fi
+        log_warn "已保留证书、私钥及续期记录（可能被 sing-box/中转引用）: $cert_dir"
     fi
 
     log_success '配置已移除。'
@@ -3050,7 +3063,7 @@ validate_nginx_features() {
     fi
 }
 
-run_proxy_deployment() {
+run_proxy_deployment_locked() {
     prompt_interactive_mode
     [[ -n $you_domain && -n $r_domain ]] || { log_error '前端和主源站不能为空。'; exit 1; }
     if [[ $proxy_mode == local && $no_tls == yes ]]; then
@@ -3193,6 +3206,9 @@ main_menu() {
         esac
     done
 }
+
+run_proxy_deployment() ( _config_write_lock || exit 1; run_proxy_deployment_locked; )
+remove_domain_config() ( _config_write_lock || exit 1; remove_domain_config_locked; )
 
 main() {
     local argument_count=$#

@@ -1,11 +1,32 @@
 #!/bin/bash
+
+# 所有组件固定先取配置写锁，再取 SNI/端口转发资源锁。
+_config_write_lock() {
+    local lock_file="${PROXYALL_WRITE_LOCK_FILE:-/run/lock/proxyall-config.lock}"
+    if [ "${PROXYALL_WRITE_LOCK_HELD:-}" = "$lock_file" ] && [ /dev/fd/8 -ef "$lock_file" ]; then
+        return 0
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        if declare -F _pkg_install >/dev/null; then _pkg_install util-linux || return 1
+        elif command -v apk >/dev/null 2>&1; then apk add --no-cache util-linux || return 1
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y util-linux || return 1
+        else echo '请先安装 util-linux（flock）；拒绝无锁修改配置。' >&2; return 1; fi
+        command -v flock >/dev/null 2>&1 || return 1
+    fi
+    mkdir -p "$(dirname "$lock_file")" || return 1
+    exec 8>"$lock_file" || return 1
+    flock -x -w 30 8 || { echo '配置正被其他管理进程修改，请稍后重试。' >&2; return 1; }
+    export PROXYALL_WRITE_LOCK_HELD="$lock_file"
+}
+
 # PROXYALL_COMPONENT=advanced_relay.sh
 
 # 中转配置、节点凭据与私钥默认仅允许 root 读取。
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.10"
+SCRIPT_VERSION="16-kevin.11"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -1164,22 +1185,21 @@ _save_nftables_rules() {
 _atomic_modify_json() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
+    local tmp
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
     if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
     else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
 }
 
 # 单个原子修改 YAML
 _atomic_modify_yaml() {
-    local file="$1" filter="$2"
-    [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp.$$"
-    cp "$file" "$tmp" || return 1
-    if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
-        rm -f "$tmp"
-    else
-        _error "修改 YAML 失败: $file"; mv "$tmp" "$file"; return 1
-    fi
+    local file="$1" filter="$2" tmp
+    [ -f "$file" ] || return 1
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    if ${YQ_BINARY} eval "$filter" "$file" > "$tmp" && mv -- "$tmp" "$file"; then return 0; fi
+    _error "修改 YAML 失败: $file"
+    rm -f -- "$tmp"
+    return 1
 }
 
 # 服务管理
@@ -1205,7 +1225,7 @@ _manage_service() {
                     rm -f "$pid_file"
                     [ -s "$RELAY_CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
                     nohup "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
-                        >> "$log_file" 2>&1 &
+                        >> "$log_file" 2>&1 8>&- 9>&- &
                     echo $! > "$pid_file"
                     ;;
                 stop)
@@ -1306,7 +1326,7 @@ _clear_created_relay_certificates() {
     while IFS= read -r inbound_tag; do
         [ -z "$inbound_tag" ] && continue
         if [[ "$inbound_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            rm -f "${RELAY_AUX_DIR}/${inbound_tag}.pem" "${RELAY_AUX_DIR}/${inbound_tag}.key"
+            _info "证书已保留，删除中转不销毁共享证书。"
         else
             _warn "跳过异常中转 Tag 的证书清理: $inbound_tag"
         fi
@@ -1315,7 +1335,8 @@ _clear_created_relay_certificates() {
 
 
 # 初始化辅助目录
-_init_relay_dirs() {
+_init_relay_dirs() (
+    _config_write_lock || exit 1
     # 确保辅助目录存在
     if [ ! -d "$RELAY_AUX_DIR" ]; then
         mkdir -p "$RELAY_AUX_DIR"
@@ -1350,7 +1371,7 @@ EOF
         echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
         _info "已初始化中转配置文件: $RELAY_CONFIG_FILE"
     fi
-}
+)
 
 # 检查并下载解析脚本；只执行与同仓库当前版本匹配的文件。
 _verify_parser_component() {
@@ -1402,7 +1423,7 @@ _check_parser() {
 }
 
 # --- 2.1 导入第三方节点链接 ---
-_import_link_config() {
+_import_link_config_locked() {
     _check_parser || return
     local PARSER_BIN="$_PARSER_PATH"
 
@@ -1468,7 +1489,7 @@ _check_deps() {
 }
 
 # --- 1. 落地机配置 (生成 Token) ---
-_landing_config() {
+_landing_config_locked() {
     echo -e "\n  ${CYAN}【落地机：生成全协议 Token】${NC}"
     _info "正在加载本地落地节点..."
     
@@ -2330,7 +2351,7 @@ _finalize_relay_setup() {
 }
 
 # --- 2. 中转机配置 (导入 Token) ---
-_relay_config() {
+_relay_config_locked() {
     echo -e "\n  ${CYAN}【配置为 [中转机] (导入 Token)】${NC}"
     echo -e "  请输入来自 [落地机] 的 Token 字符串:"
     echo ""
@@ -2452,7 +2473,7 @@ _view_relays() {
 }
 
 # --- 4. 删除中转路由 ---
-_clear_all_relays() {
+_clear_all_relays_locked() {
     local links_file="${RELAY_AUX_DIR}/relay_links.json"
     local relay_tmp links_tmp router_tag
 
@@ -2501,7 +2522,7 @@ _clear_all_relays() {
     _success "全部中转已清空，HAProxy 与 nftables 关联也已解除。"
 }
 
-_delete_relay() {
+_delete_relay_locked() {
     echo -e "\n  ${RED}【删除中转路由】${NC}"
     
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
@@ -2622,7 +2643,7 @@ _delete_relay() {
     # 复用节点的证书属于 sb.sh 主配置，解除中转时必须保留。
     if [ "$reuse_existing" != "true" ]; then
         if [[ "$in_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            rm -f "${RELAY_AUX_DIR}/${in_tag}.pem" "${RELAY_AUX_DIR}/${in_tag}.key"
+            _info "证书已保留，删除中转不销毁共享证书。"
         else
             _warn "Tag 异常，已跳过证书清理: $in_tag"
         fi
@@ -2634,7 +2655,7 @@ _delete_relay() {
 }
 
 # --- 5. 修改中转路由端口 (功能恢复) ---
-_modify_relay_port() {
+_modify_relay_port_locked() {
     echo -e "\n  ${CYAN}【修改中转路由端口】${NC}"
     
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
@@ -4247,18 +4268,31 @@ _pf_switch_engine_impl() {
     read -p "  按回车继续..."
 }
 
-_pf_add() { _pf_run_locked _pf_add_impl; }
-_pf_delete() { _pf_run_locked _pf_delete_impl; }
-_pf_modify() { _pf_run_locked _pf_modify_impl; }
-_pf_clear() { _pf_run_locked _pf_clear_impl; }
-_pf_dns_refresh() { _pf_run_locked _pf_dns_refresh_impl; }
-_pf_switch_engine() { _pf_run_locked _pf_switch_engine_impl; }
+_pf_add_locked() { _pf_run_locked _pf_add_impl; }
+_pf_delete_locked() { _pf_run_locked _pf_delete_impl; }
+_pf_modify_locked() { _pf_run_locked _pf_modify_impl; }
+_pf_clear_locked() { _pf_run_locked _pf_clear_impl; }
+_pf_dns_refresh_locked() { _pf_run_locked _pf_dns_refresh_impl; }
+_pf_switch_engine_locked() { _pf_run_locked _pf_switch_engine_impl; }
+
+_landing_config() ( _config_write_lock || exit 1; _landing_config_locked; )
+_relay_config() ( _config_write_lock || exit 1; _relay_config_locked; )
+_import_link_config() ( _config_write_lock || exit 1; _import_link_config_locked; )
+_delete_relay() ( _config_write_lock || exit 1; _delete_relay_locked; )
+_modify_relay_port() ( _config_write_lock || exit 1; _modify_relay_port_locked; )
+_clear_all_relays() ( _config_write_lock || exit 1; _clear_all_relays_locked; )
+_pf_add() ( _config_write_lock || exit 1; _pf_add_locked; )
+_pf_modify() ( _config_write_lock || exit 1; _pf_modify_locked; )
+_pf_delete() ( _config_write_lock || exit 1; _pf_delete_locked; )
+_pf_switch_engine() ( _config_write_lock || exit 1; _pf_switch_engine_locked; )
+_pf_clear() ( _config_write_lock || exit 1; _pf_clear_locked; )
+_pf_dns_refresh() ( _config_write_lock || exit 1; _pf_dns_refresh_locked; )
 
 _port_forward_menu() {
     # 进入菜单时同步修复已有 DDNS 规则的 cron 周期和脚本路径。
     _pf_auto_manage_dns_cron
     while true; do
-        clear
+        [ ! -t 0 ] || [ ! -t 1 ] || clear
         local count=$(_pf_count)
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
@@ -4294,7 +4328,7 @@ _menu() {
     _init_relay_dirs
 
     while true; do
-        clear
+        [ ! -t 0 ] || [ ! -t 1 ] || clear
         # ASCII Logo (对齐主脚本)
         echo -e "${CYAN}"
         echo '  ____  _             ____            '
