@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.25"
+export SCRIPT_VERSION="20-kevin.26"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -790,11 +790,18 @@ _prepare_local_reality_origin() {
         rm -f "$tmp"
     fi
 
+    local origin_listen_http2=' http2' origin_http2_directive='' nginx_version
+    nginx_version=$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9.]*\).*#\1#p')
+    if [ -n "$nginx_version" ] && _version_at_least "$nginx_version" '1.25.1'; then
+        origin_listen_http2=''
+        origin_http2_directive='    http2 on;'
+    fi
     tmp=$(mktemp) || return 1
     cat > "$tmp" <<EOF_REALITY_ORIGIN
 $marker
 server {
-    listen ${REALITY_LOCAL_ORIGIN_HOST}:${REALITY_LOCAL_ORIGIN_PORT} ssl http2;
+    listen ${REALITY_LOCAL_ORIGIN_HOST}:${REALITY_LOCAL_ORIGIN_PORT} ssl${origin_listen_http2};
+${origin_http2_directive}
     server_name ${domain};
 
     ssl_certificate ${NGINX_CERT_DIR}/${domain}/cert;

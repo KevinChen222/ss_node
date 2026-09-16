@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
-PROXYALL_VERSION="1.7.1"
-SB_SHA256="39196eef616c14c85dd2458a3b06d6ce14f9a8f200f871c77356553d6c01f074"
-DEPLOY_SHA256="436aae9c920552a160ad7b0f78a1251b3d8ebea5aff3e0db803d78a707b643fa"
+PROXYALL_VERSION="1.7.2"
+SB_SHA256="8fbbd6853748c05e5836b49f0fda7f54326a4c6acc80d2135082184330bfa5ff"
+DEPLOY_SHA256="580cd998103c8322bb65fc5f1d93bc46728366474d3fa1c1d0668d2411808532"
 RELAY_SHA256="b25cbbac3be920963a45df4854138a3da05e1c50731510d0d364b13573abcbae"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 
@@ -35,6 +35,7 @@ proxyall：Emby / sing-box 统一管理
   proxyall --update        检查并询问是否更新全部脚本
   proxyall --uninstall     卸载统一入口，保留服务及原有管理脚本
   proxyall --version       显示版本
+  proxyall --fix-http2     备份并修复受管 Nginx 配置的 HTTP/2 旧语法
 
 脚本更新不升级 sing-box 核心，也不迁移现有监听端口。
 新建 Emby 默认使用 HAProxy；新建 Reality 默认端口 443、默认启用 SNI 分流。
@@ -292,9 +293,10 @@ pa_run() {
     [ -f "$component" ] && bash -n "$component" || { pa_error '组件缺失或语法损坏，请先检查脚本更新。'; return 1; }
     # 必须作为子进程运行，避免 deploy 的 errexit/trap/变量污染统一菜单。
     # 只有菜单持锁；子脚本启动的后台服务不能继承这个文件描述符。
-    PROXYALL_MANAGED=1 bash "$component" 8>&- || status=$?
+    shift
+    PROXYALL_MANAGED=1 bash "$component" "$@" 8>&- || status=$?
     [ "$status" = 0 ] || pa_error "子脚本返回状态 $status，已返回统一菜单。"
-    return 0
+    return "$status"
 }
 
 pa_menu() {
@@ -306,16 +308,18 @@ pa_menu() {
         printf '  2) sing-box 配置（含中转 / 节点解析）\n\n\n'
         printf '  3) 检查脚本更新\n\n\n'
         printf '  4) 卸载脚本（仅统一入口，保留服务）\n\n\n'
+        printf '  5) 修复 Nginx HTTP/2 旧语法\n\n\n'
         printf '  0) 退出脚本\n\n'
         printf '  ════════════════════════════════════\n\n'
-        read -r -p '  请选择 [0-4]: ' choice || return 0
+        read -r -p '  请选择 [0-5]: ' choice || return 0
         case "$choice" in
             1) pa_run /usr/local/bin/nginxproxy ;;
             2) pa_run /usr/local/bin/sb ;;
             3) pa_update || true ;;
             4) pa_uninstall || true ;;
+            5) pa_run /usr/local/bin/nginxproxy --fix-http2 || true ;;
             0) return 0 ;;
-            *) pa_error '请输入 0-4。' ;;
+            *) pa_error '请输入 0-5。' ;;
         esac
     done
 }
@@ -325,7 +329,7 @@ main() {
     case "$action" in
         --version) printf '%s\n' "$PROXYALL_VERSION"; return 0 ;;
         -h|--help) pa_help; return 0 ;;
-        ''|--install|--update|--uninstall) ;;
+        ''|--install|--update|--uninstall|--fix-http2) ;;
         *) pa_help; return 2 ;;
     esac
     [ "$EUID" = 0 ] || { pa_error '请用 root 或 sudo -H bash proxyall 运行。'; return 1; }
@@ -340,6 +344,7 @@ main() {
         --install) pa_update install || return 1; pa_menu; return $? ;;
         --update) pa_update; return $? ;;
         --uninstall) pa_uninstall; return $? ;;
+        --fix-http2) pa_run /usr/local/bin/nginxproxy --fix-http2; return $? ;;
     esac
     for i in "${!PA_TARGETS[@]}"; do [ -s "${PA_TARGETS[$i]}" ] || missing=1; done
     if [ ! -f "$PA_STATE/commit" ] || [ "$missing" = 1 ]; then
