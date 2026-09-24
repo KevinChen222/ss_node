@@ -33,15 +33,7 @@ apt-get update && apt-get install -y bash curl ca-certificates
 新 VPS 安装管理脚本（内核安装在 sing-box 菜单中另行选择）：
 
 ```bash
-(
-  set -e
-  installer=$(mktemp)
-  trap 'rm -f "$installer"' EXIT
-  curl --proto '=https' --tlsv1.2 -fL --retry 3 \
-    https://raw.githubusercontent.com/KevinChen222/ss_node/main/proxyall \
-    -o "$installer"
-  bash "$installer" --install
-)
+bash <(curl -fsSL https://raw.githubusercontent.com/KevinChen222/ss_node/main/proxyall) --install
 ```
 
 
