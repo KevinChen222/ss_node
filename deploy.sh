@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.24-local14'
+SCRIPT_VERSION='2026.09.24-local15'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -2225,8 +2225,26 @@ prompt_nginx_stable_update() {
     [[ $answer == y || $answer == Y ]]
 }
 
+ensure_nginx_after_stable_update() {
+    if ! nginx -t; then
+        log_error 'Nginx 更新后配置测试失败，请先修复配置。'
+        return 1
+    fi
+    if has_systemd; then
+        if ! systemctl is-active --quiet nginx; then
+            log_info 'Nginx 更新后未运行，正在启动服务...'
+            start_nginx || { log_error 'Nginx 未能启动，请检查 systemctl status nginx。'; return 1; }
+            systemctl is-active --quiet nginx || { log_error 'Nginx 服务仍未运行。'; return 1; }
+        fi
+    elif ! nginx_is_running; then
+        log_info 'Nginx 更新后未运行，正在启动服务...'
+        start_nginx || { log_error 'Nginx 未能启动。'; return 1; }
+        nginx_is_running || { log_error 'Nginx 服务仍未运行。'; return 1; }
+    fi
+}
+
 check_nginx_stable_update() {
-    local ID='' VERSION_CODENAME='' arch installed_version latest_package latest_version candidate
+    local ID='' VERSION_CODENAME='' arch installed_version latest_package latest_version candidate install_succeeded=yes
     command -v nginx >/dev/null 2>&1 || return 0
     command -v apt-get >/dev/null 2>&1 || return 0
     command -v curl >/dev/null 2>&1 || return 0
@@ -2274,14 +2292,14 @@ check_nginx_stable_update() {
         return 0
     fi
     if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold nginx; then
-        log_warn 'Nginx 更新失败；请检查 APT 和 Nginx 状态。'
+        install_succeeded=no
+    fi
+    ensure_nginx_after_stable_update || return 1
+    if [[ $install_succeeded == no ]]; then
+        log_warn 'Nginx 软件包更新失败，服务已恢复；请检查 APT 日志。'
         return 0
     fi
-    if ! nginx -t; then
-        log_error 'Nginx 更新后配置测试失败，请先修复配置。'
-        return 1
-    fi
-    log_success "Nginx 已更新: $(nginx -v 2>&1)"
+    log_success "Nginx 已更新且服务运行中: $(nginx -v 2>&1)"
 }
 
 install_dependencies() {
