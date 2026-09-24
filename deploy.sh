@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.16-local11'
+SCRIPT_VERSION='2026.09.24-local12'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -2370,6 +2370,10 @@ prepare_acme_webroot() {
         return 1
     }
     ensure_http_include || return 1
+    install -d -m 755 "$ACME_WEBROOT" "$ACME_WEBROOT/.well-known" \
+        "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
+    chmod 755 "$ACME_WEBROOT" "$ACME_WEBROOT/.well-known" \
+        "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
 
     local safe_domain=${you_domain,,}
     safe_domain=${safe_domain//[^a-z0-9.-]/_}
@@ -2399,7 +2403,42 @@ prepare_acme_webroot() {
         log_error 'HTTP-01 webroot 配置未通过 Nginx 验证。'
         return 1
     fi
+    check_acme_webroot || return 1
     log_success "证书续期入口已配置: http://${you_domain}/.well-known/acme-challenge/"
+}
+
+check_acme_webroot() {
+    local challenge_dir="$ACME_WEBROOT/.well-known/acme-challenge"
+    local probe_file probe_name probe_url local_response public_response public_status=0 attempt
+    probe_file=$(mktemp "$challenge_dir/proxyall-check.XXXXXXXX") || return 1
+    probe_name=${probe_file##*/}
+    printf '%s' "$probe_name" > "$probe_file"
+    chmod 644 "$probe_file"
+    probe_url="http://${you_domain}/.well-known/acme-challenge/${probe_name}"
+
+    for ((attempt = 1; attempt <= 5; attempt++)); do
+        local_response=$(curl --noproxy '*' -fsS --max-time 3 \
+            --resolve "${you_domain}:80:127.0.0.1" "$probe_url" 2>/dev/null) || true
+        [[ $local_response == "$probe_name" ]] && break
+        (( attempt == 5 )) || sleep 1
+    done
+    if [[ $local_response != "$probe_name" ]]; then
+        rm -f -- "$probe_file"
+        log_error "本机 Nginx 80 端口未能读取 HTTP-01 挑战文件: $probe_url"
+        log_error '请检查 80 端口监听、同名 server_name 配置及 webroot 目录权限。'
+        return 1
+    fi
+
+    public_response=$(curl --noproxy '*' -4 -fsS --max-time 8 "$probe_url" 2>/dev/null) || public_status=$?
+    rm -f -- "$probe_file"
+    if (( public_status == 22 )) || [[ $public_status == 0 && $public_response != "$probe_name" ]]; then
+        log_error "公网 HTTP-01 地址未返回本机挑战文件: $probe_url"
+        log_error '请检查域名 A 记录、80 端口转发及其他 Web 服务或反代是否接管了请求。'
+        return 1
+    fi
+    if (( public_status != 0 )); then
+        log_warn '本机无法经公网 IPv4 回访 80 端口，将继续交由证书机构验证。'
+    fi
 }
 
 cleanup_stale_acme_record() {
