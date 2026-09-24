@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.26"
+export SCRIPT_VERSION="20-kevin.27"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -586,8 +586,58 @@ _install_managed_nginx_config() {
     return 0
 }
 
+_setup_official_nginx_stable_apt_repo() {
+    local ID='' VERSION_CODENAME='' arch key_file keyring_tmp fingerprints path
+    local keyring=/usr/share/keyrings/proxyall-nginx.gpg
+    local source_file=/etc/apt/sources.list.d/proxyall-nginx.list
+    local pin_file=/etc/apt/preferences.d/99proxyall-nginx
+    [ -r /etc/os-release ] || { _error '无法识别系统版本，不能配置 Nginx 官方仓库。'; return 1; }
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    case "$ID:${VERSION_CODENAME:-}" in
+        debian:bullseye|debian:bookworm|debian:trixie|ubuntu:jammy|ubuntu:noble|ubuntu:resolute) ;;
+        *) _error "Nginx 官方仓库尚未适配此系统: $ID ${VERSION_CODENAME:-未知}"; return 1 ;;
+    esac
+    arch=$(dpkg --print-architecture) || return 1
+    case $arch in
+        amd64|arm64) ;;
+        *) _error "Nginx 官方仓库尚未适配此架构: $arch"; return 1 ;;
+    esac
+    for path in "$source_file" "$pin_file"; do
+        if [ -e "$path" ] && ! grep -Fqx '# Managed by proxyall: nginx stable' "$path"; then
+            _error "APT 配置已存在且不属于本脚本: $path"
+            return 1
+        fi
+    done
+
+    key_file=$(mktemp) || return 1
+    keyring_tmp=$(mktemp) || { rm -f -- "$key_file"; return 1; }
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 30 \
+        https://nginx.org/keys/nginx_signing.key -o "$key_file"; then
+        rm -f -- "$key_file" "$keyring_tmp"
+        _error '下载 Nginx 官方仓库签名密钥失败。'
+        return 1
+    fi
+    fingerprints=$(gpg --show-keys --with-colons "$key_file" 2>/dev/null | \
+        awk -F: '$1=="fpr" {print toupper($10)}') || true
+    if ! grep -Fxq '573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62' <<<"$fingerprints" || \
+       ! gpg --batch --yes --dearmor --output "$keyring_tmp" "$key_file"; then
+        rm -f -- "$key_file" "$keyring_tmp"
+        _error 'Nginx 官方仓库签名密钥指纹不匹配或无法导入。'
+        return 1
+    fi
+    install -m 644 "$keyring_tmp" "$keyring" || { rm -f -- "$key_file" "$keyring_tmp"; return 1; }
+    rm -f -- "$key_file" "$keyring_tmp"
+    printf '%s\n' '# Managed by proxyall: nginx stable' \
+        "deb [signed-by=$keyring] https://nginx.org/packages/$ID $VERSION_CODENAME nginx" > "$source_file" || return 1
+    printf '%s\n' '# Managed by proxyall: nginx stable' 'Package: nginx' \
+        'Pin: origin nginx.org' 'Pin-Priority: 900' > "$pin_file" || return 1
+    chmod 644 "$source_file" "$pin_file" || return 1
+    _info "已配置 Nginx 官方 stable 仓库: $ID $VERSION_CODENAME"
+}
+
 _ensure_local_origin_dependencies() {
-    local nginx_was_missing=0 nginx_version
+    local nginx_was_missing=0 nginx_version nginx_candidate=''
     _info "正在安装/检查 Nginx 与证书依赖..."
     if ! command -v nginx >/dev/null 2>&1; then
         nginx_was_missing=1
@@ -597,6 +647,17 @@ _ensure_local_origin_dependencies() {
     if command -v apk >/dev/null 2>&1; then
         SB_PKG_VERBOSE=1 _pkg_install nginx dcron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     elif command -v apt-get >/dev/null 2>&1; then
+        if [ "$nginx_was_missing" = 1 ]; then
+            SB_PKG_VERBOSE=1 _pkg_install curl ca-certificates gnupg || return 1
+            _setup_official_nginx_stable_apt_repo || return 1
+            apt-get update || return 1
+            nginx_candidate=$(LC_ALL=C apt-cache policy nginx | awk '/Candidate:/ {print $2; exit}')
+            if ! _version_at_least "${nginx_candidate%%-*}" '1.30.0'; then
+                _error "APT 未选中高版本 Nginx，候选版本: ${nginx_candidate:-无}"
+                return 1
+            fi
+            _info "将从官方 stable 仓库安装 Nginx: $nginx_candidate"
+        fi
         SB_PKG_VERBOSE=1 _pkg_install nginx cron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     else
         SB_PKG_VERBOSE=1 _pkg_install nginx cronie socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }

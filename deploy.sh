@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.24-local12'
+SCRIPT_VERSION='2026.09.24-local13'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -2166,8 +2166,58 @@ display_summary() {
     echo '──────────────────────────────────────────────'
 }
 
+setup_official_nginx_stable_apt_repo() {
+    local ID='' VERSION_CODENAME='' arch key_file keyring_tmp fingerprints path
+    local keyring=/usr/share/keyrings/proxyall-nginx.gpg
+    local source_file=/etc/apt/sources.list.d/proxyall-nginx.list
+    local pin_file=/etc/apt/preferences.d/99proxyall-nginx
+    [[ -r /etc/os-release ]] || { log_error '无法识别系统版本，不能配置 Nginx 官方仓库。'; return 1; }
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    case "$ID:${VERSION_CODENAME:-}" in
+        debian:bullseye|debian:bookworm|debian:trixie|ubuntu:jammy|ubuntu:noble|ubuntu:resolute) ;;
+        *) log_error "Nginx 官方仓库尚未适配此系统: $ID ${VERSION_CODENAME:-未知}"; return 1 ;;
+    esac
+    arch=$(dpkg --print-architecture) || return 1
+    case $arch in
+        amd64|arm64) ;;
+        *) log_error "Nginx 官方仓库尚未适配此架构: $arch"; return 1 ;;
+    esac
+    for path in "$source_file" "$pin_file"; do
+        if [[ -e $path ]] && ! grep -Fqx '# Managed by proxyall: nginx stable' "$path"; then
+            log_error "APT 配置已存在且不属于本脚本: $path"
+            return 1
+        fi
+    done
+
+    key_file=$(mktemp) || return 1
+    keyring_tmp=$(mktemp) || { rm -f -- "$key_file"; return 1; }
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 30 \
+        https://nginx.org/keys/nginx_signing.key -o "$key_file"; then
+        rm -f -- "$key_file" "$keyring_tmp"
+        log_error '下载 Nginx 官方仓库签名密钥失败。'
+        return 1
+    fi
+    fingerprints=$(gpg --show-keys --with-colons "$key_file" 2>/dev/null | \
+        awk -F: '$1=="fpr" {print toupper($10)}') || true
+    if ! grep -Fxq '573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62' <<<"$fingerprints" || \
+       ! gpg --batch --yes --dearmor --output "$keyring_tmp" "$key_file"; then
+        rm -f -- "$key_file" "$keyring_tmp"
+        log_error 'Nginx 官方仓库签名密钥指纹不匹配或无法导入。'
+        return 1
+    fi
+    install -m 644 "$keyring_tmp" "$keyring" || { rm -f -- "$key_file" "$keyring_tmp"; return 1; }
+    rm -f -- "$key_file" "$keyring_tmp"
+    printf '%s\n' '# Managed by proxyall: nginx stable' \
+        "deb [signed-by=$keyring] https://nginx.org/packages/$ID $VERSION_CODENAME nginx" > "$source_file" || return 1
+    printf '%s\n' '# Managed by proxyall: nginx stable' 'Package: nginx' \
+        'Pin: origin nginx.org' 'Pin-Priority: 900' > "$pin_file" || return 1
+    chmod 644 "$source_file" "$pin_file"
+    log_info "已配置 Nginx 官方 stable 仓库: $ID $VERSION_CODENAME"
+}
+
 install_dependencies() {
-    local id_like='' os_id='' pm=''
+    local id_like='' os_id='' pm='' nginx_candidate=''
     local -a required_packages=()
     local dependencies_ready=yes
     local required_command
@@ -2205,6 +2255,17 @@ install_dependencies() {
         required_packages=(nginx curl ca-certificates socat cron openssl gettext-base tar coreutils jq)
         if [[ $frontend_mode == haproxy ]]; then required_packages+=(haproxy util-linux); fi
         $SUDO apt-get update
+        if ! command -v nginx >/dev/null 2>&1 && [[ $os_id == debian || $os_id == ubuntu ]]; then
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates gnupg
+            setup_official_nginx_stable_apt_repo || return 1
+            $SUDO apt-get update
+            nginx_candidate=$(LC_ALL=C apt-cache policy nginx | awk '/Candidate:/ {print $2; exit}')
+            if ! version_at_least "${nginx_candidate%%-*}" '1.30.0'; then
+                log_error "APT 未选中高版本 Nginx，候选版本: ${nginx_candidate:-无}"
+                return 1
+            fi
+            log_info "将从官方 stable 仓库安装 Nginx: $nginx_candidate"
+        fi
         $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${required_packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         pm=dnf
