@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.24-local13'
+SCRIPT_VERSION='2026.09.24-local14'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -2216,6 +2216,74 @@ setup_official_nginx_stable_apt_repo() {
     log_info "已配置 Nginx 官方 stable 仓库: $ID $VERSION_CODENAME"
 }
 
+prompt_nginx_stable_update() {
+    local answer=''
+    if ! read -r -t 4 -p '现在更新 Nginx？[y/N，4 秒后跳过]: ' answer; then
+        answer=''
+        echo
+    fi
+    [[ $answer == y || $answer == Y ]]
+}
+
+check_nginx_stable_update() {
+    local ID='' VERSION_CODENAME='' arch installed_version latest_package latest_version candidate
+    command -v nginx >/dev/null 2>&1 || return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    [[ -r /etc/os-release ]] || return 0
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    case "$ID:${VERSION_CODENAME:-}" in
+        debian:bullseye|debian:bookworm|debian:trixie|ubuntu:jammy|ubuntu:noble|ubuntu:resolute) ;;
+        *) return 0 ;;
+    esac
+    arch=$(dpkg --print-architecture 2>/dev/null) || return 0
+    case $arch in amd64|arm64) ;; *) return 0 ;; esac
+    if [[ $(nginx -v 2>&1) =~ nginx/([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        installed_version=${BASH_REMATCH[1]}
+    else
+        return 0
+    fi
+
+    log_info '正在检查 Nginx 官方 stable 更新...'
+    latest_package=$(curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 2 --max-time 8 \
+        "https://nginx.org/packages/$ID/dists/$VERSION_CODENAME/nginx/binary-$arch/Packages" | \
+        awk '/^Package: / {nginx_pkg=($2=="nginx")} nginx_pkg && /^Version: / {print $2}' | \
+        sort -V | tail -n 1) || { log_warn 'Nginx 更新检查失败，继续执行。'; return 0; }
+    latest_version=${latest_package%%-*}
+    [[ $latest_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { log_warn '未能读取 Nginx stable 版本，继续执行。'; return 0; }
+    if version_at_least "$installed_version" "$latest_version"; then
+        log_info "Nginx 已是最新 stable 或更高版本: $installed_version"
+        return 0
+    fi
+    log_info "Nginx stable 有更新: $installed_version -> $latest_version"
+    [[ -t 0 ]] || { log_info '非交互运行，跳过 Nginx 更新。'; return 0; }
+    if ! prompt_nginx_stable_update; then
+        log_info '已跳过 Nginx 更新。'
+        return 0
+    fi
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg || { log_warn '安装 GnuPG 失败，已跳过 Nginx 更新。'; return 0; }
+    fi
+    setup_official_nginx_stable_apt_repo || { log_warn '无法配置官方 stable 仓库，已跳过 Nginx 更新。'; return 0; }
+    $SUDO apt-get update || { log_warn 'APT 更新失败，已跳过 Nginx 更新。'; return 0; }
+    candidate=$(LC_ALL=C apt-cache policy nginx | awk '/Candidate:/ {print $2; exit}') || return 0
+    if ! version_at_least "${candidate%%-*}" "$latest_version"; then
+        log_warn "APT 候选版本 $candidate 低于 stable $latest_version，已跳过更新。"
+        return 0
+    fi
+    if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold nginx; then
+        log_warn 'Nginx 更新失败；请检查 APT 和 Nginx 状态。'
+        return 0
+    fi
+    if ! nginx -t; then
+        log_error 'Nginx 更新后配置测试失败，请先修复配置。'
+        return 1
+    fi
+    log_success "Nginx 已更新: $(nginx -v 2>&1)"
+}
+
 install_dependencies() {
     local id_like='' os_id='' pm='' nginx_candidate=''
     local -a required_packages=()
@@ -3409,6 +3477,7 @@ main() {
         exit 0
     fi
     ensure_quick_command
+    check_nginx_stable_update
 
     if [[ -n $domain_to_remove ]]; then
         remove_domain_config
