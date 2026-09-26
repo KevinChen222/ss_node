@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
-PROXYALL_VERSION="1.7.7"
+PROXYALL_VERSION="1.7.8"
 SB_SHA256="8d9fe66e6ee887dab8153cb20ae45d292935f09da52191e88142efc9103ad148"
-DEPLOY_SHA256="d0b4c584f2007a5514c104e82652df6c4a4b66eee7cebaedf91faefe279dbd62"
+DEPLOY_SHA256="5611cd7e106923c3b6db765a4679b98bc7f15d882cacb9aacf5ee69fa1c1c285"
 RELAY_SHA256="b25cbbac3be920963a45df4854138a3da05e1c50731510d0d364b13573abcbae"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 
@@ -36,6 +36,7 @@ proxyall：Emby / sing-box 统一管理
   proxyall --uninstall     卸载统一入口，保留服务及原有管理脚本
   proxyall --version       显示版本
   proxyall --fix-http2     备份并修复受管 Nginx 配置的 HTTP/2 旧语法
+  proxyall --certificates  管理现有证书（查看、检查、续期、归档清理）
 
 脚本更新不升级 sing-box 核心，也不迁移现有监听端口。
 新建域名 HTTPS/443 反代默认使用 HAProxy；HTTP、自定义端口和 IP 前端使用直监听。
@@ -309,18 +310,20 @@ pa_menu() {
         printf '  2) sing-box 配置（含中转 / 节点解析）\n\n'
         printf '  3) 检查脚本更新\n'
         printf '  4) 卸载统一入口（保留全部服务）\n'
-        printf '  5) 修复 Nginx HTTP/2 旧语法\n\n'
+        printf '  5) 修复 Nginx HTTP/2 旧语法\n'
+        printf '  6) 证书管理\n\n'
         printf '  0) 退出脚本\n'
         printf '  ════════════════════════════════════\n'
-        read -r -p '  请选择 [0-5]: ' choice || return 0
+        read -r -p '  请选择 [0-6]: ' choice || return 0
         case "$choice" in
             1) pa_run /usr/local/bin/nginxproxy ;;
             2) pa_run /usr/local/bin/sb ;;
             3) pa_update || true ;;
             4) pa_uninstall || true ;;
             5) pa_run /usr/local/bin/nginxproxy --fix-http2 || true ;;
+            6) pa_run /usr/local/bin/nginxproxy --certificates || true ;;
             0) return 0 ;;
-            *) pa_error '请输入 0-5。' ;;
+            *) pa_error '请输入 0-6。' ;;
         esac
     done
 }
@@ -330,12 +333,17 @@ main() {
     case "$action" in
         --version) printf '%s\n' "$PROXYALL_VERSION"; return 0 ;;
         -h|--help) pa_help; return 0 ;;
-        ''|--install|--update|--uninstall|--fix-http2) ;;
+        ''|--install|--update|--uninstall|--fix-http2|--certificates) ;;
         *) pa_help; return 2 ;;
     esac
     [ "$EUID" = 0 ] || { pa_error '请用 root 或 sudo -H bash proxyall 运行。'; return 1; }
     [ "$(uname -s)" = Linux ] || { pa_error '此脚本用于 Linux VPS。'; return 1; }
     [ "$#" -le 1 ] || return 2
+    # 只读入口不触发依赖安装、脚本更新或会话状态目录初始化。
+    if [ "$action" = --certificates ]; then
+        pa_run /usr/local/bin/nginxproxy --certificates
+        return $?
+    fi
     pa_dependencies || return 1
     pa_prepare_state || return 1
     trap pa_cleanup EXIT

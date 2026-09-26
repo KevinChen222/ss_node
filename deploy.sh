@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.26-local16'
+SCRIPT_VERSION='2026.09.26-local17'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -108,6 +108,7 @@ cf_account_id=''
 domain_to_remove=''
 install_command_only='no'
 fix_http2_only='no'
+certificates_only='no'
 script_update_performed='no'
 force_yes='no'
 no_proxy_redirect='no'
@@ -308,6 +309,7 @@ show_help() {
 管理选项:
       --install-command        将当前脚本安装为 /usr/local/bin/nginxproxy
       --fix-http2              备份并修复受管 Nginx 配置的 HTTP/2 旧语法
+      --certificates           管理现有证书（查看、检查、续期、归档清理）
       --remove <URL>           删除指定前端 URL 的配置及其独占证书/续期记录
   -Y, --yes                    非交互删除时自动确认
   -h, --help                   显示帮助
@@ -1983,7 +1985,7 @@ manage_existing_link() {
 
 parse_arguments() {
     local temp
-    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,local-service,frontend-mode:,sni-router,install-command,fix-http2,version,help -n "$(basename "$0")" -- "$@") || exit 1
+    temp=$(getopt -o y:r:s:m:R:dD:hY --long you-domain:,r-domain:,stream-domain:,cert-domain:,resolver:,parse-cert-domain,dns:,cf-token:,cf-account-id:,gh-proxy:,remove:,yes,no-proxy-redirect,no-upstream-tls-verify,local-service,frontend-mode:,sni-router,install-command,fix-http2,certificates,version,help -n "$(basename "$0")" -- "$@") || exit 1
     eval set -- "$temp"
 
     while true; do
@@ -2007,6 +2009,7 @@ parse_arguments() {
             --sni-router) frontend_mode=haproxy; frontend_mode_explicit=yes; shift ;;
             --install-command) install_command_only=yes; shift ;;
             --fix-http2) fix_http2_only=yes; shift ;;
+            --certificates) certificates_only=yes; shift ;;
             --version) echo "$SCRIPT_VERSION"; exit 0 ;;
             -h|--help) show_help; exit 0 ;;
             --) shift; break ;;
@@ -3516,10 +3519,507 @@ run_proxy_deployment() (
 )
 remove_domain_config() ( _config_write_lock || exit 1; remove_domain_config_locked; )
 
+# Certificate inventory is read-only. Never source acme.sh account/domain files.
+CM_CERT_ROOT='/etc/nginx/certs'
+CM_SB_ROOT='/usr/local/etc/sing-box'
+CM_NGINX_ROOT='/etc/nginx'
+CM_BACKUP_ROOT='/var/lib/proxyall/certificates'
+declare -a cm_certs=() cm_keys=() cm_names=() cm_records=() cm_ref_paths=() cm_ref_labels=()
+cm_scan_complete=yes
+
+cm_field() {
+    local file=$1 field=$2 value
+    value=$(sed -n "s/^${field}=//p" "$file" 2>/dev/null | head -n 1) || return 1
+    if [[ $value == \'*\' ]]; then value=${value:1:${#value}-2}; fi
+    printf '%s' "$value"
+}
+
+cm_same_file() {
+    [[ -n $1 && -n $2 ]] || return 1
+    [[ $1 == "$2" || $1 -ef $2 ]] && return 0
+    [[ $(readlink -m -- "$1") == "$(readlink -m -- "$2")" ]]
+}
+
+cm_add() {
+    local cert=$1 key=${2:-} name=${3:-} record=${4:-} i subject
+    [[ $cert == /* && $cert != *$'\n'* && $cert != *$'\t'* ]] || { cm_scan_complete=no; return 0; }
+    for i in "${!cm_certs[@]}"; do
+        if cm_same_file "$cert" "${cm_certs[$i]}"; then
+            [[ -z $key ]] || cm_keys[$i]=$key
+            if [[ -n $record ]]; then
+                if [[ -n ${cm_records[$i]} && ${cm_records[$i]} != "$record" ]]; then
+                    cm_records[$i]='AMBIGUOUS'
+                else cm_records[$i]=$record; fi
+                cm_names[$i]=$name
+            fi
+            return 0
+        fi
+    done
+    if [[ -z $name ]]; then
+        subject=$(openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -n 1) || true
+        [[ ! $subject =~ ^(\*\.)?[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || name=$subject
+    fi
+    cm_certs+=("$cert"); cm_keys+=("$key")
+    cm_names+=("${name:-$(basename "$(dirname "$cert")")}"); cm_records+=("$record")
+}
+
+cm_ref() {
+    [[ -n $1 ]] || return 0
+    if [[ $1 != /* || $1 == *'$'* || $1 == *\\* || $1 == *$'\n'* || $1 == *$'\t'* ]]; then
+        cm_scan_complete=no
+        return 0
+    fi
+    cm_ref_paths+=("$1"); cm_ref_labels+=("$2")
+}
+
+# Tokenize nginx -T, including quoted paths and directives split across lines.
+# Unhandled escaped/dynamic paths fail closed for cleanup, without executing text.
+cm_nginx_paths() {
+    awk '
+    function word() { if (token != "") { words[++n]=token; token="" } }
+    function statement(    k) {
+        word()
+        if (words[1] ~ /^(ssl|proxy_ssl|grpc_ssl|uwsgi_ssl)_(certificate|certificate_key|trusted_certificate|client_certificate)$/) {
+            if (n != 2 || words[2] ~ /[$\\\t\r]/) print "BAD\t-\t-"
+            else print words[1] "\t" words[2] "\t" file " [块 " block[depth] "]"
+        }
+        for (k in words) delete words[k]; n=0
+    }
+    /^# configuration file / { file=$0; sub(/^# configuration file /,"",file); sub(/:$/,"",file); next }
+    {
+        for (i=1; i<=length($0); i++) {
+            c=substr($0,i,1)
+            if (quote != "") {
+                if (c == quote) quote=""; else token=token c
+            } else if (c == "\042" || c == "\047") quote=c
+            else if (c == "#") break
+            else if (c ~ /[ \t\r]/) word()
+            else if (c == ";") statement()
+            else if (c == "{") { statement(); block[++depth]=++serial }
+            else if (c == "}") { statement(); depth-- }
+            else token=token c
+        }
+        if (quote == "") word(); else token=token "\n"
+    }
+    END { if (quote != "" || depth != 0 || n != 0 || token != "") print "BAD\t-\t-" }
+    '
+}
+
+cm_scan() {
+    local file dir name cert key record dump rows kind path label entry json
+    local -a nginx_certs=() nginx_keys=() nginx_groups=() nginx_key_groups=()
+    local i j
+    cm_certs=(); cm_keys=(); cm_names=(); cm_records=(); cm_ref_paths=(); cm_ref_labels=()
+    cm_scan_complete=yes
+    if command -v nginx >/dev/null 2>&1; then
+        if dump=$(nginx -T 2>/dev/null); then
+            rows=$(printf '%s\n' "$dump" | cm_nginx_paths)
+            while IFS=$'\t' read -r kind path label; do
+                [[ -n $kind ]] || continue
+                if [[ $kind == BAD ]]; then cm_scan_complete=no; continue; fi
+                cm_ref "$path" "Nginx: $label ($kind)"
+                if [[ $kind == ssl_certificate || $kind == proxy_ssl_certificate ]]; then
+                    nginx_certs+=("$path"); nginx_groups+=("$label")
+                elif [[ $kind == ssl_certificate_key || $kind == proxy_ssl_certificate_key ]]; then
+                    nginx_keys+=("$path"); nginx_key_groups+=("$label")
+                fi
+            done <<< "$rows"
+            for i in "${!nginx_certs[@]}"; do
+                key=''
+                for j in "${!nginx_keys[@]}"; do
+                    if [[ ${nginx_groups[$i]} == "${nginx_key_groups[$j]}" ]] && \
+                       cm_key_matches "${nginx_certs[$i]}" "${nginx_keys[$j]}"; then key=${nginx_keys[$j]}; break; fi
+                done
+                cm_add "${nginx_certs[$i]}" "$key"
+            done
+        else cm_scan_complete=no; fi
+    elif [[ -d $CM_NGINX_ROOT ]]; then cm_scan_complete=no; fi
+
+    for file in "$CM_SB_ROOT"/*.json; do
+        [[ -e $file ]] || continue
+        if ! json=$(jq -c . "$file" 2>/dev/null); then cm_scan_complete=no; continue; fi
+        case "${file##*/}" in
+            config.json|relay.json)
+                if ! jq -e 'type=="object" and (.inbounds==null or (.inbounds|type=="array"))' <<< "$json" >/dev/null; then cm_scan_complete=no; continue; fi ;;
+        esac
+        # Include all certificate/key path references, including outbound trust and metadata.
+        rows=$(printf '%s' "$json" | jq -c 'paths as $p | select($p[-1] | type=="string") | select($p[-1] | test("(certificate|key)_path$")) | {path:getpath($p),tag:([range(0; ($p|length)) as $n | getpath($p[0:$n]) | objects | .tag? // empty] | last // "配置/元数据")} | if (.path|type)=="array" then .path[] as $v | .path=$v else . end') || { cm_scan_complete=no; continue; }
+        while IFS= read -r entry; do
+            [[ -n $entry ]] || continue
+            path=$(jq -r '.path | if type=="string" then . else "INVALID" end' <<< "$entry")
+            label=$(jq -r .tag <<< "$entry")
+            [[ -z $path ]] || cm_ref "$path" "sing-box: $label ($file)"
+        done <<< "$rows"
+        rows=$(printf '%s' "$json" | jq -c '.. | objects | select(.certificate_path? | type=="string") | {cert:.certificate_path,key:(.key_path // "")}') || { cm_scan_complete=no; continue; }
+        while IFS= read -r entry; do
+            [[ -n $entry ]] || continue
+            cert=$(jq -r .cert <<< "$entry"); key=$(jq -r .key <<< "$entry")
+            cm_add "$cert" "$key"
+        done <<< "$rows"
+    done
+    for cert in "$CM_CERT_ROOT"/*/cert "$CM_SB_ROOT"/*.pem; do
+        [[ -f $cert ]] || continue
+        if [[ $cert == *.pem ]]; then key=${cert%.pem}.key; else key=${cert%/cert}/key; fi
+        cm_add "$cert" "$key"
+    done
+    for dir in "${ACME_SH%/*}"/*; do
+        [[ -d $dir ]] || continue
+        name=${dir##*/}; name=${name%_ecc}
+        record="$dir/$name.conf"
+        [[ -f $record ]] || continue
+        [[ $(cm_field "$record" Le_Domain) == "$name" ]] || { cm_scan_complete=no; continue; }
+        cert=$(cm_field "$record" Le_RealFullChainPath); key=$(cm_field "$record" Le_RealKeyPath)
+        [[ -n $cert ]] || cert="$dir/fullchain.cer"
+        [[ -n $key ]] || key="$dir/$name.key"
+        cm_add "$cert" "$key" "$name" "$record"
+    done
+    cm_sort_inventory
+    return 0
+}
+
+cm_sort_inventory() {
+    local i expiry epoch
+    local -a certs=() keys=() names=() records=()
+    while read -r epoch i; do
+        certs+=("${cm_certs[$i]}"); keys+=("${cm_keys[$i]}")
+        names+=("${cm_names[$i]}"); records+=("${cm_records[$i]}")
+    done < <(
+        for i in "${!cm_certs[@]}"; do
+            expiry=$(openssl x509 -in "${cm_certs[$i]}" -enddate -noout 2>/dev/null) || expiry=''
+            epoch=$(date -u -d "${expiry#notAfter=}" +%s 2>/dev/null) || epoch=0
+            [[ -n $expiry ]] || epoch=0
+            printf '%s %s\n' "$epoch" "$i"
+        done | sort -n
+    )
+    cm_certs=("${certs[@]}"); cm_keys=("${keys[@]}"); cm_names=("${names[@]}"); cm_records=("${records[@]}")
+}
+
+cm_key_matches() {
+    local cert=$1 key=$2 public_cert public_key
+    [[ -r $cert && -r $key ]] || return 1
+    public_cert=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null) || return 1
+    public_key=$(openssl pkey -in "$key" -passin pass: -pubout 2>/dev/null) || return 1
+    [[ -n $public_cert && $public_cert == "$public_key" ]]
+}
+
+cm_references() {
+    local j target field record=${cm_records[$1]} dir name
+    local -a targets=("${cm_certs[$1]}" "${cm_keys[$1]}")
+    if [[ -f $record ]]; then
+        dir=${record%/*}; name=${record##*/}; name=${name%.conf}
+        targets+=("$dir/fullchain.cer" "$dir/$name.cer" "$dir/$name.key" "$dir/ca.cer")
+        for field in Le_RealCertPath Le_RealCAPath; do
+            target=$(cm_field "$record" "$field")
+            [[ -z $target ]] || targets+=("$target")
+        done
+    fi
+    for j in "${!cm_ref_paths[@]}"; do
+        for target in "${targets[@]}"; do
+            if cm_same_file "${cm_ref_paths[$j]}" "$target"; then printf '  %s\n' "${cm_ref_labels[$j]}"; break; fi
+        done
+    done
+}
+
+cm_expiry() {
+    local cert=$1 end epoch now
+    end=$(openssl x509 -in "$cert" -enddate -noout 2>/dev/null) || { printf '文件缺失/无效'; return; }
+    epoch=$(date -u -d "${end#notAfter=}" +%s 2>/dev/null) || { printf '%s' "${end#notAfter=}"; return; }
+    now=$(date +%s)
+    if ((epoch <= now)); then printf '已过期'; else printf '%s 天' "$(((epoch - now) / 86400))"; fi
+}
+
+cm_schedule() {
+    local jobs='' service_state='未确认调度服务运行' unit
+    command -v crontab >/dev/null 2>&1 && jobs=$(crontab -l 2>/dev/null || true)
+    jobs+=$'\n'$(grep -hs '^[[:space:]]*[^#[:space:]]' /etc/cron.d/* 2>/dev/null || true)
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        for unit in cron crond; do
+            if systemctl is-active --quiet "$unit" 2>/dev/null; then service_state='调度服务运行中'; break; fi
+        done
+    elif command -v rc-service >/dev/null 2>&1; then
+        for unit in crond dcron; do
+            if rc-service "$unit" status >/dev/null 2>&1; then service_state='调度服务运行中'; break; fi
+        done
+    fi
+    if printf '%s\n' "$jobs" | grep -v '^[[:space:]]*#' | grep -F -- "$ACME_SH" | grep -q -- '--cron'; then
+        printf '自动续期：发现 cron 条目；%s（不代表最近续期成功）。\n' "$service_state"
+    else
+        printf '自动续期：未发现默认 acme.sh 的 cron 条目；自定义 timer/外部调度需自行核对。\n'
+    fi
+}
+
+cm_details() {
+    local index=$1 record=${cm_records[$1]} refs method next
+    printf '\n证书：%s\n文件：%s\n私钥：%s\n剩余：%s\n' "${cm_names[$index]}" "${cm_certs[$index]}" "${cm_keys[$index]:-未找到}" "$(cm_expiry "${cm_certs[$index]}")"
+    openssl x509 -in "${cm_certs[$index]}" -noout -issuer -subject -dates -ext subjectAltName 2>/dev/null || true
+    if [[ -f $record ]]; then
+        method=$(cm_field "$record" Le_Webroot); next=$(cm_field "$record" Le_NextRenewTime)
+        printf '续期：acme.sh；验证方式：%s\n' "$method"
+        if [[ $next =~ ^[0-9]{1,12}$ ]]; then printf '计划续期时间：%s\n' "$(date -u -d "@$next" '+%F %T UTC' 2>/dev/null || printf '%s' "$next")"; fi
+        cm_schedule
+    elif [[ $record == AMBIGUOUS ]]; then
+        printf '多个 ACME 记录部署到同一文件，已禁用续期及清理，请先解决冲突。\n'
+    else printf '未关联默认 acme.sh 续期记录（可能是自签、导入或已停止续期的证书）。\n'; fi
+    refs=$(cm_references "$index")
+    printf '引用位置：\n%s\n' "${refs:-  未发现引用}"
+    [[ $cm_scan_complete == yes ]] || printf '引用检查不完整：Nginx/JSON 配置或路径无法解析，禁止清理。\n'
+}
+
+cm_validate() {
+    local cert=${cm_certs[$1]} key=${cm_keys[$1]} record=${cm_records[$1]} status=0 mode start epoch
+    if openssl x509 -in "$cert" -noout >/dev/null 2>&1 && \
+       openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1; then
+        log_success '证书可读取且未过期。'
+    else log_error '证书缺失、损坏或已过期。'; status=1; fi
+    start=$(openssl x509 -in "$cert" -startdate -noout 2>/dev/null) || true
+    epoch=$(date -u -d "${start#notBefore=}" +%s 2>/dev/null) || epoch=''
+    if [[ $epoch =~ ^[0-9]+$ ]] && ((epoch > $(date +%s))); then log_error '证书尚未生效，请检查证书和系统时间。'; status=1; fi
+    if cm_key_matches "$cert" "$key"; then log_success '证书与私钥匹配。'
+    else log_error '私钥缺失、加密或与证书不匹配。'; status=1; fi
+    if [[ -f $record && ${cm_names[$1]} != '*.'* ]]; then
+        if ! openssl x509 -in "$cert" -noout -checkhost "${cm_names[$1]}" 2>/dev/null | grep -q 'does match certificate'; then
+            log_error '证书不覆盖 ACME 主域名。'; status=1
+        fi
+    fi
+    if openssl verify -untrusted "$cert" "$cert" >/dev/null 2>&1; then log_success '通过本机信任链验证。'
+    else log_warn '未通过本机信任链验证；自签/私有 CA 证书可能属于预期情况。'; fi
+    if [[ -f $key ]]; then
+        mode=$(stat -c '%a' -- "$key" 2>/dev/null || true)
+        if [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 7) != 0 )); then log_warn '私钥允许其他用户访问，请检查文件权限。'; fi
+    fi
+    return "$status"
+}
+
+cm_probe() (
+    local index=$1 host port address output served disk
+    command -v timeout >/dev/null 2>&1 || { log_error '缺少 timeout，无法进行有时限的连接检查。'; return 1; }
+    printf '检查 TCP TLS 入口；HAProxy 共享服务使用公网域名和 443。HY2/TUIC 的 UDP 握手不在此检查范围。\n'
+    read -r -p "验证域名 / SNI [${cm_names[$index]}]，0 返回: " host || return 0
+    [[ $host != 0 ]] || return 0
+    host=${host:-${cm_names[$index]}}
+    [[ $host =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { log_error '请输入具体域名，不能使用通配符。'; return 1; }
+    read -r -p '连接地址 [使用上述域名，可填服务器 IP；0 返回]: ' address || return 0
+    [[ $address != 0 ]] || return 0
+    address=${address:-$host}
+    [[ $address =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]*$ ]] || { log_error '连接地址格式无效。'; return 1; }
+    [[ $address != *:* ]] || address="[$address]"
+    read -r -p 'TCP 端口 [443；0 返回]: ' port || return 0
+    [[ $port != 0 ]] || return 0
+    port=${port:-443}
+    [[ $port =~ ^[0-9]{1,5}$ ]] && ((10#$port > 0 && 10#$port <= 65535)) || { log_error '端口无效。'; return 1; }
+    output=$(timeout 15 openssl s_client -connect "$address:$port" -servername "$host" -showcerts </dev/null 2>/dev/null) || true
+    served=$(printf '%s\n' "$output" | openssl x509 -noout -fingerprint -sha256 2>/dev/null) || { log_error '未获得服务端证书，检查 DNS、端口和 SNI 路由。'; return 1; }
+    disk=$(openssl x509 -in "${cm_certs[$index]}" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    if [[ $served == "$disk" ]]; then log_success '该 TLS 入口提供的证书与选中证书一致。'
+    else log_error '入口证书不一致：可能命中 CDN/其他后端，或服务尚未加载新证书。'; return 1; fi
+    printf '%s\n' "$output" | openssl x509 -noout -checkhost "$host" 2>/dev/null | grep -q 'does match certificate' || { log_error '证书不覆盖验证域名。'; return 1; }
+    if timeout 15 openssl s_client -connect "$address:$port" -servername "$host" -verify_hostname "$host" -verify_return_error </dev/null >/dev/null 2>&1; then
+        log_success '域名、有效期及信任链握手检查通过。'
+    else log_error '指纹一致，但 TLS 信任验证失败（自签证书需客户端单独信任）。'; return 1; fi
+)
+
+cm_mutation_ready() {
+    command -v flock >/dev/null 2>&1 || { log_error '缺少 flock，请先安装 util-linux；此次未修改。'; return 1; }
+    command -v pgrep >/dev/null 2>&1 || { log_error '缺少 pgrep，请先安装 procps；此次未修改。'; return 1; }
+    _config_write_lock || return 1
+    cm_acme_idle
+}
+
+cm_acme_idle() {
+    local rc=0
+    pgrep -f '[/]acme[.]sh([[:space:]]|$)' >/dev/null 2>&1 || rc=$?
+    [[ $rc == 1 ]] || { log_error '检测到 ACME 进程或进程检查失败，请待自动续期结束后重试。'; return 1; }
+}
+
+cm_backup() {
+    local index=$1
+    [[ ! -L $CM_BACKUP_ROOT ]] || return 1
+    install -d -m 700 "$CM_BACKUP_ROOT" || return 1
+    cm_backup_dir=$(mktemp -d "$CM_BACKUP_ROOT/operation.XXXXXXXX") || return 1
+    [[ ! -f ${cm_certs[$index]} ]] || cp -p -- "${cm_certs[$index]}" "$cm_backup_dir/cert" || return 1
+    [[ ! -f ${cm_keys[$index]} ]] || cp -p -- "${cm_keys[$index]}" "$cm_backup_dir/key" || return 1
+    [[ ! -f ${cm_records[$index]} ]] || cp -p -- "${cm_records[$index]}" "$cm_backup_dir/domain.conf" || return 1
+    printf 'certificate=%s\nkey=%s\nrecord=%s\n' "${cm_certs[$index]}" "${cm_keys[$index]}" "${cm_records[$index]}" > "$cm_backup_dir/paths.txt" || return 1
+    chmod 600 "$cm_backup_dir"/* || return 1
+    log_info "受保护备份：$cm_backup_dir"
+}
+
+cm_record_valid() {
+    local index=$1 name=${cm_names[$1]} record=${cm_records[$1]} home=${ACME_SH%/*}
+    [[ $name =~ ^(\*\.)?[a-zA-Z0-9][a-zA-Z0-9.-]*$ && -f $record && ! -L $record ]] || return 1
+    [[ $record == "$home/$name/$name.conf" || $record == "$home/${name}_ecc/$name.conf" ]] || return 1
+    [[ $(cm_field "$record" Le_Domain) == "$name" ]]
+}
+
+cm_restore_invalid_pair() {
+    local index=$1 backup=$2 refs
+    cm_key_matches "${cm_certs[$index]}" "${cm_keys[$index]}" && return 0
+    cm_key_matches "$backup/cert" "$backup/key" || return 1
+    cm_acme_idle || return 1
+    cp -p -- "$backup/cert" "${cm_certs[$index]}" && cp -p -- "$backup/key" "${cm_keys[$index]}" || return 1
+    log_warn '部署文件缺失或不匹配，已从本次备份恢复证书及私钥。'
+    refs=$(cm_references "$index")
+    if [[ $refs == *'Nginx:'* ]] && nginx_is_running; then
+        nginx -t && nginx -s reload || { log_error '文件已恢复，但 Nginx 重载失败，请检查服务。'; return 1; }
+    fi
+}
+
+cm_renew() (
+    local index=$1 force=${2:-no} record=${cm_records[$1]} status=0 cm_backup_dir item
+    local cert=${cm_certs[$1]} key=${cm_keys[$1]}
+    local -a args=(--renew -d "${cm_names[$1]}" --home "${ACME_SH%/*}")
+    cm_mutation_ready || return 1
+    cm_scan
+    index=''
+    for item in "${!cm_certs[@]}"; do
+        if [[ ${cm_certs[$item]} == "$cert" && ${cm_keys[$item]} == "$key" && ${cm_records[$item]} == "$record" ]]; then index=$item; fi
+    done
+    [[ -n $index ]] || { log_error '证书或续期记录已变化，请重新选择。'; return 1; }
+    cm_record_valid "$index" && [[ -x $ACME_SH ]] || { log_error '没有可用且唯一的 ACME 记录/客户端，不能自动续期。'; return 1; }
+    [[ $record != *'_ecc/'* ]] || args+=(--ecc)
+    [[ $force != yes ]] || args+=(--force)
+    cm_backup "$index" || return 1
+    log_info '正在调用现有 ACME 续期方式和部署钩子；详细日志仅保存到受保护目录。'
+    "$ACME_SH" "${args[@]}" > "$cm_backup_dir/acme.log" 2>&1 || status=$?
+    chmod 600 "$cm_backup_dir/acme.log" || true
+    if [[ $status == 2 ]]; then log_info '尚未到续期时间，无需续期。'; return 0; fi
+    if [[ $status != 0 ]]; then
+        cm_restore_invalid_pair "$index" "$cm_backup_dir" || log_warn '未能自动恢复有效文件，请使用备份检查恢复。'
+        log_error "续期或部署钩子失败（$status）。备份及日志：$cm_backup_dir；未盲目重启服务。"
+        return 1
+    fi
+    cm_validate "$index" || {
+        cm_restore_invalid_pair "$index" "$cm_backup_dir" || true
+        log_error "续期返回成功，但部署文件检查失败；保留备份：$cm_backup_dir"; return 1
+    }
+    log_success '续期命令与本地文件检查完成。请用“验证 TLS 入口”确认在线服务已生效。'
+)
+
+cm_archive() (
+    local index=$1 cert=${cm_certs[$1]} key=${cm_keys[$1]} record=${cm_records[$1]} dir name refs cm_backup_dir item
+    local record_disabled=no
+    cm_mutation_ready || return 1
+    # Refresh references under the write lock, then locate the original selection again.
+    cm_scan
+    index=''
+    for item in "${!cm_certs[@]}"; do [[ ${cm_certs[$item]} != "$cert" ]] || index=$item; done
+    [[ -n $index && $cm_scan_complete == yes ]] || { log_error '引用检查不完整或证书已变化，拒绝清理。'; return 1; }
+    key=${cm_keys[$index]}; record=${cm_records[$index]}; name=${cm_names[$index]}
+    refs=$(cm_references "$index")
+    [[ -z $refs ]] || { log_error "证书或私钥仍被使用，拒绝清理：\n$refs"; return 1; }
+    for item in "${!cm_certs[@]}"; do
+        [[ $item != "$index" ]] || continue
+        if cm_same_file "${cm_keys[$item]}" "$key" || cm_same_file "${cm_certs[$item]}" "$cert"; then
+            log_error '其他证书条目共用这些文件，拒绝清理。'; return 1
+        fi
+    done
+    dir=${cert%/cert}
+    [[ $cert == "$CM_CERT_ROOT/"*/cert && ${dir%/*} == "$CM_CERT_ROOT" && $key == "$dir/key" ]] || { log_error '首版只清理 /etc/nginx/certs 下独立目录；外部导入、自签及 ACME 内部文件保留。'; return 1; }
+    [[ ! -L $dir && ! -L $cert && ! -L $key && $(readlink -m "$dir") == "$dir" ]] || { log_error '路径含符号链接或不是规范路径，拒绝清理。'; return 1; }
+    # Other files could be used by an unrecognized service. Do not move the whole directory.
+    for item in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [[ -e $item || -L $item ]] || continue
+        [[ $item == "$cert" || $item == "$key" ]] || { log_error '证书目录包含额外文件，拒绝清理。'; return 1; }
+    done
+    if [[ -n $record ]]; then
+        cm_record_valid "$index" || { log_error 'ACME 记录存在歧义，拒绝清理。'; return 1; }
+        [[ $(cm_field "$record" Le_RealFullChainPath) == "$cert" && $(cm_field "$record" Le_RealKeyPath) == "$key" && ! -e $record.removed ]] || { log_error 'ACME 部署路径不唯一或已有停用记录，拒绝清理。'; return 1; }
+    fi
+    cm_backup "$index" || return 1
+    trap 'if [[ $record_disabled == yes && -f $record.removed && ! -e $record ]]; then mv -- "$record.removed" "$record" || log_error "恢复续期记录失败，备份在 $cm_backup_dir"; fi' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Same reversible de-registration as acme.sh --remove; do not revoke the certificate.
+    if [[ -n $record ]]; then record_disabled=yes; mv -- "$record" "$record.removed" || return 1; fi
+    if ! cm_acme_idle || ! mv -- "$dir" "$cm_backup_dir/archived"; then
+        return 1
+    fi
+    record_disabled=no
+    log_success "已停止该记录续期并归档部署文件：$cm_backup_dir/archived"
+    log_info '保留 ACME 内部证书、账户和 HTTP-01 验证入口；没有吊销证书或修改 SNI 路由。'
+)
+
+cm_renewal_report() {
+    local i record next method
+    cm_schedule
+    for i in "${!cm_certs[@]}"; do
+        record=${cm_records[$i]}
+        printf '\n%s：%s\n' "${cm_names[$i]}" "$(cm_expiry "${cm_certs[$i]}")"
+        if [[ ! -f $record ]]; then printf '  没有唯一的默认 ACME 记录，不能自动续期。\n'; continue; fi
+        next=$(cm_field "$record" Le_NextRenewTime); method=$(cm_field "$record" Le_Webroot)
+        if [[ $next =~ ^[0-9]{1,12}$ ]] && ((10#$next > $(date +%s))); then printf '  未到计划续期时间。\n'; else printf '  已到续期时间或计划时间缺失，请检查。\n'; fi
+        case "$method" in
+            /*) [[ -d $method ]] && printf '  HTTP 验证目录存在；公网 DNS/80 可达性尚未验证。\n' || printf '  异常：HTTP 验证目录缺失。\n' ;;
+            dns_*) printf '  DNS API 验证；凭据有效性需实际续期确认。\n' ;;
+            *) printf '  验证方式：%s；可能需要临时占用端口或运行已有钩子。\n' "$method" ;;
+        esac
+    done
+}
+
+certificate_menu() (
+    local choice index action answer refs cmd origin
+    umask 077
+    # The deployment signal handler may start nginx; a read-only menu must never do that.
+    trap - ERR
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    for cmd in openssl jq readlink; do
+        command -v "$cmd" >/dev/null 2>&1 || { log_error "证书管理需要 $cmd；请先安装，此次未自动安装或改动服务。"; return 1; }
+    done
+    while true; do
+        cm_scan
+        printf '\n  证书管理（默认 ACME 目录、Nginx、sing-box）\n'
+        for index in "${!cm_certs[@]}"; do
+            refs=$(cm_references "$index")
+            if [[ -f ${cm_records[$index]} ]]; then origin='ACME'; else origin='未关联 ACME'; fi
+            if [[ -n $refs ]]; then refs='有配置引用'; else refs='未发现引用'; fi
+            printf '  %s) %s | %s | %s | %s\n' "$((index + 1))" "${cm_names[$index]}" "$(cm_expiry "${cm_certs[$index]}")" "$origin" "$refs"
+        done
+        ((${#cm_certs[@]})) || printf '  尚未发现证书。可先添加 HTTPS 反代或需要证书的节点；两者没有安装顺序要求。\n'
+        [[ $cm_scan_complete == yes ]] || printf '  引用扫描不完整，清理已禁用；检查 Nginx 配置及 sing-box JSON。\n'
+        printf '  R) 检查全部证书续期状态（只读）\n  0) 返回\n'
+        read -r -p '  选择证书序号或操作: ' choice || return 0
+        case "$choice" in
+            0) return 0 ;;
+            r|R) cm_renewal_report; continue ;;
+        esac
+        [[ $choice =~ ^[0-9]{1,6}$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#cm_certs[@]})) || { log_warn '请选择有效序号。'; continue; }
+        index=$((10#$choice - 1))
+        cm_details "$index"
+        printf '\n  1) 检查本地证书和私钥\n  2) 验证 TLS 入口\n  3) 按计划续期\n  4) 强制续期\n  5) 停止续期并归档未使用证书\n  0) 返回列表\n'
+        read -r -p '  选择操作: ' action || return 0
+        case "$action" in
+            0) continue ;;
+            1) cm_validate "$index" || true ;;
+            2) cm_probe "$index" || true ;;
+            3|4)
+                printf '将使用已有验证方式和部署钩子，可能重载相关服务；独立验证模式可能短暂停止 Nginx。\n'
+                if [[ $action == 4 ]]; then
+                    read -r -p '强制续期可能触发 CA 频率限制。输入 RENEW 确认，其余返回: ' answer || return 0
+                    [[ $answer != RENEW ]] || cm_renew "$index" yes || true
+                else
+                    read -r -p '现在检查并按计划续期？[y/N]: ' answer || return 0
+                    [[ $answer != y && $answer != Y ]] || cm_renew "$index" || true
+                fi ;;
+            5)
+                printf '将重新检查 Nginx/sing-box 引用，并归档到 %s。自定义其他服务的引用需自行核对。\n' "$CM_BACKUP_ROOT"
+                read -r -p "确认没有其他服务使用，输入完整名称 ${cm_names[$index]}，其余返回: " answer || return 0
+                [[ $answer != "${cm_names[$index]}" ]] || cm_archive "$index" || true ;;
+            *) log_warn '操作无效，已返回列表。' ;;
+        esac
+    done
+)
+
 main() {
     local argument_count=$#
     parse_arguments "$@"
     require_root
+
+    if [[ $certificates_only == yes ]]; then
+        [[ $argument_count == 1 ]] || { log_error '--certificates 请单独使用。'; return 1; }
+        certificate_menu
+        return $?
+    fi
 
     if [[ $fix_http2_only == yes ]]; then
         fix_nginx_http2
