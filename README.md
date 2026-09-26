@@ -56,4 +56,4 @@ proxyall --fix-http2     # 修复受管 Nginx 配置的 HTTP/2 旧语法
 - **Emby 网页默认关闭**：客户端 API 保留，可在反代菜单 **4** 中开启网页入口。
 - **证书默认保留**：删除反代或节点不会顺带删除证书。证书管理会检查引用后归档清理，备份位于 `/var/lib/proxyall/certificates/`；其他自定义服务的引用需自行核对。
 
-测试记录见 [REGRESSION.md](REGRESSION.md)，已知边界见 [AUDIT.md](AUDIT.md)。本地隔离测试不能代替真实 VPS 上的安装、续期和连接验证。
+
