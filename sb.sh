@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.27"
+export SCRIPT_VERSION="20-kevin.28"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -638,14 +638,16 @@ _setup_official_nginx_stable_apt_repo() {
 
 _ensure_local_origin_dependencies() {
     local nginx_was_missing=0 nginx_version nginx_candidate=''
+    local -a nginx_package=()
     _info "正在安装/检查 Nginx 与证书依赖..."
     if ! command -v nginx >/dev/null 2>&1; then
         nginx_was_missing=1
+        nginx_package=(nginx)
         _warn "首次安装 Nginx 时包管理器可能数分钟没有输出，请勿重复运行或中断脚本。"
         _info "正在调用系统包管理器安装 Nginx、cron 与 socat..."
     fi
     if command -v apk >/dev/null 2>&1; then
-        SB_PKG_VERBOSE=1 _pkg_install nginx dcron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
+        SB_PKG_VERBOSE=1 _pkg_install "${nginx_package[@]}" dcron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     elif command -v apt-get >/dev/null 2>&1; then
         if [ "$nginx_was_missing" = 1 ]; then
             SB_PKG_VERBOSE=1 _pkg_install curl ca-certificates gnupg || return 1
@@ -658,9 +660,9 @@ _ensure_local_origin_dependencies() {
             fi
             _info "将从官方 stable 仓库安装 Nginx: $nginx_candidate"
         fi
-        SB_PKG_VERBOSE=1 _pkg_install nginx cron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
+        SB_PKG_VERBOSE=1 _pkg_install "${nginx_package[@]}" cron socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     else
-        SB_PKG_VERBOSE=1 _pkg_install nginx cronie socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
+        SB_PKG_VERBOSE=1 _pkg_install "${nginx_package[@]}" cronie socat || { _error "包管理器安装 Nginx 依赖失败。"; return 1; }
     fi
     command -v nginx >/dev/null 2>&1 || { _error "Nginx 安装失败。"; return 1; }
     nginx_version=$(nginx -v 2>&1 | sed 's#^nginx version: ##')
@@ -4624,7 +4626,9 @@ _view_log() {
     fi
 }
 
-_uninstall() {
+_uninstall() ( _config_write_lock || exit 1; _uninstall_locked; )
+
+_uninstall_locked() {
     local managed_sing_box=false
     local managed_yq=false
     local managed_cloudflared=false
@@ -8477,6 +8481,9 @@ _main_menu() {
         
         echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
         echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}"
+        if [ ! -f "$SINGBOX_BIN" ]; then
+            echo -e "  ${YELLOW}首次使用：先选 [15] 安装核心，再选 [1] 添加节点。${NC}"
+        fi
         echo ""
         
         # 节点管理
@@ -8503,7 +8510,7 @@ _main_menu() {
         # 核心管理
         echo -e "  ${CYAN}【核心管理】${NC}"
         echo -e "    ${GREEN}[15]${NC} 安装/更新 Sing-box 核心"
-        echo -e "    ${RED}[16]${NC} 卸载脚本"
+        echo -e "    ${RED}[16]${NC} 卸载 sing-box 核心及全部节点"
         echo ""
         
         # 进阶功能
@@ -8512,10 +8519,14 @@ _main_menu() {
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
-        echo -e "    ${YELLOW}[0]${NC} 退出脚本"
+        if [ "${PROXYALL_MANAGED:-0}" = 1 ]; then
+            echo -e "    ${YELLOW}[0]${NC} 返回 proxyall 主菜单"
+        else
+            echo -e "    ${YELLOW}[0]${NC} 退出脚本"
+        fi
         echo ""
         
-        read -p "  请输入选项 [0-17]: " choice
+        read -r -p "  请输入选项 [0-17]: " choice || return 0
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -8533,13 +8544,13 @@ _main_menu() {
             13) _update_script ;;
             14) _require_singbox && _dns_config_menu ;;
             15) _install_or_update_singbox ;;
-            16) _uninstall ;;
+            16) _uninstall; [ -d "$SINGBOX_DIR" ] || return 0 ;;
             17) _require_singbox && _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
         echo
-        read -n 1 -s -r -p "按任意键返回主菜单..."
+        read -n 1 -s -r -p "按任意键返回主菜单..." || return 0
     done
 }
 
@@ -9166,6 +9177,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 _check_root
                 local_origin_domain="${2:-}"
                 [ -n "$local_origin_domain" ] || { _error "缺少自有域名参数。"; exit 1; }
+                _config_write_lock || exit 1
                 mkdir -p "$SINGBOX_DIR"
                 _install_dependencies
                 _prepare_local_reality_origin "$local_origin_domain"

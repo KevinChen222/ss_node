@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.24-local15'
+SCRIPT_VERSION='2026.09.26-local16'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -826,9 +826,23 @@ sni_router_call() {
 }
 
 prepare_sni_router() {
-    local status
+    local status route
     sni_router_call prepare || return 1
     status=$(sni_router_call status) || return 1
+    while IFS= read -r route; do
+        case "$route" in
+            "reality=${you_domain,,} -> "*|"tls=${you_domain,,} -> "*)
+                log_error "域名 ${you_domain,,} 已被 Reality/TLS 节点使用，请为反代选择不同子域名。"
+                return 1
+                ;;
+            "https=${you_domain,,} -> "*)
+                if [[ $route != "https=${you_domain,,} -> ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT} (${SNI_ROUTER_OWNER})" ]]; then
+                    log_error "该域名已有不同的 HTTPS 路由，拒绝覆盖: $route"
+                    return 1
+                fi
+                ;;
+        esac
+    done <<<"$status"
     if grep -Fqx "https=${you_domain,,} -> ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT} (${SNI_ROUTER_OWNER})" <<<"$status"; then
         sni_route_preexisting=yes
     fi
@@ -1929,7 +1943,7 @@ manage_existing_link() {
 
     echo
     echo "  [1] 修改该反代链路"
-    echo "  [2] 删除该反代链路、其独占证书及续期记录"
+    echo "  [2] 删除该反代链路（保留证书和续期入口）"
     echo "  [3] 禁用 Emby 网页入口（保留客户端 API）"
     echo "  [4] 恢复 Emby 网页入口"
     echo "  [0] 返回"
@@ -2037,14 +2051,19 @@ prompt_interactive_mode() {
             echo -e "\n${BLUE}--- 交互模式: 配置 Emby 反向代理 ---${NC}"
         fi
         local input_you input_r
-        read -r -p "请输入要访问的地址（例如 https://emby.example.com:443）: " input_you
-        if [[ $proxy_mode == local ]]; then
-            read -r -p "请输入本机服务 URL（例如 http://127.0.0.1:3000）: " input_r
-        else
-            read -r -p "请输入要反代的 Emby 主地址（登录/API 地址）: " input_r
-        fi
-        process_url_input "$input_you" you
-        process_url_input "$input_r" r
+        while [[ -z $you_domain ]]; do
+            read -r -p "请输入要访问的地址（例如 https://emby.example.com:443）: " input_you || return 1
+            process_url_input "$input_you" you || continue
+        done
+        while [[ -z $r_domain ]]; do
+            if [[ $proxy_mode == local ]]; then
+                read -r -p "请输入本机服务 URL（例如 http://127.0.0.1:3000）: " input_r || return 1
+            else
+                read -r -p "请输入要反代的 Emby 主地址（登录/API 地址）: " input_r || return 1
+            fi
+            process_url_input "$input_r" r || continue
+            if ! validate_local_service_upstream; then r_domain=''; fi
+        done
     fi
 
     # Preserve the original behavior: when -y and -r are both supplied, the
@@ -2062,7 +2081,9 @@ prompt_interactive_mode() {
         done
     fi
 
-    if [[ ${PROXYALL_MANAGED:-0} == 1 && $frontend_mode_explicit != yes ]]; then
+    if [[ ${PROXYALL_MANAGED:-0} == 1 && $frontend_mode_explicit != yes &&
+          $no_tls != yes && $you_frontend_port == 443 ]] &&
+       ! is_ip_address "$you_domain" && has_systemd; then
         frontend_mode=haproxy
         frontend_mode_explicit=yes
         log_info 'proxyall 默认使用 HAProxy SNI 共享公网 443。'
@@ -2146,6 +2167,11 @@ display_summary() {
         echo -e "本机服务: ${YELLOW}${upstream_proto}://${r_domain}:${r_frontend_port}${r_domain_path}${NC}"
     else
         echo -e "Emby 主站: ${YELLOW}${upstream_proto}://${r_domain}:${r_frontend_port}${r_domain_path}${NC}"
+        if [[ $emby_web_access == deny ]]; then
+            echo 'Emby 网页: 禁用（保留客户端 API；可在链路管理中恢复网页入口）'
+        else
+            echo "Emby 网页: 已启用 ${you_domain_path%/}/web/"
+        fi
         if ((${#stream_origins[@]})); then
             echo '推流源站:'
             for i in "${!stream_origins[@]}"; do
@@ -2243,7 +2269,7 @@ ensure_nginx_after_stable_update() {
     fi
 }
 
-check_nginx_stable_update() {
+check_nginx_stable_update() (
     local ID='' VERSION_CODENAME='' arch installed_version latest_package latest_version candidate install_succeeded=yes
     command -v nginx >/dev/null 2>&1 || return 0
     command -v apt-get >/dev/null 2>&1 || return 0
@@ -2281,6 +2307,7 @@ check_nginx_stable_update() {
         return 0
     fi
 
+    _config_write_lock || return 1
     if ! command -v gpg >/dev/null 2>&1; then
         $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg || { log_warn '安装 GnuPG 失败，已跳过 Nginx 更新。'; return 0; }
     fi
@@ -2300,7 +2327,7 @@ check_nginx_stable_update() {
         return 0
     fi
     log_success "Nginx 已更新且服务运行中: $(nginx -v 2>&1)"
-}
+)
 
 install_dependencies() {
     local id_like='' os_id='' pm='' nginx_candidate=''
@@ -2338,7 +2365,8 @@ install_dependencies() {
 
     if command -v apt-get >/dev/null 2>&1; then
         pm=apt
-        required_packages=(nginx curl ca-certificates socat cron openssl gettext-base tar coreutils jq)
+        required_packages=(curl ca-certificates socat cron openssl gettext-base tar coreutils jq)
+        command -v nginx >/dev/null 2>&1 || required_packages+=(nginx)
         if [[ $frontend_mode == haproxy ]]; then required_packages+=(haproxy util-linux); fi
         $SUDO apt-get update
         if ! command -v nginx >/dev/null 2>&1 && [[ $os_id == debian || $os_id == ubuntu ]]; then
@@ -2355,22 +2383,26 @@ install_dependencies() {
         $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${required_packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         pm=dnf
-        required_packages=(nginx curl ca-certificates socat cronie openssl gettext coreutils jq)
+        required_packages=(curl ca-certificates socat cronie openssl gettext tar coreutils jq)
+        command -v nginx >/dev/null 2>&1 || required_packages+=(nginx)
         if [[ $frontend_mode == haproxy ]]; then required_packages+=(haproxy util-linux); fi
         $SUDO dnf install -y "${required_packages[@]}"
     elif command -v yum >/dev/null 2>&1; then
         pm=yum
-        required_packages=(nginx curl ca-certificates socat cronie openssl gettext coreutils jq)
+        required_packages=(curl ca-certificates socat cronie openssl gettext tar coreutils jq)
+        command -v nginx >/dev/null 2>&1 || required_packages+=(nginx)
         if [[ $frontend_mode == haproxy ]]; then required_packages+=(haproxy util-linux); fi
         $SUDO yum install -y "${required_packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
         pm=pacman
-        required_packages=(nginx curl ca-certificates socat cronie openssl gettext coreutils jq)
+        required_packages=(curl ca-certificates socat cronie openssl gettext tar coreutils jq)
+        command -v nginx >/dev/null 2>&1 || required_packages+=(nginx)
         if [[ $frontend_mode == haproxy ]]; then required_packages+=(haproxy util-linux); fi
         $SUDO pacman -Sy --noconfirm "${required_packages[@]}"
     elif command -v apk >/dev/null 2>&1; then
         pm=apk
-        required_packages=(nginx curl ca-certificates socat dcron openssl gettext coreutils jq)
+        required_packages=(curl ca-certificates socat dcron openssl gettext tar coreutils jq)
+        command -v nginx >/dev/null 2>&1 || required_packages+=(nginx)
         if [[ $frontend_mode == haproxy ]]; then required_packages+=(haproxy util-linux); fi
         $SUDO apk add --no-cache "${required_packages[@]}"
     else
@@ -2807,7 +2839,7 @@ emit_emby_web_guard() {
 }
 
 # 只变更所选站点的网页访问块，不重新签证书、不修改监听或 HAProxy。
-set_emby_web_access() {
+set_emby_web_access_locked() {
     local conf="$1" frontend="$2" action="$3" parsed proto domain port path tmp block
     [[ $action == deny || $action == allow ]] || return 1
     [[ -f $conf && ! -L $conf ]] && grep -Fqx '# Generated by deploy-stream-domains.sh' "$conf" || {
@@ -2846,6 +2878,8 @@ set_emby_web_access() {
         log_success 'Emby 网页入口已恢复。'
     fi
 }
+
+set_emby_web_access() ( _config_write_lock || exit 1; set_emby_web_access_locked "$@"; )
 
 generate_nginx_config() {
     ensure_http_include
@@ -3290,10 +3324,7 @@ remove_domain_config_locked() {
     fi
 
     stage_file_removal "$conf_path"
-    local acme_conf="/etc/nginx/conf.d/00-emby-acme-${clean_domain,,}.conf"
-    if [[ -n $router_sni && -f $acme_conf ]] && grep -q '^# Generated by deploy-stream-domains.sh (ACME webroot)$' "$acme_conf"; then
-        stage_file_removal "$acme_conf"
-    fi
+    # 证书可能被 AnyTLS/其他站点复用；保留 HTTP-01 入口才能让保留的续期记录继续工作。
     if ! test_and_reload_nginx; then
         rollback_config_changes || true
         restore_nginx_after_rollback
@@ -3308,7 +3339,7 @@ remove_domain_config_locked() {
 
     # 配置删除与证书销毁分离。缺少跨组件所有权证明时，一律保留。
     if [[ -n $cert_path ]]; then
-        log_warn "已保留证书、私钥及续期记录（可能被 sing-box/中转引用）: $cert_dir"
+        log_warn "已保留证书、私钥、续期记录及 HTTP-01 入口（可能被 sing-box/中转引用）: $cert_dir"
     fi
 
     log_success '配置已移除。'
@@ -3332,7 +3363,6 @@ validate_nginx_features() {
 }
 
 run_proxy_deployment_locked() {
-    prompt_interactive_mode
     [[ -n $you_domain && -n $r_domain ]] || { log_error '前端和主源站不能为空。'; exit 1; }
     if [[ $proxy_mode == local && $no_tls == yes ]]; then
         log_error '本机服务模式要求 HTTPS 前端，以保证 TLS 1.3 与 HTTP/2。'
@@ -3415,7 +3445,11 @@ main_menu() {
         echo -e "    ${GREEN}[5]${NC} 检查并更新脚本"
         echo -e "    ${RED}[6]${NC} 卸载反代管理脚本"
         echo
-        echo -e "    ${YELLOW}[0]${NC} 退出"
+        if [[ ${PROXYALL_MANAGED:-0} == 1 ]]; then
+            echo -e "    ${YELLOW}[0]${NC} 返回 proxyall 主菜单"
+        else
+            echo -e "    ${YELLOW}[0]${NC} 退出"
+        fi
         echo
         if ! read -r -p '  请输入选项 [0-6]: ' choice; then
             echo
@@ -3475,7 +3509,11 @@ main_menu() {
     done
 }
 
-run_proxy_deployment() ( _config_write_lock || exit 1; run_proxy_deployment_locked; )
+run_proxy_deployment() (
+    prompt_interactive_mode
+    _config_write_lock || exit 1
+    run_proxy_deployment_locked
+)
 remove_domain_config() ( _config_write_lock || exit 1; remove_domain_config_locked; )
 
 main() {

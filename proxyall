@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
-PROXYALL_VERSION="1.7.6"
-SB_SHA256="d77eb17de604eb654a6611b9067cbad4740a62f110794e954a5fbd1dd4353706"
-DEPLOY_SHA256="e51c70c08b075f2fde308f30ca9ac3b3e9f1853a6af33a4a8d97fa05a863e49b"
+PROXYALL_VERSION="1.7.7"
+SB_SHA256="8d9fe66e6ee887dab8153cb20ae45d292935f09da52191e88142efc9103ad148"
+DEPLOY_SHA256="d0b4c584f2007a5514c104e82652df6c4a4b66eee7cebaedf91faefe279dbd62"
 RELAY_SHA256="b25cbbac3be920963a45df4854138a3da05e1c50731510d0d364b13573abcbae"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 
@@ -38,7 +38,8 @@ proxyall：Emby / sing-box 统一管理
   proxyall --fix-http2     备份并修复受管 Nginx 配置的 HTTP/2 旧语法
 
 脚本更新不升级 sing-box 核心，也不迁移现有监听端口。
-新建 Emby 默认使用 HAProxy；新建 Reality 默认端口 443、默认启用 SNI 分流。
+新建域名 HTTPS/443 反代默认使用 HAProxy；HTTP、自定义端口和 IP 前端使用直监听。
+新建 Reality 默认端口 443、默认启用 SNI 分流。
 共享入口要求 Linux + systemd，Emby 域名和 Reality SNI 必须不同。
 请勿同时在其他终端用 sb / nginxproxy 修改同一份配置。
 EOF
@@ -302,15 +303,15 @@ pa_run() {
 pa_menu() {
     local choice
     while true; do
-        printf '\n\n  ════════════════════════════════════\n\n'
+        printf '\n  ════════════════════════════════════\n'
         printf '       proxyall  %s\n\n' "$PROXYALL_VERSION"
-        printf '  1) Emby 反代\n\n\n'
-        printf '  2) sing-box 配置（含中转 / 节点解析）\n\n\n'
-        printf '  3) 检查脚本更新\n\n\n'
-        printf '  4) 卸载脚本（仅统一入口，保留服务）\n\n\n'
-        printf '  5) 修复 Nginx HTTP/2 旧语法\n\n\n'
-        printf '  0) 退出脚本\n\n'
-        printf '  ════════════════════════════════════\n\n'
+        printf '  1) Emby / 本机服务反代\n'
+        printf '  2) sing-box 配置（含中转 / 节点解析）\n\n'
+        printf '  3) 检查脚本更新\n'
+        printf '  4) 卸载统一入口（保留全部服务）\n'
+        printf '  5) 修复 Nginx HTTP/2 旧语法\n\n'
+        printf '  0) 退出脚本\n'
+        printf '  ════════════════════════════════════\n'
         read -r -p '  请选择 [0-5]: ' choice || return 0
         case "$choice" in
             1) pa_run /usr/local/bin/nginxproxy ;;
