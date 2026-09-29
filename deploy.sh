@@ -1047,7 +1047,8 @@ has_ipv6() {
 }
 
 ipv6_stack_available() {
-    [[ -s /proc/net/if_inet6 ]]
+    # procfs reports size 0 even when IPv6 addresses are present.
+    grep -q . /proc/net/if_inet6 2>/dev/null
 }
 
 nginx_supports_http2_directive() {
@@ -2591,36 +2592,45 @@ prepare_acme_webroot() {
 
 check_acme_webroot() {
     local challenge_dir="$ACME_WEBROOT/.well-known/acme-challenge"
-    local probe_file probe_name probe_url local_response public_response public_status=0 attempt
+    local probe_file probe_name probe_url local_response public_response public_status attempt address family
+    local -a local_addresses=(127.0.0.1)
+    ipv6_stack_available && local_addresses+=('[::1]')
     probe_file=$(mktemp "$challenge_dir/proxyall-check.XXXXXXXX") || return 1
     probe_name=${probe_file##*/}
     printf '%s' "$probe_name" > "$probe_file"
     chmod 644 "$probe_file"
     probe_url="http://${you_domain}/.well-known/acme-challenge/${probe_name}"
 
-    for ((attempt = 1; attempt <= 5; attempt++)); do
-        local_response=$(curl --noproxy '*' -fsS --max-time 3 \
-            --resolve "${you_domain}:80:127.0.0.1" "$probe_url" 2>/dev/null) || true
-        [[ $local_response == "$probe_name" ]] && break
-        (( attempt == 5 )) || sleep 1
+    for address in "${local_addresses[@]}"; do
+        for ((attempt = 1; attempt <= 5; attempt++)); do
+            local_response=$(curl --noproxy '*' -fsS --max-time 3 \
+                --resolve "${you_domain}:80:${address}" "$probe_url" 2>/dev/null) || true
+            [[ $local_response == "$probe_name" ]] && break
+            (( attempt == 5 )) || sleep 1
+        done
+        if [[ $local_response != "$probe_name" ]]; then
+            rm -f -- "$probe_file"
+            log_error "本机 Nginx ${address}:80 未能读取 HTTP-01 挑战文件: $probe_url"
+            log_error '请检查 80 端口监听、同名 server_name 配置及 webroot 目录权限。'
+            return 1
+        fi
     done
-    if [[ $local_response != "$probe_name" ]]; then
-        rm -f -- "$probe_file"
-        log_error "本机 Nginx 80 端口未能读取 HTTP-01 挑战文件: $probe_url"
-        log_error '请检查 80 端口监听、同名 server_name 配置及 webroot 目录权限。'
-        return 1
-    fi
 
-    public_response=$(curl --noproxy '*' -4 -fsS --max-time 8 "$probe_url" 2>/dev/null) || public_status=$?
+    for family in 4 6; do
+        public_status=0
+        public_response=$(curl --noproxy '*' "-${family}" -fsS --max-time 8 "$probe_url" 2>/dev/null) || public_status=$?
+        if (( public_status == 22 )) || [[ $public_status == 0 && $public_response != "$probe_name" ]]; then
+            rm -f -- "$probe_file"
+            log_error "公网 IPv${family} HTTP-01 地址未返回本机挑战文件: $probe_url"
+            log_error '请检查域名 A/AAAA 记录、80 端口转发及其他 Web 服务或反代是否接管了请求。'
+            return 1
+        fi
+        # curl exit 6 also covers a domain without records for this address family.
+        if (( public_status != 0 && public_status != 6 )); then
+            log_warn "本机无法经公网 IPv${family} 回访 80 端口，将继续交由证书机构验证。"
+        fi
+    done
     rm -f -- "$probe_file"
-    if (( public_status == 22 )) || [[ $public_status == 0 && $public_response != "$probe_name" ]]; then
-        log_error "公网 HTTP-01 地址未返回本机挑战文件: $probe_url"
-        log_error '请检查域名 A 记录、80 端口转发及其他 Web 服务或反代是否接管了请求。'
-        return 1
-    fi
-    if (( public_status != 0 )); then
-        log_warn '本机无法经公网 IPv4 回访 80 端口，将继续交由证书机构验证。'
-    fi
 }
 
 cleanup_stale_acme_record() {
