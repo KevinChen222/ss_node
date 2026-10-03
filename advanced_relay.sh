@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.11"
+SCRIPT_VERSION="16-kevin.12"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -2475,15 +2475,23 @@ _view_relays() {
 # --- 4. 删除中转路由 ---
 _clear_all_relays_locked() {
     local links_file="${RELAY_AUX_DIR}/relay_links.json"
-    local relay_tmp links_tmp router_tag
+    local relay_tmp links_tmp main_tmp router_tag
 
     relay_tmp=$(mktemp "${RELAY_CONFIG_FILE}.tmp.XXXXXXXXXX") || return 1
     links_tmp=$(mktemp "${links_file}.tmp.XXXXXXXXXX") || { rm -f "$relay_tmp"; return 1; }
+    main_tmp=$(mktemp "${MAIN_CONFIG_FILE}.tmp.XXXXXXXXXX") || { rm -f "$relay_tmp" "$links_tmp"; return 1; }
+    if ! jq --slurpfile links "$links_file" '
+        ($links[0].__ruleset_routing.rules // []) as $owned
+        | .route.rules = (reduce $owned[] as $r ((.route.rules // []);
+            index($r) as $i | if $i == null then . else del(.[$i]) end))
+    ' "$MAIN_CONFIG_FILE" > "$main_tmp"; then
+        rm -f "$relay_tmp" "$links_tmp" "$main_tmp"; return 1
+    fi
     printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$relay_tmp"
     printf '%s\n' '{}' > "$links_tmp"
-    if ! "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$relay_tmp" >/dev/null 2>&1; then
+    if ! "$SINGBOX_BIN" check -c "$main_tmp" -c "$relay_tmp" >/dev/null 2>&1; then
         _error "清空后的配置未通过 sing-box 校验，原配置未修改。"
-        rm -f "$relay_tmp" "$links_tmp"
+        rm -f "$relay_tmp" "$links_tmp" "$main_tmp"
         return 1
     fi
 
@@ -2491,7 +2499,7 @@ _clear_all_relays_locked() {
     if [ -n "$router_tag" ]; then
         _sni_router_call remove-reality "$router_tag" || {
             _error "无法注销 HAProxy Reality 后端，已取消清空。"
-            rm -f "$relay_tmp" "$links_tmp"
+            rm -f "$relay_tmp" "$links_tmp" "$main_tmp"
             return 1
         }
     fi
@@ -2511,6 +2519,7 @@ _clear_all_relays_locked() {
     # 元数据仍在时先清理脚本创建的 YAML 节点和证书；复用的 sb.sh 节点会保留。
     _clear_created_relay_yaml_nodes
     _clear_created_relay_certificates
+    mv "$main_tmp" "$MAIN_CONFIG_FILE" || { rm -f "$relay_tmp" "$links_tmp" "$main_tmp"; return 1; }
     mv "$relay_tmp" "$RELAY_CONFIG_FILE" || { rm -f "$relay_tmp" "$links_tmp"; return 1; }
     mv "$links_tmp" "$links_file" || { rm -f "$links_tmp"; return 1; }
     chmod 600 "$RELAY_CONFIG_FILE" "$links_file" 2>/dev/null || true
@@ -2594,6 +2603,12 @@ _delete_relay_locked() {
     local out_tag=$(echo "$selected_rule" | jq -r '.outbound')
     local reuse_existing="false"
     [ -f "$LINKS_FILE" ] && reuse_existing=$(jq -r --arg t "$in_tag" '.[$t].reuse_existing // false' "$LINKS_FILE" 2>/dev/null)
+    if [ "$reuse_existing" != true ] && jq -e --arg t "$in_tag" 'any(.__ruleset_routing.policies[]?; .inbound == $t)' "$LINKS_FILE" >/dev/null; then
+        local ruleset_policy ruleset_modern
+        ruleset_policy=$(jq -n --arg tag "$in_tag" '{id:$tag,inbound:$tag}') || return 1
+        ruleset_modern=$(_ruleset_core_version) || return 1
+        _ruleset_change delete-inbound "$ruleset_policy" "$ruleset_modern" || return 1
+    fi
     local fronted_by=""
     [ -f "$LINKS_FILE" ] && fronted_by=$(jq -r --arg t "$in_tag" '.[$t].fronted_by // empty' "$LINKS_FILE" 2>/dev/null)
     local router_sni="" router_backend=""
@@ -2819,6 +2834,220 @@ _modify_relay_port_locked() {
 
 
 # ============================================================
+# --- 二进制规则集分流 ---
+# 规则写入主配置前部；出站、DNS、规则集留在 relay.json，元数据沿用 relay_links.json。
+_ruleset_render() {
+    local relay_file="$1" links_file="$2" operation="$3" policy="$4" output="$5" metadata="$6" version="$7"
+    jq --slurpfile links "$links_file" --slurpfile main "$MAIN_CONFIG_FILE" --arg op "$operation" --argjson policy "$policy" \
+        --arg dir "$SINGBOX_DIR" --argjson modern "$version" '
+        ($links[0].__ruleset_routing // {policies:[],rules:[],cache_file_before:.experimental.cache_file}) as $old
+        | (if $op == "add" then [$policy] + $old.policies
+           elif $op == "delete-inbound" then [$old.policies[] | select(.inbound != $policy.inbound)]
+           else [$old.policies[] | select(.id != $policy.id)] end) as $policies
+        | ($policies | group_by(.inbound) | sort_by(.[0].inbound == "")) as $scopes
+        | [$scopes[] | .[0].inbound | select(. != "")] as $specific
+        | if any($scopes[]; ([.[].dns_ip] | unique | length) > 1)
+          then error("同一作用范围的 DNS 必须一致；请使用该范围已有的 DNS，或先删除旧分流") else . end
+        | def scope($p): if $p.inbound == "" then {} else {inbound:$p.inbound} end;
+          def resolve_scope($p):
+              if $p.inbound == "" and ($specific | length) > 0 then {inbound:$specific,invert:true} else scope($p) end;
+          def dns_tag($p): "ruleset-dns-" + $p.id;
+          def set_tag($p): "ruleset-set-" + $p.id;
+          def out_tag($p): "ruleset-out-" + $p.id;
+        ([ $scopes[] | .[0] as $p | scope($p) + {action:"sniff"} ]
+         + [ $scopes[] | .[0] as $p | resolve_scope($p) + {action:"resolve"}
+             + (if $p.dns_ip == "" then {} else {server:dns_tag($p)} end) ]
+         + [ ($policies | sort_by(.inbound == ""))[] as $p
+             | scope($p) + {rule_set:[set_tag($p)],action:"route",outbound:out_tag($p)} ]
+         + [ $scopes[] | .[0] as $p | select($p.inbound != "")
+             | scope($p) + {action:"route",outbound:"ruleset-direct"} ]) as $generated
+        | (reduce $old.rules[] as $r (($main[0].route.rules // []);
+            index($r) as $i | if $i == null then . else del(.[$i]) end)) as $base
+        | ($main[0] | .route.rules = ($generated + $base)) as $new_main
+        | .route.rule_set = ([.route.rule_set[]? | select(if (.tag | type) == "string" then (.tag | startswith("ruleset-set-") | not) else true end)]
+            + [$policies[] as $p | {type:"remote",tag:set_tag($p),format:"binary",url:$p.url,update_interval:"1d"}
+                + (if $modern then {http_client:{version:2}} else {} end)])
+        | .outbounds = ([.outbounds[]? | select(((.tag // "") | startswith("ruleset-out-")) | not) | select(.tag != "ruleset-direct")]
+            + (if ($policies | length) > 0 then [{type:"direct",tag:"ruleset-direct"}] + [$policies[] | .outbound] else [] end))
+        | .dns.servers = ([.dns.servers[]? | select(((.tag // "") | startswith("ruleset-dns-")) | not)]
+            + [$scopes[] | .[0] as $p | select($p.dns_ip != "")
+                | {type:"https",tag:dns_tag($p),server:$p.dns_ip,server_port:443,path:"/dns-query",
+                   tls:{server_name:(if $p.dns_ip == "1.1.1.1" then "cloudflare-dns.com"
+                                    elif $p.dns_ip == "8.8.8.8" then "dns.google" else "dns.quad9.net" end)}}])
+        | if ($policies | length) > 0 then
+            .experimental.cache_file = ((.experimental.cache_file // {}) + {enabled:true})
+            | .experimental.cache_file.path = (.experimental.cache_file.path // $main[0].experimental.cache_file.path // ($dir + "/ruleset-cache.db"))
+          elif $old.cache_file_before == null then del(.experimental.cache_file)
+          else .experimental.cache_file = $old.cache_file_before end
+        | {config:.,main_config:$new_main,state:{policies:$policies,rules:$generated,cache_file_before:$old.cache_file_before}}
+    ' "$relay_file" > "$output" || return 1
+    jq '.config' "$output" > "$metadata.config" || return 1
+    jq '.main_config' "$output" > "$metadata.main" || return 1
+    jq --slurpfile rendered "$output" '.__ruleset_routing = $rendered[0].state' "$links_file" > "$metadata" || return 1
+}
+
+_ruleset_change() (
+    _config_write_lock || exit 1
+    local operation="$1" policy="$2" modern="$3" links_file="${RELAY_AUX_DIR}/relay_links.json"
+    local work published=false restore_failed=false
+    work=$(mktemp -d "${RELAY_AUX_DIR}/.ruleset.XXXXXXXXXX") || exit 1
+    # 原件备份与候选配置分开；任何失败或信号都恢复配置并重启旧服务。
+    trap 'if [ "$published" = true ]; then
+        cp "$work/main.before" "$MAIN_CONFIG_FILE" || restore_failed=true
+        cp "$work/relay.before" "$RELAY_CONFIG_FILE" || restore_failed=true
+        cp "$work/links.before" "$links_file" || restore_failed=true
+        if [ "$restore_failed" = true ]; then
+            _error "恢复配置失败，备份已保留在 $work，请从备份恢复。"
+            exit 1
+        fi
+        _manage_service restart >/dev/null 2>&1 || _error "原配置已恢复，但服务重启失败，请检查服务日志。"
+        _error "规则集分流未生效，已恢复原配置。"
+    fi; rm -rf -- "$work"' EXIT
+    trap 'exit 1' INT TERM HUP
+    cp "$MAIN_CONFIG_FILE" "$work/main.before" && cp "$RELAY_CONFIG_FILE" "$work/relay.before" && cp "$links_file" "$work/links.before" || exit 1
+    if [ "$operation" = add ] && ! jq -e --argjson p "$policy" --slurpfile main "$MAIN_CONFIG_FILE" '
+        $p.inbound == "" or any(($main[0].inbounds + .inbounds)[]?; .tag == $p.inbound)
+    ' "$RELAY_CONFIG_FILE" >/dev/null; then
+        _error "入口节点已不存在，请重新选择。"; exit 1
+    fi
+    _ruleset_render "$RELAY_CONFIG_FILE" "$links_file" "$operation" "$policy" "$work/rendered.json" "$work/links.json" "$modern" || exit 1
+    if ! "$SINGBOX_BIN" check -c "$work/links.json.main" -c "$work/links.json.config" > "$work/check.log" 2>&1; then
+        _error "规则集配置未通过 sing-box 校验，原配置未修改。"
+        tail -n 12 "$work/check.log" >&2
+        exit 1
+    fi
+    published=true
+    mv "$work/links.json.main" "$MAIN_CONFIG_FILE" && mv "$work/links.json.config" "$RELAY_CONFIG_FILE" && mv "$work/links.json" "$links_file" || exit 1
+    _manage_service restart || exit 1
+    sleep 1
+    _manage_service status >/dev/null 2>&1 || exit 1
+    published=false
+    _log_operation "RULESET_${operation^^}" "$(jq -r '.id' <<< "$policy")"
+    _success "规则集分流配置已更新。"
+)
+
+_ruleset_core_version() {
+    local version major minor
+    version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
+    IFS=. read -r major minor _ <<< "$version"
+    if ! [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || { [ "$major" -eq 1 ] && [ "$minor" -lt 12 ]; }; then
+        _error "规则集分流需要 sing-box 1.12 或更新版本，请先升级核心。"
+        return 1
+    fi
+    if [ "$major" -gt 1 ] || [ "$minor" -ge 14 ]; then printf true; else printf false; fi
+}
+
+_ruleset_add() (
+    local modern url share_link outbound scope_choice inbound="" node_name="全部 sing-box 入口"
+    local dns_choice dns_default=0 dns_ip="" choice id policy work tag type port name
+    local -a tags=() names=()
+    modern=$(_ruleset_core_version) || exit 1
+    echo -e "\n  ${CYAN}【添加规则集分流】${NC}"
+    read -r -p "  请输入二进制规则集 (.srs) HTTPS 链接: " url || exit 1
+    if ! [[ "$url" =~ ^https://[^/[:space:]]+/[^[:space:]]+$ ]]; then
+        _error "请输入有效的 HTTPS 规则集下载链接。"; exit 1
+    fi
+    read -r -p "  请输入落地出站节点分享链接: " share_link || exit 1
+    [ -n "$share_link" ] || { _error "节点链接不能为空。"; exit 1; }
+    _check_parser || exit 1
+    outbound=$(bash "$_PARSER_PATH" "$share_link") || { _error "出站链接解析失败。"; exit 1; }
+    jq -e 'type == "object" and .error == null and (.type | type == "string") and (.server | type == "string") and (.server_port | type == "number")' \
+        <<< "$outbound" >/dev/null || { _error "出站链接解析失败。"; exit 1; }
+    echo "    [1] 全部 sing-box 入口流量"
+    echo "    [2] 指定已有入口（未命中规则的流量走本机出口）"
+    echo "  全部入口模式仅影响进入 sing-box 的流量。"
+    read -r -p "  请选择作用范围 [1-2]: " scope_choice || exit 1
+    case "$scope_choice" in
+        1) ;;
+        2)
+            while IFS=$'\t' read -r tag type port; do
+                [ -n "$tag" ] || continue
+                name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$MAIN_METADATA_FILE" 2>/dev/null)
+                [ -n "$name" ] || name=$(jq -r --arg t "$tag" '.[$t].node_name // empty' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+                name=${name:-$tag}
+                tags+=("$tag"); names+=("$name")
+                printf '    [%d] %s (%s, 监听端口 %s)\n' "${#tags[@]}" "$name" "$type" "$port"
+            done < <(jq -sr '[.[].inbounds[]? | select((.tag // "") != "" and .type != "direct")
+                | select((.tag | test("-hop-[0-9]+$")) | not)] | unique_by(.tag)[]
+                | [.tag,.type,(.listen_port // 0 | tostring)] | @tsv' "$MAIN_CONFIG_FILE" "$RELAY_CONFIG_FILE")
+            [ "${#tags[@]}" -gt 0 ] || { _error "没有可选择的入口，请先添加节点。"; exit 1; }
+            read -r -p "  请选择入口序号: " choice || exit 1
+            [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le "${#tags[@]}" ] || { _error "无效入口序号。"; exit 1; }
+            inbound=${tags[$((choice - 1))]}; node_name=${names[$((choice - 1))]}
+            ;;
+        *) _error "无效作用范围。"; exit 1 ;;
+    esac
+    echo "  DNS 用于该范围目标域名的解析（包括用于判断 IP 规则的解析），请求从本机发出。"
+    echo "  同一范围的多条分流使用同一 DNS；指定入口的 DNS 优先于全局 DNS。"
+    echo "    [0] 沿用 sing-box 当前 DNS（默认）"
+    echo "    [1] Cloudflare https://1.1.1.1/dns-query"
+    echo "    [2] Google     https://8.8.8.8/dns-query"
+    echo "    [3] Quad9      https://9.9.9.9/dns-query"
+    dns_ip=$(jq -r --arg tag "$inbound" '[.__ruleset_routing.policies[]? | select(.inbound == $tag)][0].dns_ip // ""' "${RELAY_AUX_DIR}/relay_links.json") || exit 1
+    case "$dns_ip" in 1.1.1.1) dns_default=1 ;; 8.8.8.8) dns_default=2 ;; 9.9.9.9) dns_default=3 ;; esac
+    read -r -p "  请选择 DNS [0-3，默认 ${dns_default}]: " dns_choice || exit 1
+    case "${dns_choice:-$dns_default}" in
+        0) dns_ip="" ;; 1) dns_ip=1.1.1.1 ;; 2) dns_ip=8.8.8.8 ;; 3) dns_ip=9.9.9.9 ;;
+        *) _error "无效 DNS 选项。"; exit 1 ;;
+    esac
+    work=$(mktemp -d "${RELAY_AUX_DIR}/.ruleset-download.XXXXXXXXXX") || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    trap 'exit 1' INT TERM HUP
+    _info "正在下载并校验二进制规则集..."
+    curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
+        --silent --show-error --output "$work/rules.srs" "$url" || { _error "规则集下载失败。"; exit 1; }
+    if ! "$SINGBOX_BIN" rule-set decompile --output "$work/rules.json" "$work/rules.srs" > "$work/check.log" 2>&1; then
+        _error "链接内容不是当前核心支持的二进制规则集。"
+        tail -n 8 "$work/check.log" >&2
+        exit 1
+    fi
+    id=$(openssl rand -hex 8) || exit 1
+    outbound=$(jq --arg tag "ruleset-out-$id" '.tag=$tag' <<< "$outbound") || exit 1
+    policy=$(jq -n --arg id "$id" --arg url "$url" --arg inbound "$inbound" --arg name "$node_name" \
+        --arg dns "$dns_ip" --argjson outbound "$outbound" \
+        '{id:$id,url:$url,inbound:$inbound,node_name:$name,dns_ip:$dns,outbound:$outbound}') || exit 1
+    _ruleset_change add "$policy" "$modern"
+)
+
+_ruleset_list() {
+    local policies
+    policies=$(jq -c '.__ruleset_routing.policies // []' "${RELAY_AUX_DIR}/relay_links.json") || return 1
+    jq -r 'to_entries[] | "    [\(.key + 1)] \(.value.node_name)\n      规则集: \(.value.url)\n      出口: \(.value.outbound.type) / \(.value.outbound.server):\(.value.outbound.server_port)\n      DNS: \(if .value.dns_ip == "" then "沿用当前 DNS" else "https://" + .value.dns_ip + "/dns-query" end)"' <<< "$policies"
+    [ "$(jq length <<< "$policies")" -gt 0 ] || echo "    暂无规则集分流。"
+}
+
+_ruleset_delete() {
+    local choice policy modern
+    _ruleset_list || return 1
+    read -r -p "  请输入要删除的序号（0 返回）: " choice || return 1
+    [ "${choice:-0}" != 0 ] || return 0
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] || { _error "无效序号。"; return 1; }
+    policy=$(jq -ce --argjson index "$choice" '.__ruleset_routing.policies[$index - 1] // empty' "${RELAY_AUX_DIR}/relay_links.json") || {
+        _error "无效序号。"; return 1;
+    }
+    modern=$(_ruleset_core_version) || return 1
+    _ruleset_change delete "$policy" "$modern"
+}
+
+_ruleset_menu() {
+    local choice
+    while true; do
+        echo -e "\n  ${CYAN}【按二进制规则集分流】${NC}"
+        echo "    [1] 添加规则集分流"
+        echo "    [2] 查看规则集分流"
+        echo "    [3] 删除规则集分流"
+        echo "    [0] 返回转发管理"
+        read -r -p "  请选择 [0-3]: " choice || return
+        case "$choice" in
+            1) _ruleset_add ;;
+            2) _ruleset_list ;;
+            3) _ruleset_delete ;;
+            0) return ;;
+            *) _error "无效选项。" ;;
+        esac
+    done
+}
+
 # --- 端口转发管理模块 (Port Forwarding) ---
 # 智能双引擎方案:
 #   引擎A (nftables DNAT): 内核级转发, TCP+UDP 全通, KVM/特权LXC 优先
@@ -4380,10 +4609,13 @@ _menu() {
         echo -e "  ${CYAN}【端口转发】${NC}"
         echo -e "    ${GREEN}[8]${NC} 端口转发管理"
         echo ""
+        echo -e "  ${CYAN}【规则集分流】${NC}"
+        echo -e "    ${GREEN}[9]${NC} 按二进制规则集 (.srs) 分流"
+        echo ""
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-8]: " choice
+        read -p "  请输入选项 [0-9]: " choice
         case $choice in
             1) _landing_config ;;
             2) _relay_config ;;
@@ -4397,6 +4629,7 @@ _menu() {
                fi ;;
             0) break ;;
             8) _port_forward_menu ;;
+            9) _ruleset_menu ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done

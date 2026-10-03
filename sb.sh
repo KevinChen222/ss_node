@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.28"
+export SCRIPT_VERSION="20-kevin.29"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -40,7 +40,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="b25cbbac3be920963a45df4854138a3da05e1c50731510d0d364b13573abcbae"
+ADVANCED_RELAY_SHA256="1fbb07ad1ffde1e3c982a67c30e8c97e6935cfda4acf407fc6f21d72b8064647"
 PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
@@ -7294,25 +7294,44 @@ _sync_node_relay_metadata() {
 }
 
 _remove_node_relay_references() {
-    local tag="$1" filter
-    filter=$(jq -nr --arg t "$tag" '$t | @json') || return 1
-    filter="def prune(\$t):
+    local tag="$1" filter key prune links_file removed remaining cache_before
+    key=$(jq -nr --arg t "$tag" '$t | @json') || return 1
+    prune="def prune(\$t):
         (if has(\"inbound\") then
             .inbound |= (if type == \"array\" then map(select(. != \$t))
                          elif . == \$t then [] else . end)
-            | select(.inbound != []) else . end)
+            | if .inbound == [] and .invert == true and .action == \"resolve\"
+                 and ((keys - [\"inbound\",\"invert\",\"action\",\"server\"]) | length) == 0
+              then del(.inbound,.invert) else select(.inbound != []) end else . end)
         | if (.rules? | type) == \"array\" then
             (.rules | length) as \$before | .rules |= map(prune(\$t))
             | select((.rules | length) > 0)
             | select(.mode != \"and\" or (.rules | length) == \$before)
-          else . end;
-        if (.route.rules? | type) == \"array\" then .route.rules |= map(prune($filter)) else . end"
+          else . end;"
+    filter="$prune if (.route.rules? | type) == \"array\" then .route.rules |= map(prune($key)) else . end"
     _atomic_modify_json "$CONFIG_FILE" "$filter" || return 1
     _atomic_modify_json "${NODE_RELAY_FILE:-${SINGBOX_DIR}/relay.json}" "$filter" || return 1
-    if [ -f "${NODE_RELAY_LINKS_FILE:-${SINGBOX_DIR}/relay_links.json}" ]; then
-        local key
-        key=$(jq -nr --arg t "$tag" '$t | @json') || return 1
-        _atomic_modify_json "${NODE_RELAY_LINKS_FILE:-${SINGBOX_DIR}/relay_links.json}" "del(.[$key])" || return 1
+    links_file="${NODE_RELAY_LINKS_FILE:-${SINGBOX_DIR}/relay_links.json}"
+    if [ -f "$links_file" ]; then
+        removed=$(jq -c --arg t "$tag" '[.__ruleset_routing.policies[]? | select(.inbound == $t) | .id]' "$(_node_candidate_path "$links_file")") || return 1
+        _atomic_modify_json "$links_file" "$prune del(.[$key])
+            | if .__ruleset_routing != null then
+                .__ruleset_routing.policies |= map(select(.inbound != $key))
+                | .__ruleset_routing.rules |= map(prune($key)) else . end" || return 1
+        if [ "$removed" != '[]' ]; then
+            remaining=$(jq '.__ruleset_routing.policies | length' "$(_node_candidate_path "$links_file")") || return 1
+            cache_before=$(jq -c '.__ruleset_routing.cache_file_before' "$(_node_candidate_path "$links_file")") || return 1
+            _atomic_modify_json "${NODE_RELAY_FILE:-${SINGBOX_DIR}/relay.json}" "
+                ($removed) as \$ids
+                | .outbounds |= map(.tag as \$t | select((\$ids | map(\"ruleset-out-\" + .) | index(\$t)) == null))
+                | .route.rule_set |= map(.tag as \$t | select((\$ids | map(\"ruleset-set-\" + .) | index(\$t)) == null))
+                | .dns.servers |= map(.tag as \$t | select((\$ids | map(\"ruleset-dns-\" + .) | index(\$t)) == null))
+                | if $remaining == 0 then
+                    .outbounds |= map(select(.tag != \"ruleset-direct\"))
+                    | if $cache_before == null then del(.experimental.cache_file)
+                      else .experimental.cache_file = $cache_before end
+                  else . end" || return 1
+        fi
     fi
 }
 
