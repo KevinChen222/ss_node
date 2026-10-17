@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.31"
+export SCRIPT_VERSION="20-kevin.32"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -2831,7 +2831,7 @@ _sni_router_cli_impl() {
 # 系统时间同步 (解决 TLS 握手 EOF 问题)
 _sync_system_time() {
     local force="${1:-false}"
-    local current_year sync_status=1
+    local current_year sync_status=1 sync_output http_time url attempt
     current_year=$(date +%Y 2>/dev/null)
 
     # 自动调用仅在时钟明显失真时介入；正常情况下不安装软件、不修改系统时间。
@@ -2841,21 +2841,61 @@ _sync_system_time() {
 
     _info "正在同步系统时间..."
     if command -v timedatectl &>/dev/null && [ "$INIT_SYSTEM" = "systemd" ]; then
-        timedatectl set-ntp true >/dev/null 2>&1 && sync_status=0
-    elif command -v ntpdate &>/dev/null; then
-        ntpdate -u pool.ntp.org >/dev/null 2>&1 && sync_status=0
-    elif command -v chronyd &>/dev/null; then
-        chronyd -q 'server pool.ntp.org iburst' >/dev/null 2>&1 && sync_status=0
-    else
-        # 无现成 NTP 工具时，使用 HTTPS Date 头兜底，但不会在后台安装额外软件。
-        local http_time
-        http_time=$(curl -fsSI --max-time 5 https://www.google.com 2>/dev/null | grep -i '^date:' | cut -f2- -d' ')
-        if [ -n "$http_time" ]; then
-            date -s "$http_time" >/dev/null 2>&1 && sync_status=0
+        if sync_output=$(timedatectl set-ntp true 2>&1); then
+            for attempt in 1 2 3 4 5; do
+                if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; then
+                    sync_status=0
+                    break
+                fi
+                [ "$attempt" = 5 ] || sleep 1
+            done
+            [ "$sync_status" = 0 ] || _warn "网络校时服务尚未确认同步完成，正在尝试其他校时方式。"
+        else
+            _warn "timedatectl：${sync_output:-无法启用网络校时服务}"
         fi
     fi
+
+    if [ "$sync_status" -ne 0 ] && command -v chronyc &>/dev/null; then
+        if sync_output=$(chronyc -m 'makestep 0.1 1' 'burst 1/2' 'waitsync 5 0.1 0 1' 2>&1); then
+            sync_status=0
+        else
+            _warn "chronyc：${sync_output:-未能完成时间同步}"
+        fi
+    fi
+    if [ "$sync_status" -ne 0 ] && command -v ntpdate &>/dev/null; then
+        if sync_output=$(ntpdate -u -t 5 pool.ntp.org 2>&1); then
+            sync_status=0
+        else
+            _warn "ntpdate：${sync_output:-未能完成时间同步}"
+        fi
+    fi
+    if [ "$sync_status" -ne 0 ] && command -v chronyd &>/dev/null; then
+        if sync_output=$(chronyd -q -t 10 'server pool.ntp.org iburst' 2>&1); then
+            sync_status=0
+        else
+            _warn "chronyd：${sync_output:-未能完成时间同步}"
+        fi
+    fi
+    if [ "$sync_status" -ne 0 ] && command -v curl &>/dev/null; then
+        for url in https://www.google.com https://www.cloudflare.com; do
+            if ! sync_output=$(curl -fsSI --max-time 5 "$url" 2>&1); then
+                _warn "获取 ${url} 时间失败：${sync_output}"
+                continue
+            fi
+            http_time=$(printf '%s\n' "$sync_output" | awk 'tolower($1) == "date:" {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}')
+            if [ -z "$http_time" ]; then
+                _warn "${url} 未返回 Date 时间。"
+                continue
+            fi
+            if sync_output=$(date -s "$http_time" 2>&1); then
+                sync_status=0
+                break
+            fi
+            _warn "设置系统时间失败：${sync_output}"
+        done
+    fi
     if [ "$sync_status" -ne 0 ]; then
-        _error "系统时间同步失败，请检查网络及时间同步服务。"
+        _error "系统时间同步失败，请检查校时服务、网络及系统时间修改权限。"
         return 1
     fi
     _info "当前时间：$(date)"

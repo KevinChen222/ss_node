@@ -9,7 +9,8 @@ trap 'rm -rf -- "$test_dir"' EXIT
 command() {
     if [ "${1:-}" = -v ]; then
         case "$2" in
-            timedatectl|ntpdate|chronyd) [ "$2" = "$test_backend" ]; return ;;
+            timedatectl|ntpdate|chronyd|chronyc|curl)
+                [[ " ${test_available:-$test_backend curl} " == *" $2 "* ]]; return ;;
             crontab) [ "$test_has_cron" = yes ]; return ;;
         esac
     fi
@@ -21,15 +22,38 @@ date() {
         +%Y) printf '2026\n' ;;
         '+%M %H') printf '07 08\n' ;;
         +%H:%M) printf '08:07\n' ;;
-        -s) printf 'date %s\n' "$2" >> "$test_calls"; return "$test_sync_status" ;;
+        -s)
+            printf 'date %s\n' "$2" >> "$test_calls"
+            [ "${test_date_status:-$test_sync_status}" = 0 ] || { echo 'date: Operation not permitted' >&2; return 1; }
+            ;;
         *) printf '2026-10-17 08:07:00\n' ;;
     esac
 }
 
-timedatectl() { printf 'timedatectl %s\n' "$*" >> "$test_calls"; return "$test_sync_status"; }
-ntpdate() { printf 'ntpdate %s\n' "$*" >> "$test_calls"; return "$test_sync_status"; }
-chronyd() { printf 'chronyd %s\n' "$*" >> "$test_calls"; return "$test_sync_status"; }
-curl() { printf 'date: Sat, 17 Oct 2026 08:07:00 GMT\r\n'; }
+timedatectl() {
+    printf 'timedatectl %s\n' "$*" >> "$test_calls"
+    if [ "$1" = show ]; then
+        if [ "${test_sync_after:-0}" -gt 0 ] && [ "$(grep -c '^timedatectl show' "$test_calls")" -ge "$test_sync_after" ]; then
+            echo yes
+        else
+            printf '%s\n' "${test_ntp_synced:-yes}"
+        fi
+        return 0
+    fi
+    [ "${test_timedatectl_status:-$test_sync_status}" = 0 ] || { echo 'Failed to set ntp: NTP not supported' >&2; return 1; }
+}
+ntpdate() { printf 'ntpdate %s\n' "$*" >> "$test_calls"; return "${test_ntpdate_status:-$test_sync_status}"; }
+chronyd() { printf 'chronyd %s\n' "$*" >> "$test_calls"; return "${test_chronyd_status:-$test_sync_status}"; }
+chronyc() { printf 'chronyc %s\n' "$*" >> "$test_calls"; return "${test_chronyc_status:-$test_sync_status}"; }
+sleep() { printf 'sleep %s\n' "$*" >> "$test_calls"; }
+curl() {
+    printf 'curl %s\n' "$*" >> "$test_calls"
+    if [ "${test_curl_status:-0}" != 0 ] || [ "${test_http_fail_url:-}" = "${@: -1}" ]; then
+        echo 'curl: Failed to connect' >&2
+        return 1
+    fi
+    printf '%s\r\n' "${test_http_header-date: Sat, 17 Oct 2026 08:07:00 GMT}"
+}
 crontab() {
     case "$1" in
         -l) [ -f "$test_cron" ] && cat "$test_cron" ;;
@@ -46,7 +70,7 @@ assert_empty() { [ ! -s "$1" ]; }
 
 test_accept() {
     _sync_system_time_interactive <<< y
-    assert_contains "$test_calls" 'ntpdate -u pool.ntp.org'
+    assert_contains "$test_calls" 'ntpdate -u -t 5 pool.ntp.org'
     assert_contains "$test_cron" '07 08 * * * bash '
     assert_contains "$test_cron" ' sync-time >/dev/null 2>&1 # sing-box-time-sync'
 }
@@ -129,7 +153,7 @@ test_cli() {
         eval "$(sed -n '/^if \[\[ "\${BASH_SOURCE\[0\]}" == "\$0" \]\]; then/,$p' "$repo_dir/sb.sh")"
     ) < /dev/null
     assert_contains "$test_calls" 'root-check'
-    assert_contains "$test_calls" 'ntpdate -u pool.ntp.org'
+    assert_contains "$test_calls" 'ntpdate -u -t 5 pool.ntp.org'
     assert_empty "$test_cron"
 }
 
@@ -145,7 +169,96 @@ test_script_path() {
     eval "$job"
 }
 
-for test_name in accept decline replace_and_preserve sync_failure missing_cron cron_failure remove backends automatic_sync cli script_path; do
+test_systemd_failure_ntpdate() {
+    test_available='timedatectl ntpdate curl'
+    test_timedatectl_status=1
+    _sync_system_time_interactive <<< y
+    assert_contains "$test_calls" 'ntpdate -u -t 5 pool.ntp.org'
+    assert_contains "$test_cron" '# sing-box-time-sync'
+    ! grep -q '^curl ' "$test_calls"
+}
+
+test_systemd_failure_https() {
+    test_available='timedatectl curl'
+    test_timedatectl_status=1
+    _sync_system_time_interactive <<< y
+    assert_contains "$test_calls" 'date Sat, 17 Oct 2026 08:07:00 GMT'
+    assert_contains "$test_cron" '# sing-box-time-sync'
+}
+
+test_systemd_unconfirmed() {
+    test_available='timedatectl curl'
+    test_ntp_synced=no
+    _sync_system_time true
+    assert_contains "$test_calls" 'timedatectl show'
+    assert_contains "$test_calls" 'date Sat, 17 Oct 2026 08:07:00 GMT'
+}
+
+test_systemd_delayed_confirmation() {
+    test_backend=timedatectl
+    test_ntp_synced=no
+    test_sync_after=2
+    _sync_system_time true
+    [ "$(grep -c '^timedatectl show' "$test_calls")" = 2 ]
+    ! grep -q '^curl ' "$test_calls"
+}
+
+test_ntpdate_failure_chronyd() {
+    test_available='ntpdate chronyd curl'
+    test_ntpdate_status=1
+    _sync_system_time true
+    assert_contains "$test_calls" "chronyd -q -t 10 server pool.ntp.org iburst"
+    ! grep -q '^curl ' "$test_calls"
+}
+
+test_chrony_daemon() {
+    test_available='chronyc chronyd curl'
+    _sync_system_time true
+    assert_contains "$test_calls" 'chronyc -m makestep 0.1 1 burst 1/2 waitsync 5 0.1 0 1'
+    ! grep -q '^chronyd\|^curl ' "$test_calls"
+}
+
+test_chronyc_failure_chronyd() {
+    test_available='chronyc chronyd curl'
+    test_chronyc_status=1
+    _sync_system_time true
+    assert_contains "$test_calls" 'chronyd -q -t 10'
+}
+
+test_https_provider_fallback() {
+    test_backend=https
+    test_http_fail_url=https://www.google.com
+    _sync_system_time true
+    assert_contains "$test_calls" 'https://www.cloudflare.com'
+    assert_contains "$test_calls" 'date Sat, 17 Oct 2026 08:07:00 GMT'
+}
+
+test_https_missing_date() {
+    test_backend=https
+    test_http_header='HTTP/2 200'
+    if _sync_system_time true; then return 1; fi
+    ! grep -q '^date ' "$test_calls"
+}
+
+test_https_network_failure() {
+    test_backend=https
+    test_curl_status=1
+    if _sync_system_time true; then return 1; fi
+    ! grep -q '^date ' "$test_calls"
+}
+
+test_failure_diagnostics() {
+    test_available='timedatectl curl'
+    test_timedatectl_status=1
+    test_date_status=1
+    if _sync_system_time_interactive <<< y > "$test_dir/diagnostics" 2>&1; then return 1; fi
+    assert_contains "$test_dir/diagnostics" 'NTP not supported'
+    assert_contains "$test_dir/diagnostics" 'Operation not permitted'
+    assert_empty "$test_cron"
+}
+
+for test_name in accept decline replace_and_preserve sync_failure missing_cron cron_failure remove backends automatic_sync cli script_path systemd_failure_ntpdate systemd_failure_https systemd_unconfirmed systemd_delayed_confirmation ntpdate_failure_chronyd chrony_daemon chronyc_failure_chronyd https_provider_fallback https_missing_date https_network_failure failure_diagnostics; do
+    [ -z "${TIME_SYNC_TEST_FILTER:-}" ] || [ "$test_name" = "$TIME_SYNC_TEST_FILTER" ] || continue
     (
         test_backend=ntpdate
         test_has_cron=yes

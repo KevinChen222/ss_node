@@ -1,5 +1,14 @@
 # 修改記錄
 
+## 2026-10-17 — 校時回退修復
+
+版本：`proxyall 1.7.12`、`sb.sh 20-kevin.32`。
+
+- `sb.sh`：修復 systemd 環境中 `timedatectl` 失敗便直接結束校時的問題；啟用服務後限次確認 `NTPSynchronized`。
+- 校時失敗依序嘗試現有 chrony 服務、ntpdate、限時單次 chronyd，再以 Google／Cloudflare HTTPS Date 校時；不安裝額外軟體。
+- 保留各校時方式的錯誤訊息，能辨識缺少 NTP 服務、網路失敗和系統時間修改權限不足；成功後才詢問每日任務。
+- `tests/time_sync.sh` 擴充至 22 項模擬測試且全部通過，涵蓋 NTP 不支援、服務未確認同步、chrony 服務、HTTPS 來源切換、缺少 Date 及權限失敗；語法、套件 SHA-256 與差異檢查通過。未連線操作使用者的 VPS。
+
 ## 2026-10-17
 
 版本：`proxyall 1.7.11`、`sb.sh 20-kevin.31`、`advanced_relay.sh 16-kevin.13`。
