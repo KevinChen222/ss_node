@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.29"
+export SCRIPT_VERSION="20-kevin.31"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -40,8 +40,8 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="1fbb07ad1ffde1e3c982a67c30e8c97e6935cfda4acf407fc6f21d72b8064647"
-PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
+ADVANCED_RELAY_SHA256="1c1f8a068cfaaa34f892a804252add70ed22a9a4e389d63358458f7f2c0113d5"
+PARSER_SHA256="63111d152bce7733370a808c9a2a21e4473c30a692cb9704b260299342d97456"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -2831,7 +2831,7 @@ _sni_router_cli_impl() {
 # 系统时间同步 (解决 TLS 握手 EOF 问题)
 _sync_system_time() {
     local force="${1:-false}"
-    local current_year
+    local current_year sync_status=1
     current_year=$(date +%Y 2>/dev/null)
 
     # 自动调用仅在时钟明显失真时介入；正常情况下不安装软件、不修改系统时间。
@@ -2841,20 +2841,62 @@ _sync_system_time() {
 
     _info "正在同步系统时间..."
     if command -v timedatectl &>/dev/null && [ "$INIT_SYSTEM" = "systemd" ]; then
-        timedatectl set-ntp true >/dev/null 2>&1 || true
+        timedatectl set-ntp true >/dev/null 2>&1 && sync_status=0
     elif command -v ntpdate &>/dev/null; then
-        ntpdate -u pool.ntp.org >/dev/null 2>&1 || true
+        ntpdate -u pool.ntp.org >/dev/null 2>&1 && sync_status=0
     elif command -v chronyd &>/dev/null; then
-        chronyd -q 'server pool.ntp.org iburst' >/dev/null 2>&1 || true
+        chronyd -q 'server pool.ntp.org iburst' >/dev/null 2>&1 && sync_status=0
     else
         # 无现成 NTP 工具时，使用 HTTPS Date 头兜底，但不会在后台安装额外软件。
         local http_time
         http_time=$(curl -fsSI --max-time 5 https://www.google.com 2>/dev/null | grep -i '^date:' | cut -f2- -d' ')
         if [ -n "$http_time" ]; then
-            date -s "$http_time" >/dev/null 2>&1 || true
+            date -s "$http_time" >/dev/null 2>&1 && sync_status=0
         fi
     fi
+    if [ "$sync_status" -ne 0 ]; then
+        _error "系统时间同步失败，请检查网络及时间同步服务。"
+        return 1
+    fi
     _info "当前时间：$(date)"
+}
+
+_setup_time_sync() {
+    command -v crontab >/dev/null 2>&1 || {
+        _warning "未找到 crontab，无法设置定时同步系统时间。"
+        return 1
+    }
+
+    local tag="# sing-box-time-sync"
+    local schedule script_path job current
+    schedule=$(date '+%M %H') || return 1
+    printf -v script_path '%q' "$SELF_SCRIPT_PATH"
+    script_path=${script_path//%/\\%}
+    job="${schedule} * * * bash ${script_path} sync-time >/dev/null 2>&1 ${tag}"
+    current=$(crontab -l 2>/dev/null || true)
+    if ! { printf '%s\n' "$current" | awk -v tag="$tag" 'index($0, tag) == 0'; printf '%s\n' "$job"; } | crontab -; then
+        _error "定时同步系统时间任务写入失败。"
+        return 1
+    fi
+    _success "定时同步系统时间已设置，每天 $(date '+%H:%M')（服务器本地时间）执行一次。"
+}
+
+_remove_time_sync() {
+    local tag="# sing-box-time-sync" current
+    command -v crontab >/dev/null 2>&1 || return 0
+    current=$(crontab -l 2>/dev/null || true)
+    if printf '%s\n' "$current" | grep -Fq "$tag"; then
+        printf '%s\n' "$current" | awk -v tag="$tag" 'index($0, tag) == 0' | crontab -
+    fi
+}
+
+_sync_system_time_interactive() {
+    _sync_system_time true || return 1
+    local answer
+    read -r -p "是否添加每 24 小时同步一次系统时间的定时任务？[y/N]: " answer || return 0
+    case "$answer" in
+        y|Y|yes|YES|Yes) _setup_time_sync ;;
+    esac
 }
 
 # Clash YAML 节点管理
@@ -4696,6 +4738,7 @@ _uninstall_locked() {
     # 3. 清理配置与日志
     _info "正在清理配置文件与日志..."
     _remove_log_cleanup
+    _remove_time_sync
     # 清理脚本创建的 nftables 规则
     local pf_meta="${SINGBOX_DIR}/relay_pf.json"
     [ ! -f "$pf_meta" ] && pf_meta="${SINGBOX_DIR}/pf_metadata.json"
@@ -8558,7 +8601,7 @@ _main_menu() {
             8) _require_singbox && _manage_service "status" ;;
             9) _require_singbox && _view_log ;;
             10) _require_singbox && _scheduled_restart_menu ;;
-            11) _sync_system_time true ;;
+            11) _sync_system_time_interactive ;;
             12) _require_singbox && _check_config ;;
             13) _update_script ;;
             14) _require_singbox && _dns_config_menu ;;
@@ -9172,6 +9215,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     # 解析命令行参数；直接执行 sb 时保持原有交互入口。
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            sync-time)
+                _check_root
+                _sync_system_time true
+                exit $?
+                ;;
             sni-router)
                 _check_root
                 shift

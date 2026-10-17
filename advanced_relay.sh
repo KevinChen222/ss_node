@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.12"
+SCRIPT_VERSION="16-kevin.13"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -39,7 +39,7 @@ REALITY_LOCAL_ORIGIN_PORT=8443
 SNI_ROUTER_API_VERSION=1
 SNI_ROUTER_PUBLIC_PORT=443
 SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
-PARSER_SHA256="b027bee53ca0809bb075c9467ecb1bfe0f8775b8dfb57e22a73f959d85210805"
+PARSER_SHA256="63111d152bce7733370a808c9a2a21e4473c30a692cb9704b260299342d97456"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -1293,11 +1293,11 @@ _remove_node_from_relay_yaml() {
     # 使用本地定义的全局 YQ_BINARY
     
     if [ ! -f "$YQ_BINARY" ]; then
-        return
+        return 0
     fi
     
     if [ ! -f "$RELAY_CLASH_YAML" ]; then
-        return
+        return 0
     fi
     
     # 删除节点 - 使用环境变量避免特殊字符问题
@@ -1316,7 +1316,7 @@ _clear_created_relay_yaml_nodes() {
 
     local proxy_name
     while IFS= read -r proxy_name; do
-        [ -n "$proxy_name" ] && _remove_node_from_relay_yaml "$proxy_name"
+        [ -z "$proxy_name" ] || _remove_node_from_relay_yaml "$proxy_name" || return 1
     done < <(jq -r 'to_entries[] | select((.value | type) == "object") | select((.value.reuse_existing // false) != true) | .value.node_name // empty' "$links_file" 2>/dev/null)
 }
 
@@ -2472,6 +2472,69 @@ _view_relays() {
     read -p "  按回车键继续..."
 }
 
+# 中转配置、链接、YAML、nftables 与共享入口的操作事务。
+_relay_run_transaction() (
+    local work file i rc restore_failed=false
+    local RELAY_TX_DIRTY=false RELAY_TX_NFT_CHANGED=false RELAY_TX_ROUTER_REMOVED=""
+    local files=("$MAIN_CONFIG_FILE" "$RELAY_CONFIG_FILE" "${RELAY_AUX_DIR}/relay_links.json" "$RELAY_CLASH_YAML" "$NFT_PERSIST_FILE")
+    local names=(main relay links yaml nft-persist)
+    work=$(mktemp -d "${RELAY_AUX_DIR}/.relay-txn.XXXXXXXXXX") || exit 1
+    _relay_finish_transaction() {
+        rc=$?
+        trap - EXIT
+        if [ "$rc" -ne 0 ] && [ "$RELAY_TX_DIRTY" = true ]; then
+            for i in "${!files[@]}"; do
+                file="${files[$i]}"
+                if [ -f "$work/${names[$i]}.exists" ]; then
+                    cp -p "$work/${names[$i]}.before" "$file" || restore_failed=true
+                else
+                    rm -f -- "$file" || restore_failed=true
+                fi
+            done
+            if [ "$RELAY_TX_NFT_CHANGED" = true ]; then
+                if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+                    nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || restore_failed=true
+                fi
+                if [ -s "$work/nft.before" ]; then
+                    nft -f "$work/nft.before" >/dev/null 2>&1 || restore_failed=true
+                fi
+            fi
+            if [ -n "$RELAY_TX_ROUTER_REMOVED" ]; then
+                local router_sni router_backend
+                router_sni=$(jq -r --arg t "$RELAY_TX_ROUTER_REMOVED" '.inbounds[] | select(.tag == $t) | .tls.server_name' "$work/relay.before")
+                router_backend=$(jq -r --arg t "$RELAY_TX_ROUTER_REMOVED" '.[$t].backend_port' "$work/links.before")
+                _sni_router_call register-reality advanced-relay "$RELAY_TX_ROUTER_REMOVED" "$router_sni" "$router_backend" >/dev/null 2>&1 || restore_failed=true
+            fi
+            if [ "$restore_failed" = true ]; then
+                _error "恢复配置失败，备份保留在 $work。"
+                exit 1
+            fi
+            if [ -f "$work/service.active" ]; then
+                _validate_merged_config && _manage_service restart >/dev/null 2>&1 || _error "配置已恢复，但服务重启失败，请检查服务日志。"
+            else
+                _manage_service stop >/dev/null 2>&1 || _error "配置已恢复，但服务停止失败，请检查服务日志。"
+            fi
+            _error "中转操作失败，已恢复原配置。"
+        fi
+        rm -rf -- "$work"
+        exit "$rc"
+    }
+    trap _relay_finish_transaction EXIT
+    trap 'exit 1' INT TERM HUP
+    for i in "${!files[@]}"; do
+        file="${files[$i]}"
+        if [ -f "$file" ]; then
+            cp -p "$file" "$work/${names[$i]}.before" || exit 1
+            : > "$work/${names[$i]}.exists"
+        fi
+    done
+    if command -v nft >/dev/null 2>&1; then
+        nft list table inet "$NFT_TABLE" > "$work/nft.before" 2>/dev/null || true
+    fi
+    _pf_service_is_active && : > "$work/service.active"
+    "$@"
+)
+
 # --- 4. 删除中转路由 ---
 _clear_all_relays_locked() {
     local links_file="${RELAY_AUX_DIR}/relay_links.json"
@@ -2487,7 +2550,28 @@ _clear_all_relays_locked() {
     ' "$MAIN_CONFIG_FILE" > "$main_tmp"; then
         rm -f "$relay_tmp" "$links_tmp" "$main_tmp"; return 1
     fi
-    printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$relay_tmp"
+    local relay_source="$RELAY_CONFIG_FILE"
+    if jq -e '.__ruleset_routing != null' "$links_file" >/dev/null; then
+        if ! _ruleset_render "$RELAY_CONFIG_FILE" "$links_file" clear '{}' "$relay_tmp.rendered" "$links_tmp" true; then
+            rm -f "$relay_tmp" "$links_tmp" "$main_tmp" "$relay_tmp.rendered" "$links_tmp.main" "$links_tmp.config"
+            return 1
+        fi
+        mv "$links_tmp.main" "$main_tmp" || return 1
+        relay_source="$links_tmp.config"
+    fi
+    if ! jq --slurpfile links "$links_file" '
+        [.route.rules[]? | select((.outbound // "") | startswith("relay-out-"))] as $owned
+        | ([$owned[].inbound | if type == "array" then .[] else . end]
+           + [$links[0] | keys[] | select(startswith("__") | not)]) as $inbounds
+        | [$owned[].outbound] as $outbounds
+        | .inbounds = [.inbounds[]? | select(.tag as $t | ($inbounds | index($t)) == null)]
+        | .outbounds = [.outbounds[]? | select(.tag as $t | ($outbounds | index($t)) == null)]
+        | .route.rules = [.route.rules[]? | select(. as $r | ($owned | index($r)) == null)]
+    ' "$relay_source" > "$relay_tmp"; then
+        rm -f "$relay_tmp" "$links_tmp" "$main_tmp" "$relay_tmp.rendered" "$links_tmp.config"
+        return 1
+    fi
+    rm -f "$relay_tmp.rendered" "$links_tmp.config"
     printf '%s\n' '{}' > "$links_tmp"
     if ! "$SINGBOX_BIN" check -c "$main_tmp" -c "$relay_tmp" >/dev/null 2>&1; then
         _error "清空后的配置未通过 sing-box 校验，原配置未修改。"
@@ -2495,6 +2579,7 @@ _clear_all_relays_locked() {
         return 1
     fi
 
+    RELAY_TX_DIRTY=true
     router_tag=$(jq -r 'to_entries[]? | select(.value.fronted_by == "haproxy" and .value.router_role == "reality-default") | .key' "$links_file" 2>/dev/null | head -n 1)
     if [ -n "$router_tag" ]; then
         _sni_router_call remove-reality "$router_tag" || {
@@ -2502,22 +2587,24 @@ _clear_all_relays_locked() {
             rm -f "$relay_tmp" "$links_tmp" "$main_tmp"
             return 1
         }
+        RELAY_TX_ROUTER_REMOVED="$router_tag"
     fi
 
     if [ -f "$links_file" ]; then
-        jq -r 'to_entries[]? | select(.value.port_hopping) | "\(.key)|\(.value.port_hopping)"' "$links_file" 2>/dev/null | \
-            while IFS="|" read -r ptag hop; do
-                local psuffix hstart hend
-                psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
-                hstart="${hop%-*}"
-                hend="${hop#*-}"
-                _nft_apply_redirect_rule delete "$hstart" "$hend" "$psuffix" "singboxlite-relay-hop-${ptag}"
-            done
-        _save_nftables_rules 2>/dev/null || true
+        local ptag hop
+        while IFS="|" read -r ptag hop; do
+            local psuffix hstart hend
+            psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
+            hstart="${hop%-*}"
+            hend="${hop#*-}"
+            RELAY_TX_NFT_CHANGED=true
+            _nft_apply_redirect_rule delete "$hstart" "$hend" "$psuffix" "singboxlite-relay-hop-${ptag}" || return 1
+        done < <(jq -r 'to_entries[]? | select(.value.port_hopping) | "\(.key)|\(.value.port_hopping)"' "$links_file")
+        if [ "$RELAY_TX_NFT_CHANGED" = true ]; then _save_nftables_rules || return 1; fi
     fi
 
     # 元数据仍在时先清理脚本创建的 YAML 节点和证书；复用的 sb.sh 节点会保留。
-    _clear_created_relay_yaml_nodes
+    _clear_created_relay_yaml_nodes || return 1
     _clear_created_relay_certificates
     mv "$main_tmp" "$MAIN_CONFIG_FILE" || { rm -f "$relay_tmp" "$links_tmp" "$main_tmp"; return 1; }
     mv "$relay_tmp" "$RELAY_CONFIG_FILE" || { rm -f "$relay_tmp" "$links_tmp"; return 1; }
@@ -2525,9 +2612,10 @@ _clear_all_relays_locked() {
     chmod 600 "$RELAY_CONFIG_FILE" "$links_file" 2>/dev/null || true
 
     if ! _manage_service restart; then
-        _error "中转配置已清空，但 sing-box 重启失败；请检查主配置和服务日志。"
+        _error "sing-box 重启失败，请检查服务日志。"
         return 1
     fi
+    RELAY_TX_DIRTY=false
     _success "全部中转已清空，HAProxy 与 nftables 关联也已解除。"
 }
 
@@ -2603,6 +2691,7 @@ _delete_relay_locked() {
     local out_tag=$(echo "$selected_rule" | jq -r '.outbound')
     local reuse_existing="false"
     [ -f "$LINKS_FILE" ] && reuse_existing=$(jq -r --arg t "$in_tag" '.[$t].reuse_existing // false' "$LINKS_FILE" 2>/dev/null)
+    RELAY_TX_DIRTY=true
     if [ "$reuse_existing" != true ] && jq -e --arg t "$in_tag" 'any(.__ruleset_routing.policies[]?; .inbound == $t)' "$LINKS_FILE" >/dev/null; then
         local ruleset_policy ruleset_modern
         ruleset_policy=$(jq -n --arg tag "$in_tag" '{id:$tag,inbound:$tag}') || return 1
@@ -2611,11 +2700,6 @@ _delete_relay_locked() {
     fi
     local fronted_by=""
     [ -f "$LINKS_FILE" ] && fronted_by=$(jq -r --arg t "$in_tag" '.[$t].fronted_by // empty' "$LINKS_FILE" 2>/dev/null)
-    local router_sni="" router_backend=""
-    if [ "$fronted_by" = "haproxy" ]; then
-        router_sni=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .tls.server_name // empty' "$CONFIG_FILE")
-        router_backend=$(jq -r --arg t "$in_tag" '.[$t].backend_port // empty' "$LINKS_FILE")
-    fi
     
     _info "正在删除中转链路: $in_tag -> $out_tag ..."
     if [ "$fronted_by" = "haproxy" ]; then
@@ -2623,36 +2707,33 @@ _delete_relay_locked() {
             _error "无法注销 HAProxy Reality 后端，中转未删除。"
             return 1
         }
+        RELAY_TX_ROUTER_REMOVED="$in_tag"
     fi
     if ! _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$in_tag\")) | del(.outbounds[] | select(.tag == \"$out_tag\")) | del(.route.rules[] | select(.inbound == \"$in_tag\"))"; then
-        [ "$fronted_by" = "haproxy" ] && _sni_router_call register-reality advanced-relay "$in_tag" "$router_sni" "$router_backend" >/dev/null 2>&1 || true
         return 1
     fi
     
-    # 彻底同步清理：如果还有该端口的残留 outbound (防止手动操作产生垃圾)
     local port_suffix=$(echo "$in_tag" | grep -oE "[0-9]+$")
-    if [ -n "$port_suffix" ]; then
-        _atomic_modify_json "$CONFIG_FILE" "del(.outbounds[] | select(.tag == \"relay-out-$port_suffix\"))" 2>/dev/null
-    fi
     
     if [ -f "$LINKS_FILE" ]; then
         local node_name_yaml=$(jq -r --arg t "$in_tag" '.[$t].node_name // empty' "$LINKS_FILE")
         local port_hopping=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE")
         
         if [ "$reuse_existing" != "true" ] && [ -n "$node_name_yaml" ]; then
-            _remove_node_from_relay_yaml "$node_name_yaml"
+            _remove_node_from_relay_yaml "$node_name_yaml" || return 1
         fi
         
         # 将端口跳跃相关的 nftables 规则彻底卸载脱勾
         if [ -n "$port_hopping" ]; then
             local hop_start="${port_hopping%-*}"
             local hop_end="${port_hopping#*-}"
-            _nft_apply_redirect_rule delete "$hop_start" "$hop_end" "$port_suffix" "singboxlite-relay-hop-${in_tag}"
-            _save_nftables_rules 2>/dev/null
+            RELAY_TX_NFT_CHANGED=true
+            _nft_apply_redirect_rule delete "$hop_start" "$hop_end" "$port_suffix" "singboxlite-relay-hop-${in_tag}" || return 1
+            _save_nftables_rules || return 1
             _info "已卸载绑定的 nftables UDP 端口跳跃范围转发规则 (${port_hopping})"
         fi
         
-        _atomic_modify_json "$LINKS_FILE" "del(.\""$in_tag"\")"
+        _atomic_modify_json "$LINKS_FILE" "del(.\""$in_tag"\")" || return 1
     fi
     
     # 复用节点的证书属于 sb.sh 主配置，解除中转时必须保留。
@@ -2664,9 +2745,11 @@ _delete_relay_locked() {
         fi
     fi
     
+    _validate_merged_config && _manage_service restart || return 1
+    RELAY_TX_DIRTY=false
     _success "已移除中转链路 [$in_tag]。"
     [ "$reuse_existing" == "true" ] && _info "复用的 sb.sh 本机节点已保留，仅解除其出口绑定。"
-    _manage_service restart
+    return 0
 }
 
 # --- 5. 修改中转路由端口 (功能恢复) ---
@@ -2732,20 +2815,31 @@ _modify_relay_port_locked() {
     fi
     local current_hop_info=""
     [ -f "$LINKS_FILE" ] && current_hop_info=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE" 2>/dev/null)
+    local new_port listen_protocol=tcp
+    case "$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .type' "$CONFIG_FILE")" in
+        hysteria2|tuic) listen_protocol=udp ;;
+    esac
     
     while true; do
-        read -p "  请输入新的端口号: " new_port
-        if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        read -r -p "  请输入新的端口号: " new_port || return 0
+        if [[ ! "$new_port" =~ ^[0-9]{1,5}$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
              _error "无效端口"; continue
         fi
+        new_port=$((10#$new_port))
+        [ "$new_port" != "$old_port" ] || return 0
         
-        if _check_port_occupied "$new_port"; then
-             _error "端口 $new_port 已被系统占用，请重试！"
+        if _check_port_occupied "$new_port" "$listen_protocol"; then
+             _error "端口 ${new_port}/${listen_protocol} 已被系统占用，请重试！"
              continue
         fi
 
-        if [ -n "$current_hop_info" ]; then
-            local hop_conflict
+        if [ "$listen_protocol" = udp ]; then
+            local hop_conflict pf_conflict
+            pf_conflict=$(_find_pf_udp_conflict_in_range "$new_port" "$new_port")
+            if [ -n "$pf_conflict" ]; then
+                _error "UDP 端口 ${new_port} 已用于端口转发，请换端口。"
+                continue
+            fi
             hop_conflict=$(_pf_find_hy2_hop_conflict "$new_port")
             if [ -n "$hop_conflict" ]; then
                 local c_tag c_name c_range c_mode
@@ -2761,75 +2855,55 @@ _modify_relay_port_locked() {
     done
     
     _info "正在修改端口..."
-    _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)"
+    RELAY_TX_DIRTY=true
+    _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = $new_port" || return 1
     
-    # [修复] 3. 同步更新 relay_links.json 中的链接端口与节点说明
     local old_node_name=""
     local new_node_name=""
     if [ -f "$LINKS_FILE" ]; then
         if jq -e ".\"$in_tag\"" "$LINKS_FILE" >/dev/null 2>&1; then
             old_node_name=$(jq -r ".\"$in_tag\".node_name // \"\"" "$LINKS_FILE")
             local current_link=$(jq -r ".\"$in_tag\".link // \"\"" "$LINKS_FILE")
-            
-            # 生成新节点说明名字 (替换端口数字)
             new_node_name="${old_node_name//$old_port/$new_port}"
-            
-            # 1. 链接备注与端口同步
+            local new_link="$current_link" links_tmp
             if [ -n "$current_link" ]; then
-                local new_link=$(echo "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g")
-                _atomic_modify_json "$LINKS_FILE" ".\"$in_tag\".link = \"$new_link\""
+                new_link=$(printf '%s\n' "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g")
             fi
-            
-            # 2. 节点说明同步
-            if [ -n "$new_node_name" ]; then
-                _atomic_modify_json "$LINKS_FILE" ".\"$in_tag\".node_name = \"$new_node_name\""
+            links_tmp=$(mktemp "${LINKS_FILE}.XXXXXXXXXX") || return 1
+            if ! jq --arg tag "$in_tag" --arg link "$new_link" --arg name "$new_node_name" --argjson port "$new_port" '
+                .[$tag].public_port = $port | .[$tag].backend_port = $port
+                | .[$tag].link = $link | .[$tag].node_name = $name
+            ' "$LINKS_FILE" > "$links_tmp" || ! mv "$links_tmp" "$LINKS_FILE"; then
+                rm -f "$links_tmp"
+                return 1
             fi
         fi
     fi
     
-    _info "端口修改已提交，链接元数据已同步更新。"
-    
-    # 4. 同步更新 YAML 配置文件中的节点名与端口
-    local YQ_BINARY="/usr/local/bin/yq"
     if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ] && [ -n "$old_node_name" ]; then
         _info "正在同步更新 YAML 节点全链路信息..."
         export OLD_RELAY_NAME="$old_node_name"
         export NEW_RELAY_NAME="$new_node_name"
         export NEW_RELAY_PORT="$new_port"
         
-        # 1. 改名
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(OLD_RELAY_NAME)) | .name) = env(NEW_RELAY_NAME)'
-        # 2. 改端口
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)'
-        # 3. 更新所有分组中的引用
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)'
-        
-        _success "YAML 节点名同步完成: ${old_node_name} -> ${new_node_name}"
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(OLD_RELAY_NAME)) | .name) = env(NEW_RELAY_NAME)' || return 1
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' || return 1
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)' || return 1
     fi
 
-    # 联动更新端口跳跃的 nftables 映射规则 (否则跳跃流量仍被转发到旧端口)
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    if [ -f "$LINKS_FILE" ]; then
-        local hop_info=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE" 2>/dev/null)
-        if [ -n "$hop_info" ]; then
-            local hop_start="${hop_info%-*}"
-            local hop_end="${hop_info#*-}"
-            if _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$new_port" "singboxlite-relay-hop-${in_tag}"; then
-                _save_nftables_rules
-                _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}"
-            else
-                _warn "nftables 端口跳跃映射更新失败，请检查当前容器 netfilter 权限。"
-            fi
-        fi
+    if [ -n "$current_hop_info" ]; then
+        local hop_start="${current_hop_info%-*}" hop_end="${current_hop_info#*-}"
+        RELAY_TX_NFT_CHANGED=true
+        _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$new_port" "singboxlite-relay-hop-${in_tag}" || return 1
+        _save_nftables_rules || return 1
     fi
 
-    # 记录操作
+    _validate_merged_config && _manage_service restart || return 1
+    RELAY_TX_DIRTY=false
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
-
-    _manage_service restart
-    _save_nftables_rules
     _success "服务已重启"
-    read -p "  按回车键继续..."
+    read -r -p "  按回车键继续..." || true
+    return 0
 }
 
 
@@ -2841,7 +2915,8 @@ _ruleset_render() {
     jq --slurpfile links "$links_file" --slurpfile main "$MAIN_CONFIG_FILE" --arg op "$operation" --argjson policy "$policy" \
         --arg dir "$SINGBOX_DIR" --argjson modern "$version" '
         ($links[0].__ruleset_routing // {policies:[],rules:[],cache_file_before:.experimental.cache_file}) as $old
-        | (if $op == "add" then [$policy] + $old.policies
+        | (if $op == "clear" then []
+           elif $op == "add" then [$policy] + $old.policies
            elif $op == "delete-inbound" then [$old.policies[] | select(.inbound != $policy.inbound)]
            else [$old.policies[] | select(.id != $policy.id)] end) as $policies
         | ($policies | group_by(.inbound) | sort_by(.[0].inbound == "")) as $scopes
@@ -4507,9 +4582,9 @@ _pf_switch_engine_locked() { _pf_run_locked _pf_switch_engine_impl; }
 _landing_config() ( _config_write_lock || exit 1; _landing_config_locked; )
 _relay_config() ( _config_write_lock || exit 1; _relay_config_locked; )
 _import_link_config() ( _config_write_lock || exit 1; _import_link_config_locked; )
-_delete_relay() ( _config_write_lock || exit 1; _delete_relay_locked; )
-_modify_relay_port() ( _config_write_lock || exit 1; _modify_relay_port_locked; )
-_clear_all_relays() ( _config_write_lock || exit 1; _clear_all_relays_locked; )
+_delete_relay() ( _config_write_lock || exit 1; _relay_run_transaction _delete_relay_locked; )
+_modify_relay_port() ( _config_write_lock || exit 1; _relay_run_transaction _modify_relay_port_locked; )
+_clear_all_relays() ( _config_write_lock || exit 1; _relay_run_transaction _clear_all_relays_locked; )
 _pf_add() ( _config_write_lock || exit 1; _pf_add_locked; )
 _pf_modify() ( _config_write_lock || exit 1; _pf_modify_locked; )
 _pf_delete() ( _config_write_lock || exit 1; _pf_delete_locked; )

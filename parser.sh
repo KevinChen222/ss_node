@@ -393,6 +393,7 @@ _normalize_outbound() {
     if jq -e '.tls.enabled == true and (.tls.reality.enabled != true)' <<< "$outbound" >/dev/null; then
         value=$(_get_param "$params" insecure)
         [ -n "$value" ] || value=$(_get_param "$params" allowInsecure)
+        [ -n "$value" ] || value=$(_get_param "$params" allow_insecure)
         [ -n "$value" ] || value=$(_get_param "$params" skip-cert-verify)
         case "$value" in 1|true) value=true ;; *) value=false ;; esac
         outbound=$(jq --argjson insecure "$value" '.tls.insecure=$insecure' <<< "$outbound") || return 1
