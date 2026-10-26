@@ -47,6 +47,24 @@ timedatectl() {
 ntpdate() { printf 'ntpdate %s\n' "$*" >> "$test_calls"; return "${test_ntpdate_status:-$test_sync_status}"; }
 chronyd() { printf 'chronyd %s\n' "$*" >> "$test_calls"; return "${test_chronyd_status:-$test_sync_status}"; }
 chronyc() { printf 'chronyc %s\n' "$*" >> "$test_calls"; return "${test_chronyc_status:-$test_sync_status}"; }
+_pkg_install() {
+    printf 'install %s\n' "$*" >> "$test_calls"
+    [ "${test_install_status:-1}" = 0 ] || return 1
+    test_available="${test_available:-$test_backend curl} chronyc chronyd"
+}
+systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$test_calls"
+    case "$1" in
+        show)
+            if [ "${@: -1}" = "${test_chrony_service:-chrony.service}" ]; then
+                printf 'loaded\n'
+            else
+                printf 'not-found\n'
+            fi ;;
+        enable|is-active) return "${test_service_status:-0}" ;;
+        *) return 1 ;;
+    esac
+}
 sleep() { printf 'sleep %s\n' "$*" >> "$test_calls"; }
 curl() {
     printf 'curl %s\n' "$*" >> "$test_calls"
@@ -185,6 +203,58 @@ test_script_path() {
     eval "$job"
 }
 
+test_chrony_install_enable() {
+    test_available='timedatectl curl'
+    test_timedatectl_status=1
+    test_install_status=0
+    _sync_system_time true
+    assert_contains "$test_calls" 'install chrony'
+    assert_contains "$test_calls" 'systemctl enable --now chrony.service'
+    assert_contains "$test_calls" 'systemctl is-active --quiet chrony.service'
+    assert_contains "$test_calls" 'chronyc -m makestep'
+    ! grep -q '^curl ' "$test_calls"
+}
+
+test_chronyd_service_enable() {
+    test_available='timedatectl chronyc chronyd curl'
+    test_timedatectl_status=1
+    test_chrony_service=chronyd.service
+    _sync_system_time true
+    assert_contains "$test_calls" 'systemctl enable --now chronyd.service'
+    ! grep -q '^install\|^curl ' "$test_calls"
+}
+
+test_chrony_enable_failure() {
+    test_available='timedatectl curl'
+    test_timedatectl_status=1
+    test_install_status=0
+    test_service_status=1
+    test_chronyc_status=1
+    test_chronyd_status=1
+    _sync_system_time true
+    assert_contains "$test_calls" 'systemctl enable --now chrony.service'
+    assert_contains "$test_calls" 'https://www.google.com'
+}
+
+test_chrony_unconfirmed_fallback() {
+    test_available='timedatectl chronyc chronyd curl'
+    test_timedatectl_status=1
+    test_chronyc_status=1
+    test_chronyd_status=1
+    _sync_system_time true
+    assert_contains "$test_calls" 'systemctl is-active --quiet chrony.service'
+    assert_contains "$test_calls" 'https://www.google.com'
+}
+
+test_chrony_install_failure() {
+    test_available='timedatectl curl'
+    test_timedatectl_status=1
+    _sync_system_time true
+    assert_contains "$test_calls" 'install chrony'
+    assert_contains "$test_calls" 'https://www.google.com'
+    ! grep -q '^systemctl enable' "$test_calls"
+}
+
 test_systemd_failure_ntpdate() {
     test_available='timedatectl ntpdate curl'
     test_timedatectl_status=1
@@ -296,7 +366,7 @@ test_failure_diagnostics() {
     assert_empty "$test_cron"
 }
 
-for test_name in accept decline replace_and_preserve sync_failure missing_cron cron_failure remove backends automatic_sync automatic_synced automatic_unconfirmed cli script_path systemd_failure_ntpdate systemd_failure_https systemd_unconfirmed systemd_delayed_confirmation ntpdate_failure_chronyd chrony_daemon chronyc_failure_chronyd https_provider_fallback https_fresh_request https_cached_date https_invalid_date https_missing_date https_network_failure failure_diagnostics; do
+for test_name in accept decline replace_and_preserve sync_failure missing_cron cron_failure remove backends automatic_sync automatic_synced automatic_unconfirmed cli script_path chrony_install_enable chronyd_service_enable chrony_enable_failure chrony_unconfirmed_fallback chrony_install_failure systemd_failure_ntpdate systemd_failure_https systemd_unconfirmed systemd_delayed_confirmation ntpdate_failure_chronyd chrony_daemon chronyc_failure_chronyd https_provider_fallback https_fresh_request https_cached_date https_invalid_date https_missing_date https_network_failure failure_diagnostics; do
     [ -z "${TIME_SYNC_TEST_FILTER:-}" ] || [ "$test_name" = "$TIME_SYNC_TEST_FILTER" ] || continue
     (
         test_backend=ntpdate

@@ -1,5 +1,12 @@
 # 修改記錄
 
+## 2026-10-26 — chrony 自動安裝與啟用
+
+版本：`proxyall 1.7.14`、`sb.sh 20-kevin.34`。
+
+- systemd 校時失敗或未確認同步時，安裝缺少的 chrony，啟用服務及開機自啟，再以 chronyc 確認同步。
+- 支援 chrony.service 與 chronyd.service；安裝、服務或同步失敗時繼續嘗試備用校時方式。
+
 ## 2026-10-26 — 自動校時與 HTTPS 時間校驗
 
 版本：`proxyall 1.7.13`、`sb.sh 20-kevin.33`。

@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.33"
+export SCRIPT_VERSION="20-kevin.34"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -2828,6 +2828,30 @@ _sni_router_cli_impl() {
 
 # --- 资源与环境管理 ---
 
+# chrony 系统校时服务
+_enable_chrony_service() {
+    local service sync_output
+    if ! command -v chronyc &>/dev/null || ! command -v chronyd &>/dev/null; then
+        _info "正在安装 chrony..."
+        if ! _pkg_install chrony; then
+            _warn "chrony 安装失败，正在尝试其他校时方式。"
+            return 1
+        fi
+    fi
+    for service in chrony.service chronyd.service; do
+        [ "$(systemctl show -p LoadState --value "$service" 2>/dev/null)" = loaded ] || continue
+        if sync_output=$(systemctl enable --now "$service" 2>&1) &&
+           systemctl is-active --quiet "$service"; then
+            _info "chrony 服务已启用，正在确认时间同步..."
+            return 0
+        fi
+        _warn "chrony 服务启用失败：${sync_output:-服务未运行}"
+        return 1
+    done
+    _warn "未找到 chrony 服务，正在尝试其他校时方式。"
+    return 1
+}
+
 # 系统时间同步
 _sync_system_time() {
     local force="${1:-false}"
@@ -2852,6 +2876,9 @@ _sync_system_time() {
             [ "$sync_status" = 0 ] || _warn "网络校时服务尚未确认同步完成，正在尝试其他校时方式。"
         else
             _warn "timedatectl：${sync_output:-无法启用网络校时服务}"
+        fi
+        if [ "$sync_status" -ne 0 ]; then
+            _enable_chrony_service || true
         fi
     fi
 
@@ -3164,7 +3191,7 @@ esac
 export -f _manage_service_impl
 export -f _atomic_modify_json_impl _atomic_modify_yaml_impl
 export -f _config_write_lock _node_tx_begin _node_candidate_path _node_tx_fail _node_tx_nft_snapshot
-export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
+export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _enable_chrony_service _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
 
 server_ip=""
 BATCH_MODE=false
