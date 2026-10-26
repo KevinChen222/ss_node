@@ -211,7 +211,7 @@ test_chrony_install_enable() {
     assert_contains "$test_calls" 'install chrony'
     assert_contains "$test_calls" 'systemctl enable --now chrony.service'
     assert_contains "$test_calls" 'systemctl is-active --quiet chrony.service'
-    assert_contains "$test_calls" 'chronyc -m makestep'
+    assert_contains "$test_calls" 'chronyc -m makestep 0.1 1 burst 1/2 waitsync 30 0.1 0 1'
     ! grep -q '^curl ' "$test_calls"
 }
 
@@ -243,6 +243,7 @@ test_chrony_unconfirmed_fallback() {
     test_chronyd_status=1
     _sync_system_time true
     assert_contains "$test_calls" 'systemctl is-active --quiet chrony.service'
+    ! grep -q '^chronyd ' "$test_calls"
     assert_contains "$test_calls" 'https://www.google.com'
 }
 

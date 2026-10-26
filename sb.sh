@@ -2856,6 +2856,7 @@ _enable_chrony_service() {
 _sync_system_time() {
     local force="${1:-false}"
     local sync_status=1 sync_output http_time http_age url attempt request_id
+    local chrony_service_ready=false chrony_wait_attempts=5
 
     if [ "$force" != "true" ] && [ "$INIT_SYSTEM" = systemd ] && \
        command -v timedatectl &>/dev/null && \
@@ -2878,12 +2879,15 @@ _sync_system_time() {
             _warn "timedatectl：${sync_output:-无法启用网络校时服务}"
         fi
         if [ "$sync_status" -ne 0 ]; then
-            _enable_chrony_service || true
+            if _enable_chrony_service; then
+                chrony_service_ready=true
+                chrony_wait_attempts=30
+            fi
         fi
     fi
 
     if [ "$sync_status" -ne 0 ] && command -v chronyc &>/dev/null; then
-        if sync_output=$(chronyc -m 'makestep 0.1 1' 'burst 1/2' 'waitsync 5 0.1 0 1' 2>&1); then
+        if sync_output=$(chronyc -m 'makestep 0.1 1' 'burst 1/2' "waitsync ${chrony_wait_attempts} 0.1 0 1" 2>&1); then
             sync_status=0
         else
             _warn "chronyc：${sync_output:-未能完成时间同步}"
@@ -2896,7 +2900,7 @@ _sync_system_time() {
             _warn "ntpdate：${sync_output:-未能完成时间同步}"
         fi
     fi
-    if [ "$sync_status" -ne 0 ] && command -v chronyd &>/dev/null; then
+    if [ "$sync_status" -ne 0 ] && [ "$chrony_service_ready" != true ] && command -v chronyd &>/dev/null; then
         if sync_output=$(chronyd -q -t 10 'server pool.ntp.org iburst' 2>&1); then
             sync_status=0
         else
