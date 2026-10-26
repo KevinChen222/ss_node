@@ -22,6 +22,8 @@ date() {
         +%Y) printf '2026\n' ;;
         '+%M %H') printf '07 08\n' ;;
         +%H:%M) printf '08:07\n' ;;
+        +%s) printf '1793000000\n' ;;
+        -u) /bin/date "$@" ;;
         -s)
             printf 'date %s\n' "$2" >> "$test_calls"
             [ "${test_date_status:-$test_sync_status}" = 0 ] || { echo 'date: Operation not permitted' >&2; return 1; }
@@ -48,7 +50,7 @@ chronyc() { printf 'chronyc %s\n' "$*" >> "$test_calls"; return "${test_chronyc_
 sleep() { printf 'sleep %s\n' "$*" >> "$test_calls"; }
 curl() {
     printf 'curl %s\n' "$*" >> "$test_calls"
-    if [ "${test_curl_status:-0}" != 0 ] || [ "${test_http_fail_url:-}" = "${@: -1}" ]; then
+    if [ "${test_curl_status:-0}" != 0 ] || [[ "${@: -1}" == "${test_http_fail_url:-NONE}"* ]]; then
         echo 'curl: Failed to connect' >&2
         return 1
     fi
@@ -141,8 +143,22 @@ test_backends() {
 
 test_automatic_sync() {
     _sync_system_time < /dev/null
-    assert_empty "$test_calls"
+    assert_contains "$test_calls" 'ntpdate -u -t 5 pool.ntp.org'
     assert_empty "$test_cron"
+}
+
+test_automatic_synced() {
+    test_available='timedatectl ntpdate curl'
+    _sync_system_time
+    assert_contains "$test_calls" 'timedatectl show'
+    ! grep -q 'set-ntp\|^ntpdate\|^curl ' "$test_calls"
+}
+
+test_automatic_unconfirmed() {
+    test_available='timedatectl ntpdate curl'
+    test_ntp_synced=no
+    _sync_system_time
+    assert_contains "$test_calls" 'ntpdate -u -t 5 pool.ntp.org'
 }
 
 test_cli() {
@@ -233,6 +249,29 @@ test_https_provider_fallback() {
     assert_contains "$test_calls" 'date Sat, 17 Oct 2026 08:07:00 GMT'
 }
 
+test_https_fresh_request() {
+    test_backend=https
+    _sync_system_time true
+    assert_contains "$test_calls" "--noproxy *"
+    assert_contains "$test_calls" "Cache-Control: no-cache, no-store"
+    assert_contains "$test_calls" '/?sb_time='
+}
+
+test_https_cached_date() {
+    test_backend=https
+    test_http_header=$'date: Sat, 17 Oct 2026 08:07:00 GMT\r\nAge: 600'
+    if _sync_system_time true; then return 1; fi
+    ! grep -q '^date ' "$test_calls"
+    assert_contains "$test_calls" 'https://www.cloudflare.com'
+}
+
+test_https_invalid_date() {
+    test_backend=https
+    test_http_header='date: invalid'
+    if _sync_system_time true; then return 1; fi
+    ! grep -q '^date ' "$test_calls"
+}
+
 test_https_missing_date() {
     test_backend=https
     test_http_header='HTTP/2 200'
@@ -257,7 +296,7 @@ test_failure_diagnostics() {
     assert_empty "$test_cron"
 }
 
-for test_name in accept decline replace_and_preserve sync_failure missing_cron cron_failure remove backends automatic_sync cli script_path systemd_failure_ntpdate systemd_failure_https systemd_unconfirmed systemd_delayed_confirmation ntpdate_failure_chronyd chrony_daemon chronyc_failure_chronyd https_provider_fallback https_missing_date https_network_failure failure_diagnostics; do
+for test_name in accept decline replace_and_preserve sync_failure missing_cron cron_failure remove backends automatic_sync automatic_synced automatic_unconfirmed cli script_path systemd_failure_ntpdate systemd_failure_https systemd_unconfirmed systemd_delayed_confirmation ntpdate_failure_chronyd chrony_daemon chronyc_failure_chronyd https_provider_fallback https_fresh_request https_cached_date https_invalid_date https_missing_date https_network_failure failure_diagnostics; do
     [ -z "${TIME_SYNC_TEST_FILTER:-}" ] || [ "$test_name" = "$TIME_SYNC_TEST_FILTER" ] || continue
     (
         test_backend=ntpdate

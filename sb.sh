@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.32"
+export SCRIPT_VERSION="20-kevin.33"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -2828,14 +2828,14 @@ _sni_router_cli_impl() {
 
 # --- 资源与环境管理 ---
 
-# 系统时间同步 (解决 TLS 握手 EOF 问题)
+# 系统时间同步
 _sync_system_time() {
     local force="${1:-false}"
-    local current_year sync_status=1 sync_output http_time url attempt
-    current_year=$(date +%Y 2>/dev/null)
+    local sync_status=1 sync_output http_time http_age url attempt request_id
 
-    # 自动调用仅在时钟明显失真时介入；正常情况下不安装软件、不修改系统时间。
-    if [ "$force" != "true" ] && [[ "$current_year" =~ ^[0-9]+$ ]] && [ "$current_year" -ge 2024 ]; then
+    if [ "$force" != "true" ] && [ "$INIT_SYSTEM" = systemd ] && \
+       command -v timedatectl &>/dev/null && \
+       [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; then
         return 0
     fi
 
@@ -2877,14 +2877,22 @@ _sync_system_time() {
         fi
     fi
     if [ "$sync_status" -ne 0 ] && command -v curl &>/dev/null; then
+        request_id="$(date +%s)-${RANDOM}"
         for url in https://www.google.com https://www.cloudflare.com; do
-            if ! sync_output=$(curl -fsSI --max-time 5 "$url" 2>&1); then
+            if ! sync_output=$(curl --noproxy '*' -fsSI --max-time 5 \
+                -H 'Cache-Control: no-cache, no-store' "${url}/?sb_time=${request_id}" 2>&1); then
                 _warn "获取 ${url} 时间失败：${sync_output}"
                 continue
             fi
-            http_time=$(printf '%s\n' "$sync_output" | awk 'tolower($1) == "date:" {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}')
+            http_time=$(printf '%s\n' "$sync_output" | awk 'tolower($1) == "date:" {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0} END {print value}')
             if [ -z "$http_time" ]; then
                 _warn "${url} 未返回 Date 时间。"
+                continue
+            fi
+            http_age=$(printf '%s\n' "$sync_output" | awk 'tolower($1) == "age:" {gsub(/\r/, "", $2); value=$2} END {print value}')
+            if { [ -n "$http_age" ] && [ "$http_age" != 0 ]; } ||
+               ! date -u -d "$http_time" +%s >/dev/null 2>&1; then
+                _warn "${url} 返回的时间无效或来自缓存。"
                 continue
             fi
             if sync_output=$(date -s "$http_time" 2>&1); then
