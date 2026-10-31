@@ -384,6 +384,25 @@ _normalize_outbound() {
         esac
     fi
     if [[ "$link" == vless://* ]]; then
+        local vless_param vless_params
+        IFS='&' read -ra vless_params <<< "$params"
+        for vless_param in "${vless_params[@]}"; do
+            case "$vless_param" in
+                encryption=*)
+                    value=$(_url_decode "${vless_param#*=}")
+                    if [[ -n "$value" && "$value" != none ]]; then
+                        echo '{"error":"当前 sing-box 不支持 VLESS Encryption；仅接受 encryption=none 或省略该参数"}'
+                        return 1
+                    fi
+                    ;;
+                pqv=*)
+                    if [ -n "${vless_param#*=}" ]; then
+                        echo '{"error":"当前 sing-box 不支持 Reality 的 pqv（ML-DSA 校验），无法导入此节点"}'
+                        return 1
+                    fi
+                    ;;
+            esac
+        done
         security=$(_get_param "$params" security)
         case "${security:-none}" in
             none|tls|reality) ;;

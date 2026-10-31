@@ -1,5 +1,13 @@
 # 修改記錄
 
+## 2026-10-31 — VLESS 導入校驗與 Reality 中轉探測
+
+版本：`proxyall 1.7.15`、`sb.sh 20-kevin.35`、`advanced_relay.sh 16-kevin.14`。
+
+- 拒絕不支援的 VLESS Encryption 與 Reality pqv 參數，包括重複參數中的不支援值。
+- Reality 中轉寫入前，以臨時回環代理探測落地連通性；失敗時保留現有配置，提示身份驗證與握手相容性問題。
+- Linux 回環測試涵蓋 sing-box 成功連線、錯誤 short ID，以及 Xray 26.10.31 的相容性拒絕。
+
 ## 2026-10-26 — chrony 自動安裝與啟用
 
 版本：`proxyall 1.7.14`、`sb.sh 20-kevin.34`。

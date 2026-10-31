@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.13"
+SCRIPT_VERSION="16-kevin.14"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -39,7 +39,7 @@ REALITY_LOCAL_ORIGIN_PORT=8443
 SNI_ROUTER_API_VERSION=1
 SNI_ROUTER_PUBLIC_PORT=443
 SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
-PARSER_SHA256="63111d152bce7733370a808c9a2a21e4473c30a692cb9704b260299342d97456"
+PARSER_SHA256="81b6affbeb27e3d39b06ef89ed691c68f85953d97b3f17b4bdc0aed5ac6bf01a"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -1976,6 +1976,54 @@ _offer_existing_inbound_relay() {
     return 0
 }
 
+# 使用临时回环代理验证 Reality 出站连通性。
+_probe_reality_outbound() (
+    local outbound="$1" probe_url="${2:-https://www.gstatic.com/generate_204}"
+    jq -e '.tls.reality.enabled == true' <<< "$outbound" >/dev/null || exit 0
+    local work pid="" port="" attempt
+    work=$(mktemp -d /tmp/sb-reality-probe.XXXXXX) || exit 1
+    trap '[ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }; rm -rf -- "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    jq -n --argjson outbound "$outbound" '{
+        log:{level:"info",timestamp:false},
+        dns:{servers:[{type:"local",tag:"probe-dns"}]},
+        inbounds:[{type:"mixed",tag:"probe-in",listen:"127.0.0.1",listen_port:0}],
+        outbounds:[$outbound | .tag="probe-out"],
+        route:{final:"probe-out",default_domain_resolver:"probe-dns"}
+    }' > "$work/config.json" || exit 1
+    if ! "$SINGBOX_BIN" check -c "$work/config.json" > "$work/log" 2>&1; then
+        _error "Reality 出站配置校验失败，未写入中转配置。"
+        exit 1
+    fi
+    "$SINGBOX_BIN" run -c "$work/config.json" > "$work/log" 2>&1 8>&- 9>&- &
+    pid=$!
+    for attempt in {1..30}; do
+        port=$(sed -n 's/.*tcp server started at 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$work/log" | head -n 1)
+        [ -z "$port" ] || break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ -z "$port" ]; then
+        _error "Reality 临时探测代理未能启动，未写入中转配置。"
+        exit 1
+    fi
+    _info "正在验证 Reality 落地连接..."
+    if curl --silent --show-error --noproxy "" --proxy "socks5h://127.0.0.1:$port" \
+        --connect-timeout 5 --max-time 12 --output /dev/null "$probe_url" 2> "$work/curl.log"; then
+        _success "Reality 落地连接验证通过。"
+        exit 0
+    fi
+    if grep -Eqi 'reality verification failed|received real certificate|REALITY authentication failed|x509:' "$work/log"; then
+        _error "Reality 身份验证失败，未写入中转配置。"
+        _warn "请核对公钥、short_id、SNI 和系统时间；新版 Xray 还可能要求当前 sing-box 不提供的 X25519MLKEM768 握手。"
+        _warn "更换指纹或仅升级 sing-box 不保证解决；请确认落地端兼容性，或使用兼容的客户端内核。"
+    else
+        _error "Reality 连通性探测未通过，未写入中转配置；请检查网络、落地服务及探测目标的可达性。"
+    fi
+    exit 1
+)
+
 # --- 通用：完成中转配置 (Inbound + Outbound写入) ---
 # 参数: $1=dest_type, $2=dest_addr, $3=dest_port, $4=outbound_json
 _finalize_relay_setup() {
@@ -2009,6 +2057,8 @@ _finalize_relay_setup() {
             return 1
         fi
     fi
+
+    _probe_reality_outbound "$outbound_json" || return 1
 
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
 
