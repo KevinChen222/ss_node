@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.09.26-local17'
+SCRIPT_VERSION='2026.11.06-local18'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -325,7 +325,16 @@ backup_file() {
         $SUDO mkdir -p "$BACKUP_DIR"
         local stamp
         stamp=$(date +%Y%m%d_%H%M%S)
-        $SUDO cp -a "$file_path" "$BACKUP_DIR/$(basename "$file_path").${stamp}"
+        local saved="$BACKUP_DIR/$(basename "$file_path").${stamp}.$$" previous staged
+        staged=$($SUDO mktemp "$BACKUP_DIR/.backup.XXXXXXXX") || return 1
+        if ! $SUDO cp -a -- "$file_path" "$staged" || ! $SUDO mv -f -- "$staged" "$saved"; then
+            $SUDO rm -f -- "$staged"; return 1
+        fi
+        for previous in "$BACKUP_DIR/$(basename "$file_path")."*; do
+            [[ $previous != "$saved" && ! -L $previous && -f $previous ]] || continue
+            [[ ${previous##*/} =~ \.[0-9]{8}_[0-9]{6}(\.[0-9]+)?$ ]] || continue
+            $SUDO rm -f -- "$previous" || return 1
+        done
         log_info "已备份: $file_path"
     fi
 }
@@ -4043,6 +4052,10 @@ main() {
         exit 0
     fi
     ensure_quick_command
+    if [[ -f $SNI_ROUTER_BIN ]] && grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$SNI_ROUTER_BIN" && \
+       grep -q '^_configure_runtime_log_rotation()' "$SNI_ROUTER_BIN"; then
+        bash "$SNI_ROUTER_BIN" setup-maintenance || log_warn '自动日志维护设置失败，请运行 sb setup-maintenance 重试。'
+    fi
     check_nginx_stable_update
 
     if [[ -n $domain_to_remove ]]; then

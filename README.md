@@ -48,6 +48,20 @@ proxyall --fix-http2     # 修复受管 Nginx 配置的 HTTP/2 旧语法
 
 脚本更新保留现有配置，不升级 sing-box 核心。旧版无法更新时，可重新执行安装命令。更新前退出其他管理菜单；脚本备份位于 `/var/lib/proxyall/backup.*`。
 
+## 日志与备份维护
+
+安装、更新或打开管理入口时会启用自动维护，并安装所需的 `logrotate` 和 cron。每分钟检查 sing-box、Xray、Argo、中转操作、Nginx 和 HAProxy 的文件日志；每个日志超过 150 MiB 时轮转，清空当前文件并保留一份上次日志。两次检查之间，日志可能暂时超过阈值。
+
+脚本更新、核心更新、Nginx/HAProxy 配置、DNS 配置及证书操作备份按来源各保留最近一份，不同站点的备份分别保留。维护任务会清理这些目录中的历史备份。证书归档文件保留在证书管理目录中。
+
+systemd 240 及以上的 sing-box 和 Xray 服务将标准输出写入文件日志；现有运行中的服务需重启一次生效。已有 journal 记录继续由系统管理。实时日志菜单可同时查看 journal 和文件日志。
+
+```bash
+sb setup-maintenance    # 安装或修复自动维护任务
+sb cleanup-logs         # 立即检查日志大小并清理历史备份
+sb cleanup-backups      # 仅清理历史备份
+```
+
 ## 使用说明
 
 - **域名要分开**：例如 Emby 使用 `emby.example.com`，Reality 使用 `reality.example.com`，XHTTP 使用 `xhttp.example.com`。同一个完整域名无法按 SNI 分到两个后端。

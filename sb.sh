@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.37"
+export SCRIPT_VERSION="20-kevin.38"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -506,12 +506,17 @@ _sb_reload_or_start_nginx() {
 }
 
 _sb_backup_nginx_file() {
-    local target="$1" stamp
+    local target="$1" stamp staged saved
     [ -f "$target" ] || return 0
     mkdir -p "$NGINX_BACKUP_DIR" || return 1
     chmod 700 "$NGINX_BACKUP_DIR" 2>/dev/null || true
     stamp=$(date +%Y%m%d_%H%M%S)
-    cp -a -- "$target" "${NGINX_BACKUP_DIR}/$(basename "$target").${stamp}.$$"
+    saved="${NGINX_BACKUP_DIR}/$(basename "$target").${stamp}.$$"
+    staged=$(mktemp "$NGINX_BACKUP_DIR/.backup.XXXXXXXX") || return 1
+    if ! cp -a -- "$target" "$staged" || ! mv -f -- "$staged" "$saved"; then
+        rm -f -- "$staged"; return 1
+    fi
+    _retain_latest_backups dated "${NGINX_BACKUP_DIR}/$(basename "$target")."*
 }
 
 _ensure_nginx_conf_d_include() {
@@ -4378,14 +4383,6 @@ _argo_keepalive_locked() {
     # 确保退出时删除锁
     trap 'rm -rf "$lock_dir"' RETURN EXIT
 
-    # --- 性能优化: 日志轮转 (10MB) ---
-    local max_size=$((10 * 1024 * 1024))
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE" "$XRAY_LOG_FILE"; do
-        if [ -f "$log" ] && [ $(wc -c < "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
-            tail -n 1000 "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
-        fi
-    done
-
     # 如果元数据文件不存在或为空，不需要守护
     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
         return
@@ -4726,26 +4723,222 @@ _create_service_files() {
     _success "${INIT_SYSTEM} 服务创建并启用成功。"
 }
 
-# 每天 03:17（服务器本地时间）清空一次本脚本产生的运行日志。
-_cleanup_runtime_logs() {
-    local log
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE" "${SINGBOX_DIR}/relay_operations.log" /tmp/singbox_argo_*.log; do
-        [ -f "$log" ] && : > "$log"
+MAINTENANCE_DIR="${PROXYALL_MAINTENANCE_DIR:-/var/lib/proxyall-maintenance}"
+LOGROTATE_DIR="${PROXYALL_LOGROTATE_DIR:-/etc/logrotate.d}"
+SYSTEMD_UNIT_DIR="${PROXYALL_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+NGINX_LOG_DIR="${PROXYALL_NGINX_LOG_DIR:-/var/log/nginx}"
+HAPROXY_LOG_FILE="${PROXYALL_HAPROXY_LOG_FILE:-/var/log/haproxy.log}"
+ARGO_LOG_DIR="${PROXYALL_ARGO_LOG_DIR:-/tmp}"
+
+_maintenance_safe_path() {
+    local path="$1"
+    [[ "$path" = /* && "$path" != *$'\n'* && "$path" != *'"'* && "$path" != *'\\'* ]] || return 1
+    while [ "$path" != / ]; do
+        [ ! -L "$path" ] || return 1
+        path=$(dirname -- "$path")
     done
 }
 
+# 同一来源的备份保留最新一份；日期后缀用于配置文件，修改时间用于快照目录。
+_retain_latest_backups() {
+    local mode="$1" path key order existing failed=0
+    shift
+    local -A latest=() orders=()
+    local -a paths=() keys=()
+    for path in "$@"; do
+        [ -e "$path" ] && _maintenance_safe_path "$path" || continue
+        case "$mode" in
+            dated)
+                [[ "$path" =~ ^(.*)\.([0-9]{8}_[0-9]{6})(\.[0-9]+)?$ ]] || continue
+                [ -f "$path" ] || continue
+                key="${BASH_REMATCH[1]}"; order="${BASH_REMATCH[2]}${BASH_REMATCH[3]:-}" ;;
+            dns)
+                [[ "$path" =~ ^(.*\.bak_dns_)([0-9]{8}_[0-9]{6})$ ]] || continue
+                [ -f "$path" ] || continue
+                key="${BASH_REMATCH[1]}"; order="${BASH_REMATCH[2]}" ;;
+            log)
+                [[ "$path" =~ ^(.*\.log)(\.[0-9]+(\.gz)?|-[0-9]{8}(\.gz)?)$ ]] || continue
+                [ -f "$path" ] || continue
+                key="${BASH_REMATCH[1]}"; order=$(stat -c %Y -- "$path") || return 1 ;;
+            bundle|core)
+                [ -d "$path" ] || continue
+                if [ "$mode" = core ]; then [ -f "$path/sing-box" ] && [ ! -L "$path/sing-box" ] || continue; fi
+                key="$mode"; order=$(stat -c %Y -- "$path") || return 1 ;;
+            certificate)
+                [ -d "$path" ] && [ -f "$path/paths.txt" ] && [ ! -L "$path/paths.txt" ] || continue
+                [ ! -e "$path/archived" ] || continue
+                IFS= read -r key < "$path/paths.txt" || continue
+                [[ "$key" == certificate=/* ]] || continue
+                order=$(stat -c %Y -- "$path") || return 1 ;;
+            *) return 1 ;;
+        esac
+        paths+=("$path"); keys+=("$key")
+        existing="${latest[$key]:-}"
+        if [ "$mode" = log ]; then
+            if [ "$path" = "$key.1" ]; then latest[$key]="$path"; orders[$key]="$order"; continue; fi
+            [ "$existing" != "$key.1" ] || continue
+        fi
+        if [ -z "$existing" ] || { [[ "$mode" = dated || "$mode" = dns ]] && [[ "$order" > "${orders[$key]}" ]]; } || \
+           { [[ "$mode" != dated && "$mode" != dns ]] && [ "$order" -gt "${orders[$key]}" ]; } || \
+           { [ "$order" = "${orders[$key]}" ] && [[ "$path" > "$existing" ]]; }; then
+            latest[$key]="$path"; orders[$key]="$order"
+        fi
+    done
+    local i
+    for i in "${!paths[@]}"; do
+        path="${paths[$i]}"; key="${keys[$i]}"
+        [ "$path" = "${latest[$key]}" ] || rm -rf -- "$path" || failed=1
+    done
+    return "$failed"
+}
+
+_cleanup_config_backups() (
+    _config_write_lock || exit 1
+    local failed=0 state="${PROXYALL_STATE_DIR:-/var/lib/proxyall}"
+    _retain_latest_backups dated "$NGINX_BACKUP_DIR/"* "$SNI_ROUTER_HAPROXY_BACKUP_DIR/"* || failed=1
+    _retain_latest_backups dns "$CONFIG_FILE".bak_dns_* || failed=1
+    _retain_latest_backups core "$SB_ROOT_HOME"/.singbox-update.* || failed=1
+    _retain_latest_backups certificate "$state"/certificates/operation.* || failed=1
+    # 脚本更新目录由统一入口的会话锁保护。
+    if _maintenance_safe_path "$state" && [ -f "$state/.managed" ] && \
+       grep -Fqx '# PROXYALL_MANAGED_COMMAND=1' "$state/.managed"; then
+        exec 7>"$state/manager.lock" || exit 1
+        if flock -n 7; then _retain_latest_backups bundle "$state"/backup.* || failed=1; fi
+    fi
+    exit "$failed"
+)
+
+_runtime_log_policy() {
+    printf '# Managed by proxyall log maintenance\n'
+    printf '"%s" ' "$@"
+    cat <<'EOF'
+{
+    size 157286401
+    rotate 1
+    missingok
+    notifempty
+    copytruncate
+    nocompress
+    nodateext
+EOF
+    printf '    su %s %s\n' "$(id -un)" "$(id -gn)"
+    printf '}\n'
+}
+
+_install_runtime_log_policy() {
+    local name="$1" target="$LOGROTATE_DIR/$1" tmp
+    shift
+    _maintenance_safe_path "$target" || return 1
+    tmp=$(mktemp "$LOGROTATE_DIR/.proxyall-logrotate.XXXXXX") || return 1
+    _runtime_log_policy "$@" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    if [ -f "$target" ] && cmp -s -- "$tmp" "$target"; then rm -f -- "$tmp"; return 0; fi
+    if [ -f "$target" ]; then
+        cp -p -- "$target" "$MAINTENANCE_DIR/logrotate-$name.latest" || { rm -f -- "$tmp"; return 1; }
+    fi
+    chmod 600 "$tmp" && mv -f -- "$tmp" "$target"
+}
+
+_configure_runtime_log_rotation() {
+    local path
+    for path in "$MAINTENANCE_DIR" "$LOGROTATE_DIR" "$LOG_FILE" "$ARGO_LOG_FILE" "$XRAY_LOG_FILE" \
+        "$SINGBOX_DIR" "$ARGO_LOG_DIR" "$NGINX_LOG_DIR" "$HAPROXY_LOG_FILE"; do
+        _maintenance_safe_path "$path" || return 1
+    done
+    install -d -m 700 "$MAINTENANCE_DIR" || return 1
+    mkdir -p -- "$LOGROTATE_DIR" || return 1
+    _install_runtime_log_policy proxyall "$LOG_FILE" "$ARGO_LOG_FILE" "$SINGBOX_DIR/*.log" \
+        "$ARGO_LOG_DIR/singbox_argo_*.log" || return 1
+    if [ -d "$NGINX_LOG_DIR" ] || [ -f "$LOGROTATE_DIR/nginx" ]; then
+        _install_runtime_log_policy nginx "$NGINX_LOG_DIR/*.log" || return 1
+    fi
+    if [ -f "$HAPROXY_LOG_FILE" ] || [ -f "$LOGROTATE_DIR/haproxy" ]; then
+        _install_runtime_log_policy haproxy "$HAPROXY_LOG_FILE" || return 1
+    fi
+}
+
+# 服务标准输出写入可轮转文件；服务下次启动时使用该设置。
+_configure_runtime_log_output() {
+    [ "$INIT_SYSTEM" = systemd ] || return 0
+    local unit log dir tmp changed=false version
+    version=$(systemctl --version | awk 'NR==1 {print $2}')
+    [[ "$version" =~ ^[0-9]+$ ]] && [ "$version" -ge 240 ] || {
+        _warning 'systemd 低于 240，服务标准输出继续由系统 journal 管理。'; return 0;
+    }
+    for unit in sing-box proxyall-xray; do
+        [ -f "$SYSTEMD_UNIT_DIR/$unit.service" ] || continue
+        if [ "$unit" = sing-box ]; then log="$LOG_FILE"; else log="$XRAY_LOG_FILE"; fi
+        dir="$SYSTEMD_UNIT_DIR/$unit.service.d"
+        _maintenance_safe_path "$dir/90-proxyall-logging.conf" && _maintenance_safe_path "$log" || return 1
+        if [ -f "$dir/90-proxyall-logging.conf" ] && ! grep -Fqx '# Managed by proxyall log maintenance' "$dir/90-proxyall-logging.conf"; then
+            _error "日志配置文件已被其他配置占用：$dir/90-proxyall-logging.conf"; return 1
+        fi
+        install -d -m 755 "$dir" || return 1
+        mkdir -p -- "$(dirname -- "$log")" || return 1
+        touch -- "$log" && chmod 600 "$log" || return 1
+        tmp=$(mktemp "$dir/.proxyall-logging.XXXXXX") || return 1
+        printf '# Managed by proxyall log maintenance\n[Service]\nStandardOutput=append:%s\nStandardError=inherit\n' "$log" > "$tmp"
+        if [ -f "$dir/90-proxyall-logging.conf" ] && cmp -s "$tmp" "$dir/90-proxyall-logging.conf"; then
+            rm -f -- "$tmp"
+        else
+            chmod 644 "$tmp" && mv -f -- "$tmp" "$dir/90-proxyall-logging.conf" || return 1
+            changed=true
+        fi
+    done
+    [ "$changed" != true ] || systemctl daemon-reload
+}
+
+_cleanup_runtime_logs() (
+    _maintenance_safe_path "$MAINTENANCE_DIR" || exit 1
+    install -d -m 700 "$MAINTENANCE_DIR" || exit 1
+    exec 6>"$MAINTENANCE_DIR/cleanup.lock" || exit 1
+    flock -n 6 || exit 0
+    local failed=0 name
+    _configure_runtime_log_rotation || exit 1
+    command -v logrotate >/dev/null 2>&1 || { _error '未找到 logrotate。'; exit 1; }
+    # 使用系统 logrotate 状态文件，与系统自身的轮转任务共用状态锁。
+    for name in proxyall nginx haproxy; do
+        [ -f "$LOGROTATE_DIR/$name" ] || continue
+        logrotate "$LOGROTATE_DIR/$name" || failed=1
+    done
+    _retain_latest_backups log "$LOG_FILE".* "$ARGO_LOG_FILE".* "$SINGBOX_DIR/"*.log.* \
+        "$ARGO_LOG_DIR/"singbox_argo_*.log.* "$NGINX_LOG_DIR/"*.log.* "$NGINX_LOG_DIR/"*.log-* \
+        "$HAPROXY_LOG_FILE".* "$HAPROXY_LOG_FILE"-* || failed=1
+    _cleanup_config_backups || failed=1
+    exit "$failed"
+)
+
 _setup_log_cleanup() {
+    command -v logrotate >/dev/null 2>&1 || _pkg_install logrotate || return 1
+    if ! command -v crontab >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then _pkg_install dcron || return 1
+        elif command -v apt-get >/dev/null 2>&1; then _pkg_install cron || return 1
+        else _pkg_install cronie || return 1; fi
+    fi
     command -v crontab >/dev/null 2>&1 || {
-        _warning "未找到 crontab，无法启用每日自动清理日志。"
+        _warning "未找到 crontab，无法启用自动日志清理。"
         return 1
     }
 
     local tag="# sing-box-log-cleanup"
-    local job="17 3 * * * bash ${SELF_SCRIPT_PATH} cleanup-logs >/dev/null 2>&1 ${tag}"
+    _configure_runtime_log_rotation && _configure_runtime_log_output || return 1
+    local job="* * * * * bash ${SELF_SCRIPT_PATH} cleanup-logs >/dev/null 2>&1 ${tag}"
     local current
     current=$(crontab -l 2>/dev/null || true)
-    if ! printf '%s\n' "$current" | grep -Fqx "$job"; then
+    if [ "$(printf '%s\n' "$current" | grep -Fc "$tag")" != 1 ] || ! printf '%s\n' "$current" | grep -Fqx "$job"; then
         { printf '%s\n' "$current" | grep -Fv "$tag"; printf '%s\n' "$job"; } | sed '/^$/d' | crontab - || return 1
+    fi
+    if [ "$INIT_SYSTEM" = systemd ]; then
+        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || return 1
+    elif [ "$INIT_SYSTEM" = openrc ]; then
+        rc-service dcron start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || return 1
+        rc-update add dcron default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || return 1
+    elif command -v crond >/dev/null 2>&1; then
+        pgrep -x crond >/dev/null 2>&1 || crond || return 1
+    elif command -v cron >/dev/null 2>&1; then
+        pgrep -x cron >/dev/null 2>&1 || cron || return 1
+    else
+        _error '未找到 cron 服务，自动维护任务尚未运行。'
+        return 1
     fi
 }
 
@@ -4759,19 +4952,25 @@ _remove_log_cleanup() {
 
 # 注意: _manage_service 已在上方定义，此处不再重复定义
 
-_view_log() {
-    if [ "$INIT_SYSTEM" == "systemd" ]; then
-        _info "按 Ctrl+C 退出日志查看。"
-        journalctl -u sing-box -f --no-pager
-    else # 适用于 openrc 和 direct 模式
-        if [ ! -f "$LOG_FILE" ]; then
-            _warning "日志文件 ${LOG_FILE} 不存在。"
-            return
-        fi
-        _info "按 Ctrl+C 退出日志查看 (日志文件: ${LOG_FILE})。"
-        tail -f "$LOG_FILE"
+_view_log() (
+    local -a logs=()
+    local -a readers=()
+    local log
+    trap '[ "${#readers[@]}" = 0 ] || kill "${readers[@]}" 2>/dev/null; wait 2>/dev/null || true' EXIT
+    trap 'exit 0' INT TERM
+    for log in "$LOG_FILE" "$XRAY_LOG_FILE"; do [ ! -f "$log" ] || logs+=("$log"); done
+    _info "按 Ctrl+C 退出日志查看。"
+    if [ "$INIT_SYSTEM" = systemd ]; then
+        journalctl -u sing-box -u proxyall-xray -f --no-pager &
+        readers+=("$!")
     fi
-}
+    if [ "${#logs[@]}" -gt 0 ]; then
+        tail -n 50 -F -- "${logs[@]}" &
+        readers+=("$!")
+    fi
+    if [ "${#readers[@]}" = 0 ]; then _warning '日志文件不存在。'; return 0; fi
+    wait "${readers[@]}"
+)
 
 _uninstall() ( _config_write_lock || exit 1; _uninstall_locked; )
 
@@ -6707,6 +6906,10 @@ EOF
         chmod 700 "$service"
         rc-update add proxyall-xray default || { _xray_restore_install; rm -rf -- "$work"; return 1; }
     fi
+    if ! _configure_runtime_log_output; then
+        _xray_restore_install
+        rm -rf -- "$work"; return 1
+    fi
     if [ "$was_running" = true ] && ! _xray_service restart; then
         _xray_restore_install
         rm -rf -- "$work"; return 1
@@ -8227,6 +8430,8 @@ _apply_dns_config_locked() {
         return 1
     fi
 
+    _retain_latest_backups dns "$CONFIG_FILE".bak_dns_* || return 1
+
     _success "DNS 配置已保存，备份文件：${backup_file}"
     _manage_service "restart"
 }
@@ -8985,6 +9190,7 @@ _do_update_singbox() (
             _info "正在启动/重启 [主] 服务 (sing-box)..."
             if _manage_service "restart" 9>&-; then
                 CORE_UPGRADE_APPLIED=0
+                _retain_latest_backups core "$SB_ROOT_HOME"/.singbox-update.* || _warn '核心备份清理失败。'
                 [ -z "$update_backup_dir" ] || _info "升级前核心与配置备份已保留: ${update_backup_dir}"
                 _success "[主] 服务已就绪。"
                 return 0
@@ -9790,6 +9996,17 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 ;;
             cleanup-logs)
                 _cleanup_runtime_logs
+                exit $?
+                ;;
+            setup-maintenance)
+                _check_root
+                _config_write_lock || exit 1
+                _setup_log_cleanup
+                exit $?
+                ;;
+            cleanup-backups)
+                _check_root
+                _cleanup_config_backups
                 exit $?
                 ;;
             install-realitlscanner)

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
-PROXYALL_VERSION="1.7.17"
-SB_SHA256="171a64919b8365e6773101882fe0cf5f3aff99ef3ee7287c68690228efb9dc4c"
-DEPLOY_SHA256="82fa4e919e2273e326c14f25bdb48397f23529b806023fc6d822159f4595c2eb"
+PROXYALL_VERSION="1.7.18"
+SB_SHA256="70f4c64e07b0c732f3975e4219944549e3434baff298a920424e00ec52ffdc9d"
+DEPLOY_SHA256="c3953892e580872f08a709a8b3f28b905a101e410c42a0be08c2967a0b5a277d"
 RELAY_SHA256="b9d7c1e43bb1e20c384c8303b7cf6e46ac3fdb4531b60730fbab415d40ae8070"
 PARSER_SHA256="81b6affbeb27e3d39b06ef89ed691c68f85953d97b3f17b4bdc0aed5ac6bf01a"
 
@@ -245,6 +245,16 @@ pa_install_bundle() {
     done
     cp -- "$PA_STAGE/commit" "$PA_STATE/commit" || return 1
     PA_TRANSACTION=0
+    local old_backup
+    for old_backup in "$PA_STATE"/backup.*; do
+        [ "$old_backup" != "$PA_BACKUP" ] && [ -d "$old_backup" ] || continue
+        pa_safe_directory "$old_backup" || continue
+        rm -rf -- "$old_backup" || return 1
+    done
+    PROXYALL_MANAGED=1 bash "${PA_TARGETS[0]}" setup-maintenance 8>&- || {
+        pa_error '脚本已安装，但自动日志维护设置失败；请运行 sb setup-maintenance 重试。'
+        return 1
+    }
     pa_info "脚本已配套安装。旧脚本备份: $PA_BACKUP"
     pa_info '现有节点、证书、Nginx 和 HAProxy 配置均保留。以后输入 proxyall 即可打开。'
 }
@@ -359,6 +369,7 @@ main() {
     if [ ! -f "$PA_STATE/commit" ] || [ "$missing" = 1 ]; then
         pa_update install || return 1
     fi
+    pa_run /usr/local/bin/sb setup-maintenance || return 1
     if [ ! -d /run/systemd/system ]; then
         pa_info '当前无 systemd：可查看已有配置；HAProxy 共享 443 功能无法部署。'
     fi
