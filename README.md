@@ -64,7 +64,7 @@ proxyall --fix-http2     # 修复受管 Nginx 配置的 HTTP/2 旧语法
 - 客户端使用支持 XHTTP 的 mihomo，导出配置采用 `network: xhttp`、`mode: stream-up`、`alpn: [h2]`，启用证书验证。
 - 节点链接、mihomo YAML、查看、删除、修改端口及服务启停均由节点菜单管理。XHTTP 配置位于 `/usr/local/etc/sing-box/xray.json`；服务名为 `proxyall-xray`。
 - 选择共享 443 时，流量经过 HAProxy → Nginx → 回环 Xray；Emby、Reality 和 XHTTP 使用不同完整域名。共享入口需要 systemd。
-- 使用独立的 XHTTP 子域名。已有该域名的 Nginx 站点会触发冲突检查；同机其他域名的网站或 Emby 可共用 HTTPS 端口。
+- 使用独立的 XHTTP 子域名。同域名的 Reality 节点删除后，可直接复用其有效证书；添加 XHTTP 时会检查并备份停用未被节点使用的受管 Reality 源站，保留证书、私钥及 HTTP-01 续期入口。其他已有 Nginx 站点仍会触发冲突检查；同机其他域名的网站或 Emby 可共用 HTTPS 端口。
 - Nginx 使用 `/etc/nginx/certs/<域名>/cert` 与 `key`。可复用匹配域名且仍有效的证书，或通过 HTTP-01 申请并自动续期；申请时域名需直连解析到本机并开放 TCP 80。
 - 使用 CDN 时，客户端服务器地址填写域名或 CDN 地址，SNI 与 Host 保持证书域名；CDN 需要支持 HTTP/2 和流式 gRPC，Cloudflare 需开启 gRPC。
 
