@@ -1,5 +1,14 @@
 # 修改記錄
 
+## 2026-11-06 — VLESS XHTTP TLS / HTTP/2
+
+版本：`proxyall 1.7.16`、`sb.sh 20-kevin.36`。
+
+- 新增 XHTTP 節點入口，沿用伺服器地址、域名、端口、路徑與名稱的互動流程，獨立下載及校驗官方 Xray 核心。
+- 支援 Nginx TLS / H2、stream-up 與 HAProxy SNI 共用 443，匯出 mihomo XHTTP YAML 及分享連結。
+- 接入節點查看、刪除、修改端口、服務管理及失敗回復；保留同機網站、Emby 路由與證書。
+- Linux 實測 Xray 26.10.31、mihomo 1.19.33、Nginx 1.24.0、HAProxy 2.8.30；涵蓋 1 MiB 上下載、TLS H2 共用入口、生命週期與故障回復，並通過現有 Reality 回歸測試。
+
 ## 2026-10-31 — VLESS 導入校驗與 Reality 中轉探測
 
 版本：`proxyall 1.7.15`、`sb.sh 20-kevin.35`、`advanced_relay.sh 16-kevin.14`。

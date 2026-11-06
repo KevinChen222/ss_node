@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **节点管理**：sing-box、Reality、SNI 自动选择、自有域名回落站点、中转及第三方节点导入。
+- **节点管理**：sing-box、Xray XHTTP、Reality、SNI 自动选择、自有域名回落站点、中转及第三方节点导入。
 - **反向代理**：Emby 和本机服务反代，支持多个流媒体上游。
 - **共享 443**：默认通过 HAProxy 按 SNI 分流，让节点与 HTTPS 反代共用端口。
 - **证书管理**：查看有效期和使用位置、检查续期、手动续期、验证在线证书、归档未使用证书。
@@ -50,10 +50,31 @@ proxyall --fix-http2     # 修复受管 Nginx 配置的 HTTP/2 旧语法
 
 ## 使用说明
 
-- **域名要分开**：例如 Emby 使用 `emby.example.com`，Reality 使用 `reality.example.com`。同一个完整域名无法按 SNI 分到两个后端。
+- **域名要分开**：例如 Emby 使用 `emby.example.com`，Reality 使用 `reality.example.com`，XHTTP 使用 `xhttp.example.com`。同一个完整域名无法按 SNI 分到两个后端。
 - **默认共享 HTTPS 443**：HAProxy 只转发 TLS 流量。HTTP、自定义端口、IP 前端或非 systemd 环境使用直监听；已有 Nginx 独占 443 时需先迁移。
 - **域名与端口**：自有域名需正确解析到服务器；使用 HTTP-01 申请或续期证书时，公网 TCP 80 必须可达，共享入口需放行 TCP 443。
 - **Emby 网页默认关闭**：客户端 API 保留，可在反代菜单 **4** 中开启网页入口。
 - **证书默认保留**：删除反代或节点不会顺带删除证书。证书管理会检查引用后归档清理，备份位于 `/var/lib/proxyall/certificates/`；其他自定义服务的引用需自行核对。
 
 
+## VLESS + XHTTP + TLS（HTTP/2）
+
+在 `proxyall` 中选择 **2 → 1 → 12** 添加 XHTTP 节点。按提示填写服务器地址、自有域名、端口、路径和节点名称；默认端口为 443，路径可自动生成。Xray 内核在添加时独立下载并校验官方 Release 的 SHA-256，也可通过节点管理主菜单 **18** 安装或更新。
+
+- 客户端使用支持 XHTTP 的 mihomo，导出配置采用 `network: xhttp`、`mode: stream-up`、`alpn: [h2]`，启用证书验证。
+- 节点链接、mihomo YAML、查看、删除、修改端口及服务启停均由节点菜单管理。XHTTP 配置位于 `/usr/local/etc/sing-box/xray.json`；服务名为 `proxyall-xray`。
+- 选择共享 443 时，流量经过 HAProxy → Nginx → 回环 Xray；Emby、Reality 和 XHTTP 使用不同完整域名。共享入口需要 systemd。
+- 使用独立的 XHTTP 子域名。已有该域名的 Nginx 站点会触发冲突检查；同机其他域名的网站或 Emby 可共用 HTTPS 端口。
+- Nginx 使用 `/etc/nginx/certs/<域名>/cert` 与 `key`。可复用匹配域名且仍有效的证书，或通过 HTTP-01 申请并自动续期；申请时域名需直连解析到本机并开放 TCP 80。
+- 使用 CDN 时，客户端服务器地址填写域名或 CDN 地址，SNI 与 Host 保持证书域名；CDN 需要支持 HTTP/2 和流式 gRPC，Cloudflare 需开启 gRPC。
+
+测试需要本地二进制，不安装系统服务：
+
+```bash
+TEST_XRAY=/path/to/xray TEST_MIHOMO=/path/to/mihomo \
+TEST_NGINX=/path/to/nginx TEST_YQ=/path/to/yq \
+TEST_SINGBOX=/path/to/sing-box TEST_HAPROXY=/path/to/haproxy \
+python3 tests/xhttp.py
+```
+
+测试使用临时目录和本机端口，结束时停止测试进程并清理文件。
