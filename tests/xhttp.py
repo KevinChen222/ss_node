@@ -171,8 +171,8 @@ http {{
             self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr[-4000:])
         return result
 
-    def add(self, domain='xhttp.test', name='XHTTP test', **extra):
-        return self.run_shell('add', f'\n{domain}\n{self.public}\n/test/\n{name}\n', **extra)
+    def add(self, domain='xhttp.test', name='XHTTP test', concurrency='', **extra):
+        return self.run_shell('add', f'\n{domain}\n{self.public}\n/test/\n{name}\n{concurrency}\n', **extra)
 
     def json(self, name):
         return json.loads((self.root / name).read_text())
@@ -190,6 +190,7 @@ http {{
         proxy = json.loads(yaml)['proxies'][0]
         self.assertEqual(proxy['alpn'], ['h2'])
         self.assertFalse(proxy['skip-cert-verify'])
+        self.assertEqual(proxy['xhttp-opts']['reuse-settings']['max-concurrency'], '1')
         self.assertNotIn('flow', proxy)
         self.assertNotIn('smux', proxy)
         mixed = port()
@@ -271,7 +272,7 @@ server {{
                  'https_backend': {'host': '127.0.0.1', 'port': backend},
                  'https_routes': {'emby.test': {'owner': 'nginx-proxy'}}, 'tls_routes': {}}
         (self.root / 'router/state.json').write_text(json.dumps(state))
-        self.run_shell('add', '\nxhttp.test\n443\ny\n/test/\nShared XHTTP\n')
+        self.run_shell('add', '\nxhttp.test\n443\ny\n/test/\nShared XHTTP\n\n')
         state = self.json('router/state.json')
         self.assertEqual(state['https_routes']['emby.test']['owner'], 'nginx-proxy')
         self.assertEqual(state['https_routes']['xhttp.test']['owner'], 'sb-xhttp')

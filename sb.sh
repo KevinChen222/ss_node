@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.38"
+export SCRIPT_VERSION="20-kevin.39"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -5558,8 +5558,12 @@ _show_node_link() {
             url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=firefox&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
             ;;
         "vless-xhttp-tls")
-            local uuid="$1" sni="$2" path="$3"
-            url="vless://${uuid}@${link_ip}:${port}?encryption=none&security=tls&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome#$(_url_encode "$name")"
+            local uuid="$1" sni="$2" path="$3" concurrency="${4:-}" extra=""
+            if [ -n "$concurrency" ]; then
+                extra=$(jq -nc --arg concurrency "$concurrency" '{xmux:{maxConcurrency:$concurrency,hMaxReusableSecs:1800}}') || return 1
+                extra="&extra=$(_url_encode "$extra")"
+            fi
+            url="vless://${uuid}@${link_ip}:${port}?encryption=none&security=tls&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome${extra}#$(_url_encode "$name")"
             ;;
         "vless-ws-tls")
             # 参数: uuid, sni, ws_path, skip_verify
@@ -7047,7 +7051,7 @@ _xhttp_prepare_domain() {
 }
 
 _add_vless_xhttp_tls_impl() {
-    local node_ip domain port name path tag uuid backend routed=false use_router tmp target proxy meta inbound custom_ip custom_name
+    local node_ip domain port name path tag uuid backend routed=false use_router tmp target proxy meta inbound custom_ip custom_name concurrency
     [ -n "$server_ip" ] || server_ip=$(_get_ip)
     read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " custom_ip || return 1
     node_ip="${custom_ip:-$server_ip}"
@@ -7071,6 +7075,15 @@ _add_vless_xhttp_tls_impl() {
     read -r -p "请输入节点名称 (默认: VLESS-XHTTP-${port}): " custom_name || return 1
     name="${custom_name:-VLESS-XHTTP-${port}}"
     _assert_node_name_free "$name" || return 1
+    while true; do
+        read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return 1
+        concurrency="${concurrency:-1}"
+        if [[ "$concurrency" =~ ^[0-9]{1,10}$ ]] && (( 10#$concurrency >= 1 && 10#$concurrency <= 2147483647 )); then
+            concurrency=$((10#$concurrency))
+            break
+        fi
+        _error 'XMUX 并发数必须是 1-2147483647 之间的整数。'
+    done
     _node_tx_begin || return 1
     _ensure_local_origin_dependencies || return 1
     _xhttp_prepare_domain "$domain" || return 1
@@ -7096,13 +7109,13 @@ _add_vless_xhttp_tls_impl() {
     meta=$(jq -nc --arg name "$name" --arg domain "$domain" --arg path "$path" --arg conf "$target" --argjson public "$port" --argjson backend "$backend" --argjson routed "$routed" \
         '{name:$name,core:"xray",type:"vless-xhttp",server_name:$domain,path:$path,nginxConfig:$conf,publicPort:$public,backendPort:$backend,frontedBy:(if $routed then "haproxy" else "nginx" end),routerRole:"xhttp-https"}') || return 1
     _atomic_modify_json "$METADATA_FILE" ".[$(jq -Rn --arg t "$tag" '$t')] = $meta" || return 1
-    proxy=$(jq -nc --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" --argjson port "$port" \
-        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","skip-cert-verify":false,"xhttp-opts":{path:$path,host:$host,mode:"stream-up"}}') || return 1
+    proxy=$(jq -nc --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" --arg concurrency "$concurrency" --argjson port "$port" \
+        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","skip-cert-verify":false,"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
     _add_node_to_yaml "$proxy" || return 1
     _xhttp_nginx_config "$domain" "$path" "$backend" "$port" "$routed" > "$NODE_TX_DIR/xhttp-nginx"
     _install_managed_nginx_config "$NODE_TX_DIR/xhttp-nginx" "$target" '# Managed by proxyall XHTTP' || return 1
     if [ "$routed" = true ]; then _sni_router_register_https sb-xhttp "$domain" "$SNI_ROUTER_HTTPS_BACKEND_PORT" || return 1; fi
-    _show_node_link vless-xhttp-tls "$name" "$node_ip" "$port" "$tag" "$uuid" "$domain" "$path"
+    _show_node_link vless-xhttp-tls "$name" "$node_ip" "$port" "$tag" "$uuid" "$domain" "$path" "$concurrency"
 }
 
 _delete_xhttp_node() {
@@ -7141,11 +7154,12 @@ _modify_xhttp_port() {
     if [ "$routed" = true ]; then _sni_router_register_https sb-xhttp "$domain" "$SNI_ROUTER_HTTPS_BACKEND_PORT" || return 1
     elif [ "$(jq -r '.frontedBy' <<< "$meta")" = haproxy ]; then _sni_router_remove_https sb-xhttp "$domain" || return 1; fi
     _atomic_modify_json "$METADATA_FILE" ".\"$tag\".publicPort=$port | .\"$tag\".frontedBy=\"$(if [ "$routed" = true ]; then echo haproxy; else echo nginx; fi)\"" || return 1
-    local name uuid server
+    local name uuid server concurrency
     name=$(jq -r '.clientName' <<< "$meta")
     uuid=$(_get_proxy_field "$name" '.uuid'); server=$(_get_proxy_field "$name" '.server')
+    concurrency=$(_get_proxy_field "$name" '.["xhttp-opts"]["reuse-settings"]["max-concurrency"] // ""') || return 1
     PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies[] |= (select(.name == env(PROXY_NAME)) | .port=$port)" || return 1
-    _show_node_link vless-xhttp-tls "$name" "$server" "$port" "$tag" "$uuid" "$domain" "$path"
+    _show_node_link vless-xhttp-tls "$name" "$server" "$port" "$tag" "$uuid" "$domain" "$path" "$concurrency"
 }
 
 export -f _node_catalog _xray_running _xray_service

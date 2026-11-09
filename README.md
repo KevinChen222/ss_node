@@ -73,9 +73,10 @@ sb cleanup-backups      # 仅清理历史备份
 
 ## VLESS + XHTTP + TLS（HTTP/2）
 
-在 `proxyall` 中选择 **2 → 1 → 12** 添加 XHTTP 节点。按提示填写服务器地址、自有域名、端口、路径和节点名称；默认端口为 443，路径可自动生成。Xray 内核在添加时独立下载并校验官方 Release 的 SHA-256，也可通过节点管理主菜单 **18** 安装或更新。
+在 `proxyall` 中选择 **2 → 1 → 12** 添加 XHTTP 节点。按提示填写服务器地址、自有域名、端口、路径、节点名称和 XMUX 每条连接的最大并发数；默认端口为 443，并发数为 1，路径可自动生成。Xray 内核在添加时独立下载并校验官方 Release 的 SHA-256，也可通过节点管理主菜单 **18** 安装或更新。
 
 - 客户端使用支持 XHTTP 的 mihomo，导出配置采用 `network: xhttp`、`mode: stream-up`、`alpn: [h2]`，启用证书验证。
+- XMUX 并发数写入 mihomo YAML 的 `xhttp-opts.reuse-settings.max-concurrency` 和分享链接的 `extra.xmux.maxConcurrency`，连接可复用时间为 1800 秒；修改端口时保留并发数。
 - 节点链接、mihomo YAML、查看、删除、修改端口及服务启停均由节点菜单管理。XHTTP 配置位于 `/usr/local/etc/sing-box/xray.json`；服务名为 `proxyall-xray`。
 - 选择共享 443 时，流量经过 HAProxy → Nginx → 回环 Xray；Emby、Reality 和 XHTTP 使用不同完整域名。共享入口需要 systemd。
 - 使用独立的 XHTTP 子域名。同域名的 Reality 节点删除后，可直接复用其有效证书；添加 XHTTP 时会检查并备份停用未被节点使用的受管 Reality 源站，保留证书、私钥及 HTTP-01 续期入口。其他已有 Nginx 站点仍会触发冲突检查；同机其他域名的网站或 Emby 可共用 HTTPS 端口。
