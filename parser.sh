@@ -219,6 +219,8 @@ _parse_ss() {
     local link="$1"
     local body="${link#ss://}"
     [[ "$body" == *"#"* ]] && body="${body%#*}"
+    body="${body%%\?*}"
+    body="${body%/}"
     
     local method_pass server_port
     if [[ "$body" == *"@"* ]]; then
@@ -365,6 +367,23 @@ _normalize_outbound() {
     if [[ "$link" == ss://* ]] && [ -n "$(_get_param "$params" plugin)" ]; then
         echo '{"error":"不支持 Shadowsocks 插件，不能忽略 plugin 参数后导入"}'
         return 1
+    fi
+    if [[ "$link" == ss://* ]]; then
+        value=$(_get_param "$params" smux)
+        if [ -n "$value" ]; then
+            if ! jq -e 'type == "object" and (.enabled | type == "boolean")
+                and (.protocol == "h2mux" or .protocol == "smux" or .protocol == "yamux")
+                and (.padding | type == "boolean")
+                and ([.["max-connections"], .["min-streams"]] | all(type == "number" and . >= 1 and floor == .))' \
+                <<< "$value" >/dev/null 2>&1; then
+                echo '{"error":"SS smux 参数无效"}'
+                return 1
+            fi
+            outbound=$(jq --argjson smux "$value" '.multiplex={
+                enabled:$smux.enabled, protocol:$smux.protocol, padding:$smux.padding,
+                max_connections:$smux["max-connections"], min_streams:$smux["min-streams"]
+            }' <<< "$outbound") || return 1
+        fi
     fi
     transport=$(_get_param "$params" type)
     if [[ "$link" == vmess://* ]]; then

@@ -71,6 +71,23 @@ sb cleanup-backups      # 仅清理历史备份
 - **证书默认保留**：删除反代或节点不会顺带删除证书。证书管理会检查引用后归档清理，备份位于 `/var/lib/proxyall/certificates/`；其他自定义服务的引用需自行核对。
 
 
+## SS TCP 多路复用与裸 VLESS
+
+在 `proxyall` 中选择 **2 → 1 → 8** 创建 SS 节点。服务端启用 TCP 多路复用，mihomo 节点 YAML 包含 `smux`：使用 `h2mux`，最大连接数为 4，新建连接前的最小流数为 4，仅复用 TCP。第 **4** 项同时启用 Padding，其他 SS 选项不启用 Padding。
+
+创建和查看 SS 节点时显示 `ss://` 分享链接，包含地址、加密方式、密码、节点名称、UDP 开关及完整的 `smux` 参数；ShadowTLS 节点同时包含插件的主机名、密码和版本。聚合 Base64 订阅保留这些链接参数。mihomo 配置保存在 `/usr/local/etc/sing-box/clash.yaml`。
+
+Sub-Store 的 SS 原生解析器不读取 `smux` 查询参数。在单条订阅中添加一次「脚本操作」，以本地代码使用 [substore-smux.js](substore-smux.js)，放在重命名等处理之前，导出选择 **Clash.Meta / mihomo**。该脚本从原始链接还原多路复用配置，支持直接粘贴链接和 Base64 订阅；解析与导出测试使用 Sub-Store **2.44.5**。
+
+在添加节点菜单选择 **9 → VLESS（裸 TCP，无 TLS）** 创建普通 VLESS 节点。该节点使用 TCP 直监听，不启用 TLS、Reality 或 Vision；客户端 YAML 为 `tls: false`、`network: tcp`，分享链接为 `security=none`、`encryption=none`、`type=tcp`。批量创建也支持协议编号 **9**。
+
+节点生成与回环通信测试使用临时目录和端口，不安装系统服务：
+
+```bash
+TEST_SINGBOX=/path/to/sing-box TEST_MIHOMO=/path/to/mihomo \
+TEST_YQ=/path/to/yq python3 tests/tcp_nodes.py
+```
+
 ## VLESS + XHTTP + TLS（HTTP/2）
 
 在 `proxyall` 中选择 **2 → 1 → 12** 添加 XHTTP 节点。按提示填写服务器地址、自有域名、端口、路径、节点名称和 XMUX 每条连接的最大并发数；默认端口为 443，并发数为 1，路径可自动生成。Xray 内核在添加时独立下载并校验官方 Release 的 SHA-256，也可通过节点管理主菜单 **18** 安装或更新。

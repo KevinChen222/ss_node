@@ -1,5 +1,22 @@
 # 修改記錄
 
+## 2026-11-09 — SS 完整分享連結與 Sub-Store
+
+版本：`proxyall 1.7.21`、`sb.sh 20-kevin.41`。
+
+- SS 分享連結攜帶完整 smux JSON、UDP 開關及 ShadowTLS 插件參數，創建、查看與聚合訂閱使用相同連結；取消顯示 YAML 複製流程。
+- 提供 Sub-Store 腳本操作，從原始 SS 連結恢復多路復用配置，驗證官方 2.44.5 SS 解析器及 mihomo 匯出器保留五種 SS 節點的參數。
+- 本機 SS 連結導入保留 Multiplex 與 Padding；查看 ShadowTLS 節點時使用外層監聽地址和內層 SS 憑據。
+
+## 2026-11-09 — SS 多路復用與裸 VLESS 匯出
+
+版本：`proxyall 1.7.20`、`sb.sh 20-kevin.40`。
+
+- 新建 SS 節點同步啟用服務端 Multiplex 和 mihomo smux，採用 h2mux、最多 4 條連線；Padding 選項與兩端配置一致。
+- 創建及查看 SS 節點時顯示完整 mihomo YAML，包含多路復用與 ShadowTLS 參數。
+- 明確裸 VLESS 的選單、YAML 與分享連結，沿用單節點及批量創建入口。
+- 測試覆蓋 SS 變體配置、YAML 顯示、裸 VLESS 連結重建、真實內核並發上下載、連線復用及 SS2022 至裸 VLESS 代理鏈。
+
 ## 2026-11-09 — XHTTP XMUX 並發數
 
 版本：`proxyall 1.7.19`、`sb.sh 20-kevin.39`。

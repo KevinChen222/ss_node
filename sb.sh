@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.39"
+export SCRIPT_VERSION="20-kevin.41"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -40,8 +40,8 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="b9d7c1e43bb1e20c384c8303b7cf6e46ac3fdb4531b60730fbab415d40ae8070"
-PARSER_SHA256="81b6affbeb27e3d39b06ef89ed691c68f85953d97b3f17b4bdc0aed5ac6bf01a"
+ADVANCED_RELAY_SHA256="1cad884bb97194f55d696ec8bdb19a744029bb32cd52ec09060c925b7ab57f88"
+PARSER_SHA256="682863d2ea70daa9f26cb7a3830cac59047d47f09ff99e4e30985656256805b3"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -5530,6 +5530,30 @@ EOF
 # 注意: _atomic_modify_json, _atomic_modify_yaml, _get_proxy_field, _add_node_to_yaml, _remove_node_from_yaml
 # 均在上方统一定义，此处不再重复定义以避免不一致
 
+_ss_share_link() {
+    local proxy_name="$1" proxy_json server port name userinfo query plugin smux
+    proxy_json=$(PROXY_NAME="$proxy_name" "$YQ_BINARY" eval -o=json -I=0 \
+        '[.proxies[] | select(.name == strenv(PROXY_NAME))]' "$CLASH_YAML_FILE") || return 1
+    proxy_json=$(jq -ce 'if length == 1 and .[0].type == "ss" then .[0] else empty end' <<< "$proxy_json") || {
+        _error "找不到 mihomo 节点配置: ${proxy_name}"
+        return 1
+    }
+    server=$(jq -r '.server' <<< "$proxy_json")
+    server="${server#[}"; server="${server%]}"
+    [[ "$server" != *:* ]] || server="[$server]"
+    port=$(jq -r '.port' <<< "$proxy_json")
+    name=$(jq -r '.name' <<< "$proxy_json")
+    userinfo=$(jq -jr '.cipher + ":" + .password' <<< "$proxy_json" | base64 | tr -d '\n\r=' | tr '+/' '-_') || return 1
+    query="udp=$(jq -r 'if .udp == true then 1 else 0 end' <<< "$proxy_json")"
+    smux=$(jq -c '.smux // empty' <<< "$proxy_json")
+    [ -z "$smux" ] || query="${query}&smux=$(_url_encode "$smux")"
+    plugin=$(jq -r 'if .plugin == "shadow-tls" then
+        "shadow-tls;host=" + .["plugin-opts"].host + ";password=" + .["plugin-opts"].password
+        + ";version=" + (.["plugin-opts"].version | tostring) else empty end' <<< "$proxy_json") || return 1
+    [ -z "$plugin" ] || query="${query}&plugin=$(_url_encode "$plugin")"
+    printf 'ss://%s@%s:%s/?%s#%s\n' "$userinfo" "$server" "$port" "$query" "$(_url_encode "$name")"
+}
+
 # 显示节点分享链接（在添加节点后调用）
 # 参数: $1=协议类型, $2=节点名称, $3=服务器IP(用于链接), $4=端口, $5=节点TAG, 其他参数根据协议不同
 _show_node_link() {
@@ -5580,7 +5604,7 @@ _show_node_link() {
         "vless-tcp")
             # 参数: uuid
             local uuid="$1"
-            url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:${port}?security=none&encryption=none&type=tcp#$(_url_encode "$name")"
             ;;
         "trojan-ws-tls")
             # 参数: password, sni, ws_path, skip_verify
@@ -5615,32 +5639,8 @@ _show_node_link() {
             local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
             url="anytls://$(_url_encode "$password")@${link_ip}:${port}?security=reality&sni=${sni}&fp=firefox&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
             ;;
-        "shadowsocks")
-            # 参数: method, password
-            local method="$1" password="$2"
-            local userinfo=$(printf '%s' "${method}:${password}" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
-            url="ss://${userinfo}@${link_ip}:${port}#$(_url_encode "$name")"
-            ;;
-        "shadowsocks-shadowtls")
-            # 参数: method, pw, spw, sni
-            local method="$1" pw="$2" spw="$3" sni="$4"
-            url=""
-            echo -e "${YELLOW}====== [客户端配置参考片段 (Clash Meta / Mihomo)] ======${NC}"
-            echo -e "  - name: \"${name}\""
-            echo -e "    type: ss"
-            echo -e "    server: ${link_ip}"
-            echo -e "    port: ${port}"
-            echo -e "    cipher: ${method}"
-            echo -e "    password: ${pw}"
-            echo -e "    plugin: shadow-tls"
-            echo -e "    plugin-opts:"
-            echo -e "      host: ${sni}"
-            echo -e "      password: ${spw}"
-            echo -e "      version: 3"
-            echo -e "${YELLOW}========================================================${NC}"
-            echo -e "${CYAN}[提示] ShadowTLS 需要特定的客户端配置。${NC}"
-            echo -e "${CYAN}您也可以直接打开本机位于 ${YELLOW}/usr/local/etc/sing-box/clash.yaml${CYAN} 的配置文件，${NC}"
-            echo -e "${CYAN}找到对应节点的 YAML 代码块，并复制到您的客户端中使用！${NC}"
+        "shadowsocks"|"shadowsocks-shadowtls")
+            url=$(_ss_share_link "$name") || return 1
             ;;
         "vless-ws")
             # Argo 专用: uuid, path
@@ -5662,7 +5662,7 @@ _show_node_link() {
             return
             ;;
     esac
-    
+
     if [ -n "$url" ]; then
         echo ""
         local clean_url=$(echo "$url" | sed 's/&insecure=1//g' | sed 's/&pcs=[a-fA-F0-9]*//g')
@@ -7347,7 +7347,7 @@ _add_vless_tcp_impl() {
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":false,"network":"tcp"}')
     _add_node_to_yaml "$proxy_json" || return 1
-    _success "VLESS (TCP) 节点 [${name}] 添加成功!"
+    _success "VLESS (裸 TCP，无 TLS) 节点 [${name}] 添加成功!"
     _show_node_link "vless-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid"
 }
 
@@ -7619,12 +7619,13 @@ _add_shadowsocks_menu_impl() {
         echo "========================================"
         _info "          添加 Shadowsocks 节点"
         echo "========================================"
+        echo " TCP 多路复用: mihomo smux"
         echo " [经典 SS]"
         echo " 1) aes-256-gcm"
         echo " 2) chacha20-ietf-poly1305"
         echo " [SS-2022 (强抗重放保护)]"
         echo " 3) 2022-blake3-aes-256-gcm"
-        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+        echo " 4) 2022-blake3-aes-256-gcm (多路复用 + Padding)"
         echo " [SS-2022 + ShadowTLS (完美伪装组合)]"
         echo " 5) 2022-blake3-aes-256-gcm + ShadowTLS v3"
         echo " 0) 返回"
@@ -7632,7 +7633,7 @@ _add_shadowsocks_menu_impl() {
         read -p "请选择加密方式 [0-5]: " choice
     fi
 
-    local method="" password="" name_prefix="" use_multiplex=false use_shadowtls=false
+    local method="" password="" name_prefix="" use_padding=false use_shadowtls=false
     case $choice in
         1) 
             method="aes-256-gcm"
@@ -7654,9 +7655,7 @@ _add_shadowsocks_menu_impl() {
             method="2022-blake3-aes-256-gcm"
             password=$(${SINGBOX_BIN} generate rand --base64 32)
             name_prefix="SS-2022-Padding"
-            use_multiplex=true
-            _info "已启用 Multiplex + Padding 模式"
-            _warning "注意：客户端也必须启用 Multiplex + Padding 才能连接！"
+            use_padding=true
             ;;
         5)
             # SS-2022 256 位版本（抗重放增强）
@@ -7704,7 +7703,6 @@ _add_shadowsocks_menu_impl() {
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    # 根据是否启用 Multiplex 或 ShadowTLS 生成不同配置
     local inbound_json=""
     local jq_modify_expr=".inbounds += [$inbound_json]"
     
@@ -7733,13 +7731,13 @@ _add_shadowsocks_menu_impl() {
                     "type": "shadowsocks",
                     "tag": $st,
                     "method": $m,
-                    "password": $pw
+                    "password": $pw,
+                    "multiplex": {"enabled": true, "padding": false}
                 }
             ]')
         jq_modify_expr=".inbounds += $inbound_json"
-    elif [ "$use_multiplex" == "true" ]; then
-        # 带 Multiplex + Padding 的配置
-        inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" \
+    else
+        inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" --argjson padding "$use_padding" \
             '{
                 "type": "shadowsocks",
                 "tag": $t,
@@ -7749,26 +7747,13 @@ _add_shadowsocks_menu_impl() {
                 "password": $pw,
                 "multiplex": {
                     "enabled": true,
-                    "padding": true
+                    "padding": $padding
                 }
-            }')
-        jq_modify_expr=".inbounds += [$inbound_json]"
-    else
-        # 标准配置
-        inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" \
-            '{
-                "type": "shadowsocks",
-                "tag": $t,
-                "listen": "::",
-                "listen_port": ($p|tonumber),
-                "method": $m,
-                "password": $pw
             }')
         jq_modify_expr=".inbounds += [$inbound_json]"
     fi
     _atomic_modify_json "$CONFIG_FILE" "$jq_modify_expr" || return 1
 
-    # YAML 配置也需要根据特定状态生成
     local proxy_json=""
     if [ "$use_shadowtls" == "true" ]; then
         proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg m "$method" --arg pw "$password" --arg spw "$shadowtls_password" --arg sni "$shadowtls_sni" \
@@ -7786,20 +7771,6 @@ _add_shadowsocks_menu_impl() {
                     "version": 3
                 }
             }')
-    elif [ "$use_multiplex" == "true" ]; then
-        proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg m "$method" --arg pw "$password" \
-            '{
-                "name": $n,
-                "type": "ss",
-                "server": $s,
-                "port": ($p|tonumber),
-                "cipher": $m,
-                "password": $pw,
-                "smux": {
-                    "enabled": true,
-                    "padding": true
-                }
-            }')
     else
         proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg m "$method" --arg pw "$password" \
             '{
@@ -7811,12 +7782,14 @@ _add_shadowsocks_menu_impl() {
                 "password": $pw
             }')
     fi
+    proxy_json=$(jq -c --argjson padding "$use_padding" '. + {smux: {
+        enabled: true, protocol: "h2mux", "max-connections": 4,
+        "min-streams": 4, "only-tcp": true, padding: $padding
+    }}' <<< "$proxy_json") || return 1
     _add_node_to_yaml "$proxy_json" || return 1
 
     _success "Shadowsocks (${method}) 节点 [${name}] 添加成功!"
-    if [ "$use_multiplex" == "true" ]; then
-        _info "Multiplex + Padding 已启用，客户端需配置对应选项"
-    fi
+    _info "TCP 多路复用: h2mux，Padding: ${use_padding}"
     if [ "$use_shadowtls" == "true" ]; then
         _show_node_link "shadowsocks-shadowtls" "$name" "$link_ip" "$port" "$tag" "$method" "$password" "$shadowtls_password" "$shadowtls_sni"
     else
@@ -7874,7 +7847,7 @@ _view_nodes() {
     if ! _node_catalog | jq -e '.inbounds | length > 0' >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
     
     # 统计有效节点数量（排除辅助节点）
-    local node_count=$(_node_catalog | jq '[.inbounds[] | select(.tag | contains("-hop-") | not)] | length')
+    local node_count=$(_node_catalog | jq '[.inbounds[] | select(.tag | contains("-hop-") | not) | select(.listen_port != null)] | length')
     _info "--- 当前节点信息 (共 ${node_count} 个) ---"
     
     # [关键修复] 确保在查看前清空之前的临时链接缓存
@@ -7891,6 +7864,16 @@ _view_nodes() {
         
         # 过滤掉多端口监听生成的辅助节点（跳过 tag 中包含 -hop- 的节点）
         if [[ "$tag" == *"-hop-"* ]]; then continue; fi
+        local ss_tag=""
+        if [ "$type" = shadowtls ]; then
+            ss_tag=$(jq -r '.detour' <<< "$node")
+            node=$(_node_catalog | jq -ce --argjson wrapper "$node" '
+                .inbounds[] | select(.tag == $wrapper.detour and .type == "shadowsocks")
+                | . + {tag:$wrapper.tag,listen_port:$wrapper.listen_port}') || continue
+            type=shadowsocks
+        elif [ "$type" = shadowsocks ] && [ "$port" = null ]; then
+            continue
+        fi
 
         # HAProxy 共享节点的 Sing-box 实际监听端口是回环后端端口；客户端必须使用 publicPort。
         local backend_port="$port"
@@ -7899,7 +7882,7 @@ _view_nodes() {
         [ -n "$public_port" ] && [ "$public_port" != "null" ] && port="$public_port"
         
         # 使用统一查找函数
-        local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
+        local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "${ss_tag:-$tag}")
 
         # 创建显示名称，优先使用 clash.yaml 中的名称，失败则回退到 tag
         local meta_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
@@ -7925,7 +7908,11 @@ _view_nodes() {
         local url=""
         
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
-        url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$METADATA_FILE")
+        if [ "$type" = shadowsocks ]; then
+            url=$(_ss_share_link "$proxy_name_to_find") || continue
+        else
+            url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$METADATA_FILE")
+        fi
         if { [ -z "$url" ] || [ "$url" == "null" ]; } && [[ "$tag" == argo-* ]] && [ -f "$ARGO_METADATA_FILE" ]; then
             url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
         fi
@@ -7987,7 +7974,7 @@ _view_nodes() {
                     local sn="$tls_sn"
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
                 else
-                    url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$display_name")"
+                    url="vless://${uuid}@${link_ip}:${port}?security=none&encryption=none&type=tcp#$(_url_encode "$display_name")"
                 fi
                 ;;
             "trojan")
@@ -8045,12 +8032,6 @@ _view_nodes() {
                     insecure_param="&insecure=1"
                 fi
                 url="anytls://$(_url_encode "$pw")@${link_ip}:${port}/?sni=$(_url_encode "$sn")${insecure_param}#$(_url_encode "$display_name")"
-                ;;
-            "shadowsocks")
-                # [资源优化] 合并2次jq为1次
-                local method password
-                IFS=$'\t' read -r method password <<< "$(echo "$node" | jq -r '[.method, .password] | @tsv')"
-                url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
                 ;;
             "socks")
                 # [资源优化] 合并2次jq为1次
@@ -9713,7 +9694,7 @@ _batch_create_nodes() {
         echo " 1) aes-256-gcm"
         echo " 2) chacha20-ietf-poly1305"
         echo " 3) 2022-blake3-aes-256-gcm"
-        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+        echo " 4) 2022-blake3-aes-256-gcm (多路复用 + Padding)"
         read -p "选择 [1-4] (默认1): " ss_choice
         ss_variant=${ss_choice:-1}
         # 计算 SS 实际需要的端口数
@@ -9848,7 +9829,7 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[6]${NC} Hysteria2"
     echo -e "    ${GREEN}[7]${NC} TUICv5"
     echo -e "    ${GREEN}[8]${NC} Shadowsocks"
-    echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
+    echo -e "    ${GREEN}[9]${NC} VLESS (裸 TCP，无 TLS)"
     echo -e "    ${GREEN}[10]${NC} SOCKS5"
     echo -e "    ${GREEN}[12]${NC} VLESS (XHTTP+TLS / H2)"
     echo ""
