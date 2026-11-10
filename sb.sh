@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.41"
+export SCRIPT_VERSION="20-kevin.42"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -2562,6 +2562,16 @@ _node_tx_begin() {
     CLASH_YAML_FILE="$NODE_TX_DIR/candidate.2"
     NODE_RELAY_FILE="$NODE_TX_DIR/candidate.3"
     NODE_RELAY_LINKS_FILE="$NODE_TX_DIR/candidate.4"
+    local legacy_dns compat_dir="$NODE_TX_DIR/compat"
+    legacy_dns=$(jq -s 'any(.[];
+        any(.dns.servers[]?; has("address")) or
+        any(.dns.rules[]? | .. | objects; has("outbound")))' \
+        "$CONFIG_FILE" "$NODE_RELAY_FILE") || { _node_tx_fail; return 1; }
+    if [ "$legacy_dns" = true ]; then
+        _prepare_core_config_upgrade "$SINGBOX_BIN" "$compat_dir" || { _node_tx_fail; return 1; }
+        cp -p "$compat_dir/config.json" "$CONFIG_FILE" &&
+            cp -p "$compat_dir/relay.json" "$NODE_RELAY_FILE" || { _node_tx_fail; return 1; }
+    fi
     return 0
 }
 _node_tx_validate() {
@@ -9924,7 +9934,7 @@ main() {
         _init_relay_config
         
         # 打开管理菜单不删除旧中转、不改 DNS 或默认出口、不重启业务。
-        # DNS 迁移仅在用户选择核心更新时执行，并由更新事务备份和校验。
+        # 节点操作及核心更新在候选副本中迁移 DNS，并校验主配置与中转配置。
         
         # [BUG FIX] 检查并修复旧版服务文件
         if [ -f "$SERVICE_FILE" ]; then

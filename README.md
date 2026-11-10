@@ -69,6 +69,7 @@ sb cleanup-backups      # 仅清理历史备份
 - **域名与端口**：自有域名需正确解析到服务器；使用 HTTP-01 申请或续期证书时，公网 TCP 80 必须可达，共享入口需放行 TCP 443。
 - **Emby 网页默认关闭**：客户端 API 保留，可在反代菜单 **4** 中开启网页入口。
 - **证书默认保留**：删除反代或节点不会顺带删除证书。证书管理会检查引用后归档清理，备份位于 `/var/lib/proxyall/certificates/`；其他自定义服务的引用需自行核对。
+- **旧 DNS 配置兼容**：增删改节点时，在候选副本中适配主配置和中转配置的旧 DNS 格式，使用当前 sing-box 内核合并校验。校验与操作成功后统一提交；无法安全转换、校验失败或服务重启失败时恢复原配置。打开菜单和更新脚本本身保留现有节点配置。
 
 
 ## SS TCP 多路复用与裸 VLESS
@@ -86,6 +87,9 @@ Sub-Store 的 SS 原生解析器不读取 `smux` 查询参数。在单条订阅�
 ```bash
 TEST_SINGBOX=/path/to/sing-box TEST_MIHOMO=/path/to/mihomo \
 TEST_YQ=/path/to/yq python3 tests/tcp_nodes.py
+
+TEST_SINGBOX=/path/to/sing-box TEST_YQ=/path/to/yq \
+python3 tests/node_dns_compat.py
 ```
 
 ## VLESS + XHTTP + TLS（HTTP/2）
