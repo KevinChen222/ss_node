@@ -40,8 +40,8 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="1cad884bb97194f55d696ec8bdb19a744029bb32cd52ec09060c925b7ab57f88"
-PARSER_SHA256="682863d2ea70daa9f26cb7a3830cac59047d47f09ff99e4e30985656256805b3"
+ADVANCED_RELAY_SHA256="ab4c2c0c830465c6108c0f41660d253cad736507f07a279ed4f11be8df305c02"
+PARSER_SHA256="64988fa12d37b2a63372eeeeae77ca3b817fb27af6ba5de15b23d3dfdee302ea"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -9001,7 +9001,8 @@ _ensure_component_script() {
 
     _info "正在下载并校验组件: ${script_name}..."
     rm -f "$temp_path"
-    if ! wget -qO "$temp_path" "${COMPONENT_RAW_BASE}/${script_name}"; then
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 120 \
+        "${COMPONENT_RAW_BASE}/${script_name}" -o "$temp_path"; then
         _error "组件下载失败: ${script_name}"
         rm -f "$temp_path"
         return 1

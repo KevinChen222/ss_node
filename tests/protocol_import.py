@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate link imports and Reality probes; set TEST_SINGBOX for socket tests."""
 import http.server
+import base64
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,71 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(obj['type'], 'anytls')
         self.assertTrue(obj['tls']['reality']['enabled'])
+
+    def vmess(self, **fields):
+        node = dict(add='example.com', port='443',
+                    id='bf000d23-0752-40b4-affe-68f7707a9661', net='tcp')
+        node.update(fields)
+        link = 'vmess://' + base64.urlsafe_b64encode(json.dumps(node).encode()).decode()
+        return self.parse(base=link)
+
+    def test_empty_credentials_rejected(self):
+        for link in ('ss://@1.2.3.4:8388', 'ss://:secret@example.com:8388',
+                     'ss://aes-128-gcm:@example.com:8388',
+                     'ss://' + base64.b64encode(b'aes-128-gcm').decode() + '@example.com:8388',
+                     'vless://@example.com:443', 'trojan://@example.com:443',
+                     'trojan://%00@example.com:443'):
+            with self.subTest(link=link):
+                rc, obj = self.parse(base=link)
+                self.assertNotEqual(rc, 0)
+                self.assertIn('error', obj)
+        for value in ('', None, 123):
+            with self.subTest(uuid=value):
+                rc, obj = self.vmess(id=value)
+                self.assertNotEqual(rc, 0)
+                self.assertIn('error', obj)
+
+    def test_valid_credentials_preserved(self):
+        for link, expected in (
+                ('ss://aes-128-gcm:secret%3Arest@example.com:8388', {'method': 'aes-128-gcm', 'password': 'secret:rest'}),
+                ('trojan://secret@example.com:443', {'password': 'secret'})):
+            rc, obj = self.parse(base=link)
+            self.assertEqual(rc, 0)
+            for key, value in expected.items():
+                self.assertEqual(obj[key], value)
+
+    def test_vmess_aid_and_security(self):
+        for aid in (64, '64', 0):
+            with self.subTest(aid=aid):
+                rc, obj = self.vmess(aid=aid, scy='aes-128-gcm')
+                self.assertEqual(rc, 0, obj)
+                self.assertEqual(obj['alter_id'], int(aid))
+                self.assertEqual(obj['security'], 'aes-128-gcm')
+        rc, obj = self.vmess()
+        self.assertEqual(rc, 0, obj)
+        self.assertEqual(obj['alter_id'], 0)
+        self.assertEqual(obj['security'], 'auto')
+        for fields in ({'aid': -1}, {'aid': 1.5}, {'aid': 'bad'}, {'aid': 65536}, {'scy': 'bad'}):
+            with self.subTest(fields=fields):
+                rc, obj = self.vmess(**fields)
+                self.assertNotEqual(rc, 0)
+                self.assertIn('error', obj)
+
+    def test_tcp_headers_rejected(self):
+        rc, obj = self.vmess(type='http', host='example.com', path='/')
+        self.assertNotEqual(rc, 0)
+        self.assertIn('TCP 伪装头', obj['error'])
+        for link in (BASE + '&headerType=http', 'trojan://secret@example.com:443?headerType=http'):
+            rc, obj = self.parse(base=link)
+            self.assertNotEqual(rc, 0)
+            self.assertIn('TCP 伪装头', obj['error'])
+        for header in ('', 'none'):
+            rc, obj = self.vmess(type=header)
+            self.assertEqual(rc, 0, obj)
+        rc, obj = self.vmess(net='ws', type='none', host='example.com', path='/ws')
+        self.assertEqual(rc, 0, obj)
+        self.assertEqual(obj['transport']['type'], 'ws')
+
 
 class QuietHTTP(http.server.BaseHTTPRequestHandler):
     def do_GET(self):

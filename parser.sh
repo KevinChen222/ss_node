@@ -159,15 +159,23 @@ _parse_vmess() {
     local server=$(echo "$decoded" | jq -r '.add')
     server=$(_strip_ipv6_brackets "$server")
     local port=$(echo "$decoded" | jq -r '.port')
-    local uuid=$(echo "$decoded" | jq -r '.id')
+    local uuid
+    uuid=$(jq -er '.id | select(type == "string" and length > 0)' <<< "$decoded") || return 1
     local net=$(echo "$decoded" | jq -r '.net // "tcp"')
     local tls=$(echo "$decoded" | jq -r '.tls // ""')
     local path=$(echo "$decoded" | jq -r '.path // "/"')
     local host=$(echo "$decoded" | jq -r '.host // ""')
     local sni=$(echo "$decoded" | jq -r '.sni // ""')
 
-    local outbound=$(jq -n --arg s "$server" --argjson p "$port" --arg u "$uuid" \
-        '{type:"vmess", tag:"proxy", server:$s, server_port:$p, uuid:$u, security:"auto"}')
+    local outbound
+    outbound=$(jq --arg s "$server" --argjson p "$port" --arg u "$uuid" '
+        (.aid // 0 | tonumber) as $aid
+        | (.scy // "auto") as $security
+        | if ($aid >= 0 and $aid <= 65535 and ($aid | floor) == $aid)
+            and (["auto", "none", "zero", "aes-128-gcm", "chacha20-poly1305", "aes-128-ctr"] | index($security)) != null
+          then {type:"vmess", tag:"proxy", server:$s, server_port:$p, uuid:$u,
+                security:$security, alter_id:$aid}
+          else error("VMess aid/scy 参数无效") end' <<< "$decoded") || return 1
 
     local target_sni="${sni:-$host}"
     target_sni="${target_sni:-$server}"
@@ -246,6 +254,7 @@ _parse_ss() {
     local server port
     IFS=$'\t' read -r server port <<< "$split_result"
 
+    [[ "$method_pass" == *:* ]] || return 1
     jq -n --arg s "$server" --argjson p "$port" --arg m "${method_pass%%:*}" --arg pw "${method_pass#*:}" \
         '{type:"shadowsocks", tag:"proxy", server:$s, server_port:$p, method:$m, password:$pw}'
 }
@@ -392,7 +401,14 @@ _normalize_outbound() {
     fi
     if [[ "$link" == vless://* || "$link" == trojan://* || "$link" == vmess://* ]]; then
         case "${transport:-tcp}" in
-            tcp) ;;
+            tcp)
+                value=$(_get_param "$params" headerType)
+                if [[ "$link" == vmess://* ]]; then value=$(jq -r '.type // "none"' <<< "$decoded"); fi
+                if [[ -n "$value" && "$value" != none ]]; then
+                    echo '{"error":"不支持 TCP 伪装头，无法导入此节点"}'
+                    return 1
+                fi
+                ;;
             ws) ;;
             grpc)
                 value=$(_get_param "$params" serviceName)
@@ -458,6 +474,11 @@ _normalize_outbound() {
     jq -e 'type == "object" and (.type | type == "string")
         and (.server | type == "string" and length > 0)
         and (.server_port | type == "number" and . >= 1 and . <= 65535 and floor == .)
+        and (if .type == "shadowsocks" then
+                (.method | type == "string" and length > 0) and (.password | type == "string" and length > 0)
+             elif .type == "vless" or .type == "vmess" then (.uuid | type == "string" and length > 0)
+             elif .type == "trojan" then (.password | type == "string" and length > 0)
+             else true end)
         and (if .tls.reality.enabled == true then (.tls.reality.public_key | type == "string" and length > 0) else true end)' \
         <<< "$outbound" >/dev/null || return 1
     printf '%s\n' "$outbound"

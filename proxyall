@@ -2,10 +2,10 @@
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
 PROXYALL_VERSION="1.7.22"
-SB_SHA256="26e3639950f8dde8d0878ebf68dc107aa43b4e7468a24a2369ce591a4cb75965"
+SB_SHA256="8990b562cafe5fd590b2357cc027f096f314380de77647420167fa871ed0be49"
 DEPLOY_SHA256="c3953892e580872f08a709a8b3f28b905a101e410c42a0be08c2967a0b5a277d"
-RELAY_SHA256="1cad884bb97194f55d696ec8bdb19a744029bb32cd52ec09060c925b7ab57f88"
-PARSER_SHA256="682863d2ea70daa9f26cb7a3830cac59047d47f09ff99e4e30985656256805b3"
+RELAY_SHA256="ab4c2c0c830465c6108c0f41660d253cad736507f07a279ed4f11be8df305c02"
+PARSER_SHA256="64988fa12d37b2a63372eeeeae77ca3b817fb27af6ba5de15b23d3dfdee302ea"
 
 umask 077
 set -o pipefail
@@ -73,10 +73,40 @@ pa_dependencies() {
     for cmd in curl sha256sum flock install mktemp; do command -v "$cmd" >/dev/null 2>&1 || return 1; done
 }
 
+pa_trusted_directory_chain() {
+    local path="$1" depth="${2:-0}" owner mode link
+    [ "$depth" -lt 40 ] || return 1
+    while [ -n "$path" ]; do
+        if [ -L "$path" ]; then
+            owner=$(stat -c '%u' -- "$path") || return 1
+            [[ "$owner" = 0 || "$owner" = "$EUID" ]] || return 1
+            [ -d "$path" ] || return 1
+            link=$(readlink -- "$path") || return 1
+            [[ "$link" = /* ]] || link="$(dirname -- "$path")/$link"
+            pa_trusted_directory_chain "$link" "$((depth + 1))" || return 1
+        fi
+        if [ -e "$path" ]; then
+            [ -d "$path" ] || return 1
+            read -r owner mode < <(stat -Lc '%u %a' -- "$path")
+            [[ "$owner" = 0 || "$owner" = "$EUID" ]] || return 1
+            [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+            (( (8#$mode & 0022) == 0 )) || return 1
+        fi
+        [ "$path" != / ] || break
+        path=$(dirname -- "$path")
+    done
+}
+
 pa_safe_directory() {
     local path="$1" parent="$1"
+    [ ! -L "$path" ] || { pa_error "目录是符号链接，已停止: $path"; return 1; }
     while [ "$parent" != / ] && [ -n "$parent" ]; do
-        [ ! -L "$parent" ] || { pa_error "目录是符号链接，已停止: $parent"; return 1; }
+        if [ -L "$parent" ]; then
+            if ! pa_trusted_directory_chain "$path"; then
+                pa_error "目录符号链接的目标或权限不安全，已停止: $parent"
+                return 1
+            fi
+        fi
         parent=$(dirname -- "$parent")
     done
     [ ! -e "$path" ] || [ -d "$path" ]
@@ -154,8 +184,14 @@ pa_legacy_component() {
     local -a functions
     # 只静态识别旧脚本，不 source / 执行 VPS 上待接管的文件。
     bash -n "$target" 2>/dev/null || return 1
-    grep -Eq "^SINGBOX_DIR=[\"']?/usr/local/etc/sing-box[\"']?[[:space:]]*$" "$target" || return 1
+    if [ "$file" = deploy.sh ]; then
+        grep -Eq "^BACKUP_DIR=[\"']?/etc/nginx/backup[\"']?[[:space:]]*$" "$target" || return 1
+    else
+        grep -Eq "^SINGBOX_DIR=[\"']?/usr/local/etc/sing-box[\"']?[[:space:]]*$" "$target" || return 1
+    fi
     case "$file" in
+        sb.sh) functions=(_check_root _install_sing_box _add_vless_reality _update_script _main_menu) ;;
+        deploy.sh) functions=(show_help parse_arguments install_dependencies issue_certificate generate_nginx_config main) ;;
         advanced_relay.sh) functions=(_check_deps _init_relay_dirs _landing_config _relay_config _menu) ;;
         parser.sh) functions=(_url_decode _get_param _parse_vless _parse_vmess _parse_trojan _parse_ss) ;;
         *) return 1 ;;
@@ -171,8 +207,8 @@ pa_known_target() {
     [ -e "$target" ] || return 0
     [ -f "$target" ] || return 1
     case "$file" in
-        sb.sh) grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$target" ;;
-        deploy.sh) grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$target" ;;
+        sb.sh) grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$target" || pa_legacy_component "$target" "$file" ;;
+        deploy.sh) grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$target" || pa_legacy_component "$target" "$file" ;;
         proxyall) grep -Fqx "$PA_MARKER" "$target" ;;
         advanced_relay.sh|parser.sh)
             if grep -Fqx "# PROXYALL_COMPONENT=$file" "$target"; then return 0; fi
@@ -340,6 +376,7 @@ pa_menu() {
 
 main() {
     local action="${1:-}" i missing=0
+    [ "$#" -le 1 ] || { pa_error '参数过多，请只指定一个操作。'; pa_help >&2; return 2; }
     case "$action" in
         --version) printf '%s\n' "$PROXYALL_VERSION"; return 0 ;;
         -h|--help) pa_help; return 0 ;;
@@ -348,7 +385,6 @@ main() {
     esac
     [ "$EUID" = 0 ] || { pa_error '请用 root 或 sudo -H bash proxyall 运行。'; return 1; }
     [ "$(uname -s)" = Linux ] || { pa_error '此脚本用于 Linux VPS。'; return 1; }
-    [ "$#" -le 1 ] || return 2
     # 只读入口不触发依赖安装、脚本更新或会话状态目录初始化。
     if [ "$action" = --certificates ]; then
         pa_run /usr/local/bin/nginxproxy --certificates
