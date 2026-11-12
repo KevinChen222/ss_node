@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
-PROXYALL_VERSION="1.7.22"
+PROXYALL_VERSION="1.7.23"
 SB_SHA256="8990b562cafe5fd590b2357cc027f096f314380de77647420167fa871ed0be49"
 DEPLOY_SHA256="c3953892e580872f08a709a8b3f28b905a101e410c42a0be08c2967a0b5a277d"
 RELAY_SHA256="ab4c2c0c830465c6108c0f41660d253cad736507f07a279ed4f11be8df305c02"
@@ -37,6 +37,7 @@ proxyall：Emby / sing-box 统一管理
   proxyall --version       显示版本
   proxyall --fix-http2     备份并修复受管 Nginx 配置的 HTTP/2 旧语法
   proxyall --certificates  管理现有证书（查看、检查、续期、归档清理）
+  proxyall --swap          配置 1 GiB swap（保留已有启用的 swap）
 
 脚本更新不升级 sing-box 核心，也不迁移现有监听端口。
 新建域名 HTTPS/443 反代默认使用 HAProxy；HTTP、自定义端口和 IP 前端使用直监听。
@@ -347,6 +348,76 @@ pa_run() {
     return "$status"
 }
 
+pa_setup_swap() (
+    local swap_file="${1:-/swapfile.proxyall}" fstab="${2:-/etc/fstab}"
+    local swaps="${3:-/proc/swaps}" cmd available candidate="" backup=""
+    local created=0 active=0 committed=0
+    umask 077
+    for cmd in dd mkswap swapon swapoff df awk cp cmp mktemp mv chmod; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            pa_error "缺少命令 $cmd，请安装 coreutils 和 util-linux。"; return 1;
+        }
+    done
+    [ -r "$swaps" ] || { pa_error '无法读取系统 swap 状态。'; return 1; }
+    if awk 'NR > 1 { found=1 } END { exit !found }' "$swaps"; then
+        pa_info '系统已有启用的 swap，保持现有配置。'
+        return 0
+    fi
+    if [ -e "$swap_file" ] || [ -L "$swap_file" ]; then
+        pa_error "$swap_file 已存在，拒绝覆盖。"; return 1
+    fi
+    [ -f "$fstab" ] && [ ! -L "$fstab" ] || {
+        pa_error 'fstab 不是普通文件，无法配置开机挂载。'; return 1;
+    }
+    if awk -v path="$swap_file" '$1 == path { found=1 } END { exit !found }' "$fstab"; then
+        pa_error 'fstab 已包含该 swap 路径，请先检查现有配置。'; return 1
+    fi
+    available=$(df -Pk -- "$(dirname -- "$swap_file")" | awk 'NR == 2 {print $4}')
+    if ! [[ "$available" =~ ^[0-9]+$ ]] || [ "$available" -lt 1179648 ]; then
+        pa_error '磁盘可用空间不足，需要至少 1152 MiB。'; return 1
+    fi
+    cleanup_swap() {
+        local status=$?
+        [ -z "$candidate" ] || rm -f -- "$candidate"
+        if [ "$created" = 1 ] && [ "$committed" = 0 ]; then
+            if [ "$active" = 0 ] || swapoff "$swap_file"; then
+                rm -f -- "$swap_file"
+            else
+                pa_error "无法停用 $swap_file，文件已保留；请检查 swap 状态和开机挂载配置。"
+            fi
+        fi
+        return "$status"
+    }
+    trap cleanup_swap EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    backup=$(mktemp "${fstab}.proxyall-backup.$(date +%Y%m%d%H%M%S).XXXXXX") || return 1
+    cp -p -- "$fstab" "$backup" || return 1
+    cmp -s -- "$fstab" "$backup" || return 1
+    candidate=$(mktemp "${fstab}.proxyall.XXXXXX") || return 1
+    cp -p -- "$backup" "$candidate" || return 1
+    printf '\n%s none swap sw 0 0\n' "$swap_file" >> "$candidate" || return 1
+    (set -o noclobber; : > "$swap_file") || return 1
+    created=1
+    chmod 600 "$swap_file" || return 1
+    pa_info '正在创建 1 GiB swap...'
+    if ! dd if=/dev/zero of="$swap_file" bs=1M count=1024 conv=notrunc status=none ||
+       ! mkswap "$swap_file"; then
+        pa_error 'swap 文件创建失败。'; return 1
+    fi
+    if ! swapon "$swap_file"; then
+        pa_error '无法启用 swap，请检查虚拟化权限和文件系统是否支持 swap 文件。'; return 1
+    fi
+    active=1
+    if ! cmp -s -- "$fstab" "$backup"; then
+        pa_error 'fstab 在操作期间发生变化，请重试。'; return 1
+    fi
+    mv -f -- "$candidate" "$fstab" || return 1
+    committed=1
+    pa_info "1 GiB swap 已启用并配置开机挂载：$swap_file"
+    pa_info "fstab 备份：$backup"
+)
+
 pa_menu() {
     local choice
     while true; do
@@ -357,10 +428,11 @@ pa_menu() {
         printf '  3) 检查脚本更新\n'
         printf '  4) 卸载统一入口（保留全部服务）\n'
         printf '  5) 修复 Nginx HTTP/2 旧语法\n'
-        printf '  6) 证书管理\n\n'
+        printf '  6) 证书管理\n'
+        printf '  7) 配置 1 GiB swap\n\n'
         printf '  0) 退出脚本\n'
         printf '  ════════════════════════════════════\n'
-        read -r -p '  请选择 [0-6]: ' choice || return 0
+        read -r -p '  请选择 [0-7]: ' choice || return 0
         case "$choice" in
             1) pa_run /usr/local/bin/nginxproxy ;;
             2) pa_run /usr/local/bin/sb ;;
@@ -368,8 +440,9 @@ pa_menu() {
             4) pa_uninstall || true ;;
             5) pa_run /usr/local/bin/nginxproxy --fix-http2 || true ;;
             6) pa_run /usr/local/bin/nginxproxy --certificates || true ;;
+            7) pa_setup_swap || true ;;
             0) return 0 ;;
-            *) pa_error '请输入 0-6。' ;;
+            *) pa_error '请输入 0-7。' ;;
         esac
     done
 }
@@ -380,7 +453,7 @@ main() {
     case "$action" in
         --version) printf '%s\n' "$PROXYALL_VERSION"; return 0 ;;
         -h|--help) pa_help; return 0 ;;
-        ''|--install|--update|--uninstall|--fix-http2|--certificates) ;;
+        ''|--install|--update|--uninstall|--fix-http2|--certificates|--swap) ;;
         *) pa_help; return 2 ;;
     esac
     [ "$EUID" = 0 ] || { pa_error '请用 root 或 sudo -H bash proxyall 运行。'; return 1; }
@@ -396,6 +469,7 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     case "$action" in
+        --swap) pa_setup_swap; return $? ;;
         --install) pa_update install || return 1; pa_menu; return $? ;;
         --update) pa_update; return $? ;;
         --uninstall) pa_uninstall; return $? ;;

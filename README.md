@@ -33,6 +33,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/KevinChen222/ss_node/main/pr
 proxyall                 # 打开统一菜单
 proxyall --update        # 检查并更新配套脚本
 proxyall --certificates  # 证书管理
+proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 proxyall --fix-http2     # 修复受管 Nginx 配置的 HTTP/2 旧语法
 ```
 
@@ -44,7 +45,10 @@ proxyall --fix-http2     # 修复受管 Nginx 配置的 HTTP/2 旧语法
 | 4 | 卸载统一入口，保留服务 |
 | 5 | 修复 Nginx HTTP/2 旧语法 |
 | 6 | 证书管理 |
+| 7 | 配置 1 GiB swap |
 | 0 | 退出 |
+
+Swap 使用 `/swapfile.proxyall`，大小为 1 GiB，权限为 `600`，通过 `/etc/fstab` 开机挂载。需要至少 1152 MiB 可用磁盘空间及系统允许启用 swap；已有启用的 swap 时保持现有配置，同名文件不会被覆盖。fstab 备份保存在 `/etc/fstab.proxyall-backup.*`。
 
 脚本更新保留现有配置，不升级 sing-box 核心。旧版无法更新时，可重新执行安装命令。更新前退出其他管理菜单；脚本备份位于 `/var/lib/proxyall/backup.*`。
 
