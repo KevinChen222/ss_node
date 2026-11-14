@@ -76,6 +76,24 @@ sb cleanup-backups      # 仅清理历史备份
 - **旧 DNS 配置兼容**：增删改节点时，在候选副本中适配主配置和中转配置的旧 DNS 格式，使用当前 sing-box 内核合并校验。校验与操作成功后统一提交；无法安全转换、校验失败或服务重启失败时恢复原配置。打开菜单和更新脚本本身保留现有节点配置。
 
 
+## Reality 兼容性
+
+VLESS Reality 与 Any-Reality 分享链接使用 `firefox` 指纹。VLESS 的 mihomo YAML 使用相同指纹；Any-Reality 使用支持 AnyTLS + Reality 的 sing-box 客户端。
+
+连接 Xray 26.9.8 及以上的 Reality 服务端时，sing-box 客户端内核与所选指纹需要支持 `X25519MLKEM768`；服务端的 `minClientVer` / `maxClientVer` 也会影响认证。中转配置写入前会通过临时回环代理验证实际连接，失败时显示认证或连通性错误。
+
+回环测试使用官方 Xray 内核，默认要求连接成功；对不支持该握手的 sing-box 内核，使用 `TEST_XRAY_REALITY_EXPECT=reject` 验证认证拒绝：
+
+```bash
+TEST_SINGBOX=/path/to/sing-box TEST_XRAY=/path/to/xray \
+    python3 tests/protocol_import.py -v
+
+TEST_SINGBOX=/path/to/sing-box TEST_XRAY=/path/to/xray \
+    TEST_XRAY_REALITY_EXPECT=reject python3 tests/protocol_import.py -v
+```
+
+测试覆盖脚本生成的 VLESS / AnyTLS Reality 分享链接及连接、错误 short ID、`firefox` / `chrome` 到 Xray 的连接，以及 `minClientVer=1.8.2` 的认证限制。
+
 ## SS TCP 多路复用与裸 VLESS
 
 在 `proxyall` 中选择 **2 → 1 → 8** 创建 SS 节点。服务端启用 TCP 多路复用，mihomo 节点 YAML 包含 `smux`：使用 `h2mux`，最大连接数为 4，新建连接前的最小流数为 4，仅复用 TCP。第 **4** 项同时启用 Padding，其他 SS 选项不启用 Padding。

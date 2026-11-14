@@ -1,5 +1,15 @@
 # 修改記錄
 
+## 2026-11-14 — Reality 核心相容性
+
+版本：`proxyall 1.7.24`、`sb.sh 20-kevin.43`、`advanced_relay.sh 16-kevin.15`。
+
+- 更新 Reality 認證錯誤提示，說明 Xray 26.9.8 及以上的 X25519MLKEM768 握手要求與客戶端版本限制，不再將所有 sing-box 核心判定為不支援。
+- Xray 相容性測試可明確選擇成功或拒絕預期，涵蓋 `firefox`、`chrome` 與 `minClientVer=1.8.2`；保留錯誤 short ID 及非 Reality 探測測試。
+- 回環測試直接執行腳本生成 VLESS Reality / Any-Reality 節點，驗證分享連結、VLESS YAML 參數及實際代理連線。
+- 官方 sing-box 1.14.4 與 testing 分支 CI 構建 `3dd8aa48`（版本輸出 1.14.5）各通過 15 項測試，Xray 使用官方 26.11.9；安裝與雜湊校驗通過 9 項測試。節點格式與預設指紋維持不變。
+- 上游依據：[X25519MLKEM768 握手](https://github.com/SagerNet/sing-box/commit/39501357a5c3f5a8a32ad7c2499b97fa37230b25)、[Reality 客戶端版本](https://github.com/SagerNet/sing-box/commit/0a03261e7922fa5e8ae7c0902b2d1c03aabddb19)。
+
 ## 2026-11-12 — Swap 配置
 
 版本：`proxyall 1.7.23`。

@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.14"
+SCRIPT_VERSION="16-kevin.15"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -2016,8 +2016,8 @@ _probe_reality_outbound() (
     fi
     if grep -Eqi 'reality verification failed|received real certificate|REALITY authentication failed|x509:' "$work/log"; then
         _error "Reality 身份验证失败，未写入中转配置。"
-        _warn "请核对公钥、short_id、SNI 和系统时间；新版 Xray 还可能要求当前 sing-box 不提供的 X25519MLKEM768 握手。"
-        _warn "更换指纹或仅升级 sing-box 不保证解决；请确认落地端兼容性，或使用兼容的客户端内核。"
+        _warn "请核对公钥、short_id、SNI 和系统时间；Xray 26.9.8 及以上还要求 X25519MLKEM768 握手。"
+        _warn "请使用支持 X25519MLKEM768 及 Reality 客户端版本 1.8.2 的 sing-box 内核与指纹（如 chrome）；同时检查服务端的客户端版本限制。"
     else
         _error "Reality 连通性探测未通过，未写入中转配置；请检查网络、落地服务及探测目标的可达性。"
     fi

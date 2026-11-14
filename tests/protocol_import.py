@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate link imports and Reality probes; set TEST_SINGBOX for socket tests."""
+"""Validate imports and Reality; TEST_XRAY_REALITY_EXPECT is success or reject."""
 import http.server
 import base64
 import json
@@ -14,6 +14,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 CORE = os.environ.get('TEST_SINGBOX')
+XRAY_EXPECT = os.environ.get('TEST_XRAY_REALITY_EXPECT', 'success')
 BASE = ('vless://bf000d23-0752-40b4-affe-68f7707a9661@example.com:443?'
         'security=reality&sni=example.com&pbk=jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0'
         '&sid=0123456789abcdef&flow=xtls-rprx-vision&type=tcp')
@@ -186,6 +187,54 @@ class RealityTests(unittest.TestCase):
         self.assertEqual(p.returncode,0,p.stderr)
         self.assertIn('验证通过',p.stderr)
 
+    def test_generated_reality_nodes(self):
+        for kind in ('vless', 'anytls'):
+            with self.subTest(kind=kind):
+                port = self.port()
+                env = dict(os.environ, REPO=str(REPO), WORK=str(self.root),
+                           CORE=CORE, NODE_KIND=kind, NODE_PORT=str(port),
+                           ORIGIN_PORT=str(self.origin))
+                generated = subprocess.run(['bash', '-c', r'''
+source "$REPO/sb.sh"
+SINGBOX_DIR="$WORK"
+CONFIG_FILE="$WORK/generated.json"
+METADATA_FILE="$WORK/metadata.json"
+SINGBOX_BIN="$CORE"
+server_ip=127.0.0.1
+BATCH_MODE=true
+BATCH_PORT="$NODE_PORT"
+BATCH_SNI=localhost
+BATCH_REALITY_HANDSHAKE_SERVER=127.0.0.1
+BATCH_REALITY_HANDSHAKE_PORT="$ORIGIN_PORT"
+printf '%s\n' '{"inbounds":[],"outbounds":[{"type":"direct"}]}' > "$CONFIG_FILE"
+printf '%s\n' '{}' > "$METADATA_FILE"
+_new_node_tag() { echo generated-reality; }
+_assert_node_name_free() { return 0; }
+_add_node_to_yaml() { printf '%s\n' "$1" > "$WORK/proxy.json"; }
+if [ "$NODE_KIND" = vless ]; then
+    _add_vless_reality_impl
+else
+    _create_anyreality_node_impl 127.0.0.1 "$NODE_PORT" localhost secret \
+        generated-anytls 127.0.0.1 "$ORIGIN_PORT" 127.0.0.1 "$NODE_PORT" false
+fi
+'''], env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(generated.returncode, 0, generated.stderr)
+                metadata = json.loads((self.root/'metadata.json').read_text())['generated-reality']
+                parsed = subprocess.run(['bash', str(REPO/'parser.sh'), metadata['share_link']],
+                                        capture_output=True, text=True)
+                self.assertEqual(parsed.returncode, 0, parsed.stderr)
+                outbound = json.loads(parsed.stdout)
+                self.assertEqual(outbound['tls']['utls']['fingerprint'], 'firefox')
+                self.assertEqual(outbound['tls']['reality']['public_key'], metadata['publicKey'])
+                if kind == 'vless':
+                    proxy = json.loads((self.root/'proxy.json').read_text())
+                    self.assertEqual(proxy['client-fingerprint'], outbound['tls']['utls']['fingerprint'])
+                    self.assertEqual(proxy['reality-opts']['public-key'], metadata['publicKey'])
+                    self.assertEqual(proxy['reality-opts']['short-id'], metadata['shortId'])
+                self.start([CORE, 'run', '-c', str(self.root/'generated.json')], port)
+                result = self.probe(outbound)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_wrong_short_id(self):
         outbound=self.outbound()
         outbound['tls']['reality']['short_id']='ffffffffffffffff'
@@ -196,7 +245,15 @@ class RealityTests(unittest.TestCase):
         self.assertNotIn(self.keys['PublicKey'],p.stderr)
 
     @unittest.skipUnless(os.environ.get('TEST_XRAY'), 'set TEST_XRAY for Xray compatibility test')
-    def test_xray_reality_rejected(self):
+    def test_xray_reality(self):
+        self.check_xray_reality()
+
+    @unittest.skipUnless(os.environ.get('TEST_XRAY'), 'set TEST_XRAY for Xray compatibility test')
+    def test_xray_reality_min_client_version(self):
+        self.check_xray_reality('1.8.2')
+
+    def check_xray_reality(self, min_version=None):
+        self.assertIn(XRAY_EXPECT, ('success', 'reject'))
         port=self.port()
         config={'inbounds':[{'listen':'127.0.0.1','port':port,'protocol':'vless',
             'settings':{'clients':[{'id':'bf000d23-0752-40b4-affe-68f7707a9661','flow':'xtls-rprx-vision'}],'decryption':'none'},
@@ -204,6 +261,8 @@ class RealityTests(unittest.TestCase):
                 'target':f'127.0.0.1:{self.origin}','serverNames':['localhost'],
                 'privateKey':self.keys['PrivateKey'],'shortIds':['0123456789abcdef']}}}],
             'outbounds':[{'protocol':'freedom','settings':{'finalRules':[{'action':'allow','network':'tcp','ip':['127.0.0.1/32'],'port':str(self.http.server_port)}]}}]}
+        if min_version:
+            config['inbounds'][0]['streamSettings']['realitySettings']['minClientVer'] = min_version
         path=self.root/'xray.json';path.write_text(json.dumps(config))
         self.start([os.environ['TEST_XRAY'],'run','-c',str(path)],port)
         client_port=self.port()
@@ -217,11 +276,24 @@ class RealityTests(unittest.TestCase):
         control=subprocess.run(['curl','--silent','--show-error','--noproxy','','--proxy',f'socks5h://127.0.0.1:{client_port}',
             '--max-time','20',f'http://127.0.0.1:{self.http.server_port}/'],capture_output=True,text=True)
         self.assertEqual(control.returncode,0,control.stderr+'\n'+'\n'.join(p.read_text()[-3500:] for p in self.root.glob('process-*.log')))
-        outbound=self.outbound();outbound['server_port']=port
-        p=self.probe(outbound)
-        self.assertNotEqual(p.returncode,0)
-        self.assertIn('身份验证失败',p.stderr)
-        self.assertIn('X25519MLKEM768',p.stderr)
+        outbound = {'type':'vless','server':'127.0.0.1','server_port':port,
+                    'uuid':'bf000d23-0752-40b4-affe-68f7707a9661','flow':'xtls-rprx-vision',
+                    'tls':{'enabled':True,'server_name':'localhost',
+                           'utls':{'enabled':True},
+                           'reality':{'enabled':True,'public_key':self.keys['PublicKey'],
+                                      'short_id':'0123456789abcdef'}}}
+        for fingerprint in ('firefox', 'chrome'):
+            with self.subTest(fingerprint=fingerprint, min_version=min_version):
+                outbound['tls']['utls']['fingerprint'] = fingerprint
+                p = self.probe(outbound)
+                if XRAY_EXPECT == 'success':
+                    self.assertEqual(p.returncode, 0, p.stderr)
+                    self.assertIn('验证通过', p.stderr)
+                else:
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertIn('身份验证失败', p.stderr)
+                    self.assertIn('X25519MLKEM768', p.stderr)
+                self.assertNotIn(self.keys['PublicKey'], p.stderr)
 
     def test_non_reality_no_probe(self):
         p=self.probe({'type':'direct','tag':'direct'})

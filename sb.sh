@@ -27,7 +27,7 @@ _config_write_lock() {
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="20-kevin.42"
+export SCRIPT_VERSION="20-kevin.43"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -40,7 +40,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="ab4c2c0c830465c6108c0f41660d253cad736507f07a279ed4f11be8df305c02"
+ADVANCED_RELAY_SHA256="cf645138ec0e5ba99336ca38e9b8da3b611a00a166d3002be0e3e00472512123"
 PARSER_SHA256="64988fa12d37b2a63372eeeeae77ca3b817fb27af6ba5de15b23d3dfdee302ea"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
