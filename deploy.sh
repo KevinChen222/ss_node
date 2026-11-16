@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.11.06-local18'
+SCRIPT_VERSION='2026.11.15-local19'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -2566,6 +2566,7 @@ prepare_acme_webroot() {
         "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
     chmod 755 "$ACME_WEBROOT" "$ACME_WEBROOT/.well-known" \
         "$ACME_WEBROOT/.well-known/acme-challenge" || return 1
+    chmod a+x "$(dirname -- "$ACME_WEBROOT")" || return 1
 
     local safe_domain=${you_domain,,}
     safe_domain=${safe_domain//[^a-z0-9.-]/_}

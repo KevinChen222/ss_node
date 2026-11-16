@@ -1,5 +1,12 @@
 # 修改記錄
 
+## 2026-11-15 — HTTP-01 父目錄權限
+
+版本：`proxyall 1.7.25`、`deploy.sh 2026.11.15-local19`。
+
+- HTTP-01 配置時補齊 webroot 父目錄的穿越權限，避免嚴格 umask 下 `/var/www` 為 `700` 導致 Nginx 無法讀取挑戰檔案；保留父目錄原有讀寫權限。
+- 回歸測試涵蓋新建目錄、已有私有目錄、重複執行、權限保留及權限設定失敗。
+
 ## 2026-11-14 — Reality 核心相容性
 
 版本：`proxyall 1.7.24`、`sb.sh 20-kevin.43`、`advanced_relay.sh 16-kevin.15`。
