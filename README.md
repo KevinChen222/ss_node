@@ -136,3 +136,26 @@ python3 tests/xhttp.py
 ```
 
 测试使用临时目录和本机端口，结束时停止测试进程并清理文件。
+
+
+## VLESS + XHTTP + Reality（HTTP/2）
+
+在 `proxyall` 中选择 **2 → 1 → 13** 添加节点。SNI 选择与 Vision Reality 相同：可使用自有域名的本机 Nginx HTTPS 源站（HTTP-01 证书及自动续期），或独立 HTTPS 源站。域名使用 DNS only；本机申请证书需要公网 TCP 80 可达。
+
+- Xray 直接处理 Reality 和 XHTTP；本机 Nginx 提供 Reality 握手目标站点。选择共享 443 时，入口为 HAProxy → 回环 Xray，同一共享入口只能登记一个 Reality 默认后端，且 SNI 不能与 Emby 或其他 HTTPS 路由相同。
+- mihomo 节点使用 `network: xhttp`、`mode: stream-up`、`alpn: [h2]`、`client-fingerprint: chrome`，并在 `reality-opts` 中设置 `support-x25519mlkem768: true`。服务端 `minClientVer` 为 `1.8.2`，与 mihomo 的 Reality 握手版本匹配。
+- 默认端口为 443，XMUX 最大并发数为 1；支持查看、删除、修改端口及服务启停。配置和服务使用 `/usr/local/etc/sing-box/xray.json` 与 `proxyall-xray`。
+- 复制生成的 `vless://` 分享链接导入 Sub-Store，输出目标选择 mihomo（Clash.Meta）。链接包含 `support-x25519mlkem768=true`；Sub-Store 2.39.2 及以上支持将其转换为 `reality-opts.support-x25519mlkem768: true`。
+
+配置及节点管理测试：
+
+```bash
+python3 tests/xhttp_reality.py
+```
+
+实际流量测试使用临时目录、本机 TLS 源站及指定的测试内核：
+
+```bash
+TEST_XRAY=/path/to/xray TEST_MIHOMO=/path/to/mihomo \
+python3 tests/xhttp_reality_traffic.py
+```

@@ -100,6 +100,19 @@ class DomainReuseTests(unittest.TestCase):
         self.assertEqual(len(backup), 1)
         self.assertEqual(backup[0].read_bytes(), original)
 
+    def test_active_xray_reality_is_preserved(self):
+        self.write_json('xray.json', {'inbounds': [{'streamSettings': {
+            'security': 'reality', 'realitySettings': {'serverNames': [DOMAIN]}
+        }}]})
+        self.run_case(expected=1)
+        self.assertTrue(self.origin.exists())
+        self.assertFalse((self.root / 'reloads').exists())
+
+    def test_broken_xray_aborts_without_changes(self):
+        (self.root / 'xray.json').write_text('{broken')
+        self.run_case(expected=1)
+        self.assertTrue(self.origin.exists())
+
     def test_active_main_reality_is_preserved(self):
         self.write_json('config.json', {'inbounds': [self.active_reality()]})
         self.run_case(expected=1)
