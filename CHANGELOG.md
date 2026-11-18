@@ -1,5 +1,11 @@
 # 修改記錄
 
+## 21-xray.4 — VLESS ENC
+
+- Vision + Reality、XHTTP + Reality 及 XHTTP + TLS 共用 ENC 選擇，預設 ML-KEM-768 認證，可選 X25519 或關閉；取消與 EOF 不建立節點。
+- XHTTP 分享連結、改端口和聚合訂閱保留 ENC 公開參數，服務端私鑰僅寫入核心配置；舊節點不自動改動加密設定。
+- 保持兩種 Reality 節點的 `support-x25519mlkem768=true`；Sub-Store 2.44.16 → mihomo Alpha `2be2f08` → Xray 26.11.9 實測三種節點的 ENC 選項，驗證 XHTTP 上下載及 ENC 不匹配拒絕。
+
 ## 21-xray.3 — 節點互動返回與取消
 
 - 節點列表、刪除確認、改端口和中轉輸入支援返回；選否、原端口不變及取消不再觸發配置發布或服務重啟。

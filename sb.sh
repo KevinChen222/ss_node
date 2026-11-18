@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.3"
+export SCRIPT_VERSION="21-xray.4"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -5707,20 +5707,22 @@ _show_node_link() {
             url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=firefox&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
             ;;
         "vless-xhttp-reality")
-            local uuid="$1" sni="$2" path="$3" pk="$4" sid="$5" concurrency="${6:-}" extra=""
+            local uuid="$1" sni="$2" path="$3" pk="$4" sid="$5" concurrency="${6:-}" extra="" encryption
+            encryption=$(_get_proxy_field "$name" '.encryption // "none"') || return 1
             if [ -n "$concurrency" ]; then
                 extra=$(jq -nc --arg concurrency "$concurrency" '{xmux:{maxConcurrency:$concurrency,hMaxReusableSecs:1800}}') || return 1
                 extra="&extra=$(_url_encode "$extra")"
             fi
-            url="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&support-x25519mlkem768=true${extra}#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:${port}?encryption=$(_url_encode "$encryption")&security=reality&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&support-x25519mlkem768=true${extra}#$(_url_encode "$name")"
             ;;
         "vless-xhttp-tls")
-            local uuid="$1" sni="$2" path="$3" concurrency="${4:-}" extra=""
+            local uuid="$1" sni="$2" path="$3" concurrency="${4:-}" extra="" encryption
+            encryption=$(_get_proxy_field "$name" '.encryption // "none"') || return 1
             if [ -n "$concurrency" ]; then
                 extra=$(jq -nc --arg concurrency "$concurrency" '{xmux:{maxConcurrency:$concurrency,hMaxReusableSecs:1800}}') || return 1
                 extra="&extra=$(_url_encode "$extra")"
             fi
-            url="vless://${uuid}@${link_ip}:${port}?encryption=none&security=tls&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome${extra}#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:${port}?encryption=$(_url_encode "$encryption")&security=tls&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome${extra}#$(_url_encode "$name")"
             ;;
         "vless-ws-tls")
             # 参数: uuid, sni, ws_path, skip_verify
@@ -7214,6 +7216,7 @@ _xhttp_prepare_domain() {
 }
 
 _add_vless_xhttp_tls_impl() {
+    local profile decryption=none encryption=none
     local node_ip domain port name path tag uuid backend routed=false use_router tmp target proxy meta inbound custom_ip custom_name concurrency
     [ -n "$server_ip" ] || server_ip=$(_get_ip)
     _node_read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " custom_ip || return $?
@@ -7247,6 +7250,7 @@ _add_vless_xhttp_tls_impl() {
         fi
         _error 'XMUX 并发数必须是 1-2147483647 之间的整数。'
     done
+    profile=$(_vless_encryption_profile_prompt) || return $?
     _node_tx_begin || return 1
     _ensure_local_origin_dependencies || return 1
     _xhttp_prepare_domain "$domain" || return 1
@@ -7260,20 +7264,21 @@ _add_vless_xhttp_tls_impl() {
         fi
     fi
     _install_xray || return 1
+    _vless_encryption_keypair "$profile" || return 1
     _xhttp_prepare_certificate "$domain" || return 1
     backend=$(_sni_router_allocate_backend_port 10080) || return 1
     tag=$(_new_node_tag xhttp-in) || return 1
     uuid=$(cat /proc/sys/kernel/random/uuid) || return 1
     target="$NGINX_CONF_DIR/$tag.xhttp.conf"
     _xhttp_snapshot_nginx "$target" || return 1
-    inbound=$(jq -nc --arg tag "$tag" --arg id "$uuid" --arg path "$path" --arg host "$domain" --argjson port "$backend" \
-        '{tag:$tag,listen:"127.0.0.1",port:$port,protocol:"vless",settings:{clients:[{id:$id}],decryption:"none"},streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path,host:$host,mode:"stream-up"}}}') || return 1
+    inbound=$(jq -nc --arg dec "$decryption" --arg tag "$tag" --arg id "$uuid" --arg path "$path" --arg host "$domain" --argjson port "$backend" \
+        '{tag:$tag,listen:"127.0.0.1",port:$port,protocol:"vless",settings:{clients:[{id:$id}],decryption:$dec},streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path,host:$host,mode:"stream-up"}}}') || return 1
     _atomic_modify_json "$XRAY_CONFIG_FILE" ".inbounds += [$inbound]" || return 1
     meta=$(jq -nc --arg name "$name" --arg domain "$domain" --arg path "$path" --arg conf "$target" --argjson public "$port" --argjson backend "$backend" --argjson routed "$routed" \
         '{name:$name,core:"xray",type:"vless-xhttp",server_name:$domain,path:$path,nginxConfig:$conf,publicPort:$public,backendPort:$backend,frontedBy:(if $routed then "haproxy" else "nginx" end),routerRole:"xhttp-https"}') || return 1
     _atomic_modify_json "$METADATA_FILE" ".[$(jq -Rn --arg t "$tag" '$t')] = $meta" || return 1
-    proxy=$(jq -nc --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" --arg concurrency "$concurrency" --argjson port "$port" \
-        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","skip-cert-verify":false,"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
+    proxy=$(jq -nc --arg enc "$encryption" --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" --arg concurrency "$concurrency" --argjson port "$port" \
+        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,encryption:$enc,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","skip-cert-verify":false,"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
     _add_node_to_yaml "$proxy" || return 1
     _xhttp_nginx_config "$domain" "$path" "$backend" "$port" "$routed" > "$NODE_TX_DIR/xhttp-nginx"
     _install_managed_nginx_config "$NODE_TX_DIR/xhttp-nginx" "$target" '# Managed by proxyall XHTTP' || return 1
@@ -7282,6 +7287,7 @@ _add_vless_xhttp_tls_impl() {
 }
 
 _add_vless_xhttp_reality_impl() {
+    local profile decryption=none encryption=none
     local node_ip domain handshake_server handshake_port port backend listen="::" routed=false answer
     local path name concurrency tag uuid keypair private_key public_key short_id target inbound meta proxy
     [ -n "$server_ip" ] || server_ip=$(_get_ip)
@@ -7315,6 +7321,7 @@ _add_vless_xhttp_reality_impl() {
         fi
         _error 'XMUX 并发数必须是 1-2147483647 之间的整数。'
     done
+    profile=$(_vless_encryption_profile_prompt) || return $?
     _validate_reality_no_self_loop "$port" "$handshake_server" "$handshake_port" || return 1
     _node_tx_begin || return 1
     backend="$port"
@@ -7329,6 +7336,7 @@ _add_vless_xhttp_reality_impl() {
     elif _check_port_conflict "$port" tcp; then return 1; fi
     [ -z "${NODE_PENDING_ORIGIN:-}" ] || _prepare_local_reality_origin "$NODE_PENDING_ORIGIN" || return 1
     _install_xray || return 1
+    _vless_encryption_keypair "$profile" || return 1
     uuid=$("$XRAY_BIN" uuid) || return 1
     keypair=$("$XRAY_BIN" x25519) || return 1
     private_key=$(awk -F': ' '$1=="PrivateKey"{print $2}' <<< "$keypair")
@@ -7339,18 +7347,18 @@ _add_vless_xhttp_reality_impl() {
     target="$handshake_server"
     [[ "$target" != *:* || "$target" == \[* ]] || target="[$target]"
     target="${target}:${handshake_port}"
-    inbound=$(jq -nc --arg tag "$tag" --arg id "$uuid" --arg path "$path" --arg host "$domain" \
+    inbound=$(jq -nc --arg dec "$decryption" --arg tag "$tag" --arg id "$uuid" --arg path "$path" --arg host "$domain" \
         --arg listen "$listen" --argjson port "$backend" --arg target "$target" --arg key "$private_key" --arg sid "$short_id" \
-        '{tag:$tag,listen:$listen,port:$port,protocol:"vless",settings:{clients:[{id:$id}],decryption:"none"},streamSettings:{network:"xhttp",security:"reality",realitySettings:{target:$target,serverNames:[$host],privateKey:$key,shortIds:[$sid],minClientVer:"1.8.2"},xhttpSettings:{path:$path,host:$host,mode:"stream-up"}}}') || return 1
+        '{tag:$tag,listen:$listen,port:$port,protocol:"vless",settings:{clients:[{id:$id}],decryption:$dec},streamSettings:{network:"xhttp",security:"reality",realitySettings:{target:$target,serverNames:[$host],privateKey:$key,shortIds:[$sid],minClientVer:"1.8.2"},xhttpSettings:{path:$path,host:$host,mode:"stream-up"}}}') || return 1
     _atomic_modify_json "$XRAY_CONFIG_FILE" ".inbounds += [$inbound]" || return 1
     meta=$(jq -nc --arg name "$name" --arg domain "$domain" --arg path "$path" --arg hs "$handshake_server" \
         --argjson hp "$handshake_port" --arg pub "$public_key" --arg sid "$short_id" \
         --argjson public "$port" --argjson backend "$backend" --argjson routed "$routed" \
         '{name:$name,core:"xray",type:"vless-xhttp-reality",server_name:$domain,path:$path,publicKey:$pub,shortId:$sid,handshakeServer:$hs,handshakePort:$hp,publicPort:$public,backendPort:$backend} + (if $routed then {frontedBy:"haproxy",routerRole:"reality-default"} else {} end)') || return 1
     _atomic_modify_json "$METADATA_FILE" ".[$(jq -Rn --arg t "$tag" '$t')] = $meta" || return 1
-    proxy=$(jq -nc --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" \
+    proxy=$(jq -nc --arg enc "$encryption" --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" \
         --arg pub "$public_key" --arg sid "$short_id" --arg concurrency "$concurrency" --argjson port "$port" \
-        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","reality-opts":{"public-key":$pub,"short-id":$sid,"support-x25519mlkem768":true},"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
+        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,encryption:$enc,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","reality-opts":{"public-key":$pub,"short-id":$sid,"support-x25519mlkem768":true},"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
     _add_node_to_yaml "$proxy" || return 1
     [ "$routed" != true ] || _sni_router_register_reality sb-xhttp "$tag" "$domain" "$backend" || return 1
     _show_node_link vless-xhttp-reality "$name" "$node_ip" "$port" "$tag" "$uuid" "$domain" "$path" "$public_key" "$short_id" "$concurrency"
@@ -7464,13 +7472,35 @@ _vision_link() {
         "vless://\(.uuid)@\($host):\(.port)?\($query)#\(.name|@uri)"' <<< "$proxy"
 }
 
-_vision_profile_prompt() {
+_vless_encryption_profile_prompt() {
     local choice
-    _node_read -r -p 'VLESS 附加加密认证：1) 无（默认，仍使用 Reality） 2) X25519 3) ML-KEM-768：' choice || return $?
-    case "${choice:-1}" in
-        1) echo none ;; 2) echo x25519 ;; 3) echo mlkem768 ;;
-        *) _error '无效的 VLESS 加密选项。'; return 1 ;;
-    esac
+    printf '\nVLESS 附加加密（ENC）：\n  [1] ML-KEM-768 认证（默认，后量子认证）\n  [2] X25519 认证（握手更小）\n  [3] 不启用 ENC（仍使用 TLS / Reality）\n  [0] 返回协议选择\n两种 ENC 均使用混合密钥交换；会增加握手和计算开销，不保证提速。\n' >&2
+    while true; do
+        _node_read -r -p '请选择 [0-3]（默认 1）：' choice || return $?
+        case "${choice:-1}" in
+            1) echo mlkem768; return ;; 2) echo x25519; return ;; 3) echo none; return ;;
+            0) _node_cancel; return 2 ;;
+            *) _error '无效的 VLESS 加密选项，请重新选择。' ;;
+        esac
+    done
+}
+
+# 仅输出给客户端的 encryption 可进入分享链接；decryption 留在服务端。
+_vless_encryption_keypair() {
+    local profile="$1" pair section
+    decryption=none; encryption=none
+    if [ "$profile" != none ]; then
+        case "$profile" in x25519) section=X25519 ;; mlkem768) section=ML-KEM-768 ;; *) return 1 ;; esac
+        pair=$("$XRAY_BIN" vlessenc) || return 1
+        pair=$(awk -F'"' -v section="$section" '/^Authentication: / {ok=index($0,"Authentication: "section",")==1}
+            ok && ($2=="decryption" || $2=="encryption") {print $2"="$4}' <<< "$pair")
+        decryption=$(sed -n 's/^decryption=//p' <<< "$pair")
+        encryption=$(sed -n 's/^encryption=//p' <<< "$pair")
+        [[ "$decryption" =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]+$ &&
+           "$encryption" =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+$ ]] || {
+            _error 'Xray 未返回匹配的 VLESS Encryption 密钥对。'; return 1;
+        }
+    fi
 }
 
 _add_vless_reality_impl() {
@@ -7484,7 +7514,7 @@ _add_vless_reality_impl() {
     local backend_port=""
     local listen_address="::"
     local router_mode=false
-    local name="" profile="${BATCH_VISION_PROFILE:-none}"
+    local name="" profile="${BATCH_VISION_PROFILE:-mlkem768}"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -7535,10 +7565,10 @@ _add_vless_reality_impl() {
         local default_name="VLESS-REALITY-${port}"
         _node_read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name || return $?
         name=${custom_name:-$default_name}
-        profile=$(_vision_profile_prompt) || return $?
+        profile=$(_vless_encryption_profile_prompt) || return $?
     fi
 
-    local uuid keypair private_key public_key short_id decryption=none encryption=none pair section target
+    local uuid keypair private_key public_key short_id decryption=none encryption=none target
     [ -n "$backend_port" ] || backend_port="$port"
     local tag
     tag=$(_new_node_tag "vless-in") || return 1
@@ -7561,18 +7591,7 @@ _add_vless_reality_impl() {
     [[ "$private_key" =~ ^[A-Za-z0-9_-]{43}$ && "$public_key" =~ ^[A-Za-z0-9_-]{43}$ && "$uuid" =~ ^[0-9a-f-]{36}$ ]] || {
         _error '无法识别 Xray 的 UUID 或 Reality 密钥输出，请更新 Xray。'; return 1;
     }
-    if [ "$profile" != none ]; then
-        case "$profile" in x25519) section=X25519 ;; mlkem768) section=ML-KEM-768 ;; *) return 1 ;; esac
-        pair=$("$XRAY_BIN" vlessenc) || return 1
-        pair=$(awk -F'"' -v section="$section" '/^Authentication: / {ok=index($0,"Authentication: "section",")==1}
-            ok && ($2=="decryption" || $2=="encryption") {print $2"="$4}' <<< "$pair")
-        decryption=$(sed -n 's/^decryption=//p' <<< "$pair")
-        encryption=$(sed -n 's/^encryption=//p' <<< "$pair")
-        [[ "$decryption" =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]+$ &&
-           "$encryption" =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+$ ]] || {
-            _error 'Xray 未返回匹配的 VLESS Encryption 密钥对。'; return 1;
-        }
-    fi
+    _vless_encryption_keypair "$profile" || return 1
     target="$handshake_server"
     [[ "$target" != *:* || "$target" == \[* ]] || target="[$target]"
     local inbound_json

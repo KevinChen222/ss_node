@@ -121,8 +121,8 @@ class Interaction(unittest.TestCase):
                  for n in range(1, 7)]
         cases += [
             ('vision', '', ['127.0.0.1', 'y', '1', 'example.test', '443', 'y', 'New', '1']),
-            ('xhttp-reality', '', ['127.0.0.1', 'y', '1', 'example.test', '443', 'y', '/test/', 'New', '1']),
-            ('xhttp-tls', '', ['127.0.0.1', 'example.test', '443', 'y', '/test/', 'New', '1']),
+            ('xhttp-reality', '', ['127.0.0.1', 'y', '1', 'example.test', '443', 'y', '/test/', 'New', '1', '1']),
+            ('xhttp-tls', '', ['127.0.0.1', 'example.test', '443', 'y', '/test/', 'New', '1', '1']),
         ]
         for action, variant, answers in cases:
             for i in range(len(answers)):

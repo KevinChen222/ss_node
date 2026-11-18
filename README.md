@@ -23,9 +23,9 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 
 | 添加节点子菜单 | 服务端与客户端 |
 | --- | --- |
-| 1 | VLESS TCP + Vision + Reality。Chrome 指纹、X25519MLKEM768 握手、XUDP；可选 X25519 或 ML-KEM-768 认证的 VLESS Encryption。默认 `encryption=none` 仍有 Reality 保护。 |
-| 2 | VLESS XHTTP + Reality。Xray 处理握手，无需 Nginx 终止 TLS。 |
-| 3 | VLESS XHTTP + TLS。Nginx 终止 HTTP/2，再转发至回环 Xray。 |
+| 1 | VLESS TCP + Vision + Reality。Chrome 指纹、X25519MLKEM768 握手、XUDP；支持 VLESS ENC。 |
+| 2 | VLESS XHTTP + Reality，支持 VLESS ENC。Xray 处理握手，无需 Nginx 终止 TLS。 |
+| 3 | VLESS XHTTP + TLS，支持 VLESS ENC。Nginx 终止 HTTP/2，再转发至回环 Xray。 |
 | 4 / 5 / 6 | VLESS WS+TLS / Trojan WS+TLS / VLESS gRPC+TLS。复用 `/etc/nginx/certs/<域名>/cert` 与 `key`，由 Xray 终止 TLS。 |
 | 7 / 8 / 9 | Shadowsocks AES-128-GCM / 裸 VLESS TCP / 带密码的 SOCKS5。裸 TCP 和 SOCKS5 不提供传输加密。 |
 
@@ -35,7 +35,11 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 
 将生成的链接粘贴到 Sub-Store，输出选 `Clash.Meta / mihomo`。不要将服务器的 `xray.json` 当成客户端订阅。内部 `clash.yaml`、元数据及 `xray.json` 位于 `/usr/local/etc/sing-box/`；目录名保留以便原位更新。
 
-Vision 的三种认证配置均按 Xray 26.11.9、Sub-Store 2.44.16、mihomo Alpha `2be2f08` 验证。`support-x25519mlkem768` 指 Reality 的混合密钥交换，独立于 VLESS 附加加密。这个 mihomo 构建没有 Reality `pqv` 验证密钥配置，生成器不启用依赖它的 ML-DSA-65 验证。Trojan 导出可省略 `tls: true`，mihomo 按 Trojan TLS 处理；仍需可信证书。
+Vision + Reality、XHTTP + Reality 和 XHTTP + TLS 创建时均可选择 VLESS Encryption（ENC），默认启用 ML-KEM-768 认证，也可选择握手较小的 X25519 认证或不启用 ENC。两种 ENC 均使用 ML-KEM-768 + X25519 混合密钥交换，ML-KEM-768 认证额外提供后量子身份认证；代价是更长的分享链接和更多握手开销，不保证提高吞吐。XHTTP + TLS 的 ENC 独立于外层 TLS，可让 VLESS 内容在 TLS 终止后继续保持加密。旧节点不会自动更换密钥或开启 ENC；新配置的客户端必须导入完整链接。
+
+上述三种节点的 ENC 选项已通过 Xray 26.11.9、Sub-Store 2.44.16、mihomo Alpha `2be2f08` 实际连接验证。服务端 `decryption` 与客户端 `encryption` 自动配对，改端口、查看链接和聚合订阅保留对应参数。
+
+Vision + Reality 和 XHTTP + Reality 的分享链接始终包含 `support-x25519mlkem768=true`，Sub-Store 导出为 `reality-opts.support-x25519mlkem768: true`。它指 Reality 的混合密钥交换，独立于 VLESS ENC；XHTTP + TLS 不使用 Reality，不添加此字段。这个 mihomo 构建没有 Reality `pqv` 验证密钥配置，生成器不启用依赖它的 ML-DSA-65 验证。Trojan 导出可省略 `tls: true`，mihomo 按 Trojan TLS 处理；仍需可信证书。
 
 XHTTP 使用 `stream-up`、HTTP/2 和 XMUX。单连接最大并发可调，默认 1，可复用时长为 1800 秒。使用 CDN 时，仅选择支持 HTTP/2 和流式 gRPC 的 TLS 入口；Reality 使用直连。中转链接支持本菜单生成的传输组合；无法完整转换的第三方参数用 Xray outbound JSON 配置。
 
@@ -78,6 +82,9 @@ TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs python3 tests/xhttp.py
 
 TEST_XRAY=/path/to/xray TEST_MIHOMO=/path/to/mihomo \
 TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs python3 tests/xhttp_reality_traffic.py
+
+TEST_XRAY=/path/to/xray TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs \
+python3 tests/vless_encryption.py
 
 python3 tests/xhttp_reality.py
 python3 tests/installer.py

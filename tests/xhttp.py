@@ -175,8 +175,8 @@ http {{
             self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr[-4000:])
         return result
 
-    def add(self, domain='xhttp.test', name='XHTTP test', concurrency='', **extra):
-        return self.run_shell('add', f'\n{domain}\n{self.public}\n/test/\n{name}\n{concurrency}\n', **extra)
+    def add(self, domain='xhttp.test', name='XHTTP test', concurrency='', enc='', **extra):
+        return self.run_shell('add', f'\n{domain}\n{self.public}\n/test/\n{name}\n{concurrency}\n{enc}\n', **extra)
 
     def json(self, name):
         return json.loads((self.root / name).read_text())
@@ -340,6 +340,13 @@ http {{
         self.assertEqual(result.stdout, server.payload)
         uploaded = subprocess.check_output(curl + ['--data-binary', '@-', url], input=server.payload)
         self.assertEqual(uploaded.decode(), hashlib.sha256(server.payload).hexdigest())
+        # The extra encryption must be enforced beyond the outer TLS connection.
+        badport = port()
+        bad = dict(proxy, encryption='none')
+        (self.root / 'wrong-enc.json').write_text(json.dumps({'mixed-port': badport, 'proxies': [bad], 'rules': ['MATCH,' + bad['name']]}))
+        self.start([TOOLS['mihomo'], '-d', str(self.root/'wrong-client'), '-f', str(self.root/'wrong-enc.json')], badport, env)
+        rejected = subprocess.run(['curl', '-fsS', '--max-time', '4', '--noproxy', '', '-x', f'http://127.0.0.1:{badport}', url], capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
         view = self.run_shell('view').stdout
         self.assertIn('type=xhttp', view)
         self.assertIn('alpn=h2', view)
@@ -354,6 +361,25 @@ http {{
         self.assertEqual(self.json('metadata.json'), {})
         self.assertTrue((self.root / 'certs/xhttp.test/cert').exists())
         self.assertEqual(subprocess.check_output(['curl', '-fsS', f'http://127.0.0.1:{self.webport}/']), b'website')
+
+    @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE for exported XHTTP traffic')
+    def test_xhttp_tls_other_enc_profiles(self):
+        for choice in ('2', '3'):
+            with self.subTest(choice=choice):
+                self.add(enc=choice)
+                meta = next(iter(self.json('metadata.json').values()))
+                proxy = self.exported(meta['share_link'])
+                expected = json.loads(subprocess.check_output([TOOLS['yq'], '-o=json', str(self.root/'clash.yaml')]))['proxies'][0]
+                self.assertEqual(proxy['encryption'], expected['encryption'])
+                self.assertEqual(proxy['encryption'] == 'none', choice == '3')
+                mixed = port()
+                cfg = self.root/f'enc-{choice}.json'
+                cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[proxy],'rules':['MATCH,'+proxy['name']]}))
+                self.start([TOOLS['mihomo'], '-d', str(self.root/f'client-{choice}'), '-f', str(cfg)], mixed,
+                           dict(os.environ, SSL_CERT_FILE=str(self.root/'certs/xhttp.test/cert')))
+                response = subprocess.run(['curl','-fsS','--max-time','5','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.webport}/'],capture_output=True)
+                self.assertEqual(response.stdout, b'website', response.stderr)
+                self.run_shell('delete', '1\ny\n')
 
     def test_restart_failure_rolls_back(self):
         self.add()
@@ -401,7 +427,7 @@ server {{
                  'https_backend': {'host': '127.0.0.1', 'port': backend},
                  'https_routes': {'emby.test': {'owner': 'nginx-proxy'}}, 'tls_routes': {}}
         (self.root / 'router/state.json').write_text(json.dumps(state))
-        self.run_shell('add', '\nxhttp.test\n443\ny\n/test/\nShared XHTTP\n\n')
+        self.run_shell('add', '\nxhttp.test\n443\ny\n/test/\nShared XHTTP\n\n\n')
         state = self.json('router/state.json')
         self.assertEqual(state['https_routes']['emby.test']['owner'], 'nginx-proxy')
         self.assertEqual(state['https_routes']['xhttp.test']['owner'], 'sb-xhttp')

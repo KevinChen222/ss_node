@@ -68,7 +68,7 @@ class XMUXTests(unittest.TestCase):
         return result
 
     def add(self, concurrency=''):
-        return self.run_shell('add', '\nxhttp.test\n8443\n/test/\nXHTTP test\n' + concurrency + '\n')
+        return self.run_shell('add', '\nxhttp.test\n8443\n/test/\nXHTTP test\n' + concurrency + '\n3\n')
 
     def read_json(self, name):
         return json.loads((self.root / name).read_text())

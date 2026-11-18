@@ -6,7 +6,7 @@ from xhttp_reality import REALITY_HARNESS
 
 def port():
  with socket.socket() as s:s.bind(('127.0.0.1',0));return s.getsockname()[1]
-def run_traffic():
+def run_traffic(enc=''):
     root=Path(tempfile.mkdtemp(prefix='proxyall-reality-e2e-'))
     xray = os.environ['TEST_XRAY']
     mihomo = os.environ['TEST_MIHOMO']
@@ -17,14 +17,14 @@ def run_traffic():
     (root/'router.json').write_text('{"reality":null}')
     (root/'harness.sh').write_text(REALITY_HARNESS.replace('SELECTED_REALITY_HANDSHAKE_PORT=8443',f'SELECTED_REALITY_HANDSHAKE_PORT={origin}'))
     env=dict(os.environ,WORK=str(root),REPO=str(Path(__file__).resolve().parents[1]),ACTION='add',TEST_REALITY_KEYGEN=xray)
-    r=subprocess.run(['bash',str(root/'harness.sh')],input=f'\n{public}\n/test/\nXHTTP test\n1\n',text=True,env=env,capture_output=True)
+    r=subprocess.run(['bash',str(root/'harness.sh')],input=f'\n{public}\n/test/\nXHTTP test\n1\n{enc}\n',text=True,env=env,capture_output=True)
     assert r.returncode==0,r.stderr
     subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(root/'key'),'-out',str(root/'cert'),'-subj','/CN=own.example.com','-days','1'],capture_output=True,check=True)
     proxy=json.loads((root/'client.json').read_text())['proxies'][0]
     if os.environ.get('TEST_SUBSTORE'):
      link=json.loads((root/'metadata.json').read_text())['xhttp-in-test']['share_link']
      exported=json.loads(subprocess.check_output(['node',str(Path(__file__).with_name('substore_link.mjs'))],input=link,text=True))
-     for key in ('uuid','network','alpn','client-fingerprint','servername','reality-opts','xhttp-opts'):
+     for key in ('uuid','encryption','network','alpn','client-fingerprint','servername','reality-opts','xhttp-opts'):
       assert exported[key]==proxy[key],(key,exported.get(key),proxy[key])
      proxy=exported
     proxy['server']='127.0.0.1'
@@ -50,7 +50,15 @@ def run_traffic():
      r=subprocess.run(cmd,text=True,capture_output=True);assert r.returncode==0,(r.stderr,(root/'mihomo.log').read_text()[-3500:],(root/'xray.log').read_text()[-3500:]);assert r.stdout=='proxyall-reality-ok',r.stdout
      payload=b'upload-data'*100000
      r=subprocess.run(cmd[:-1]+['--data-binary','@-',cmd[-1]],input=payload,capture_output=True);assert r.returncode==0,r.stderr;assert r.stdout.decode()==hashlib.sha256(payload).hexdigest()
-     print('PASS: generated mihomo node -> Xray -> HTTP GET and 1.1 MB POST')
+     if enc != '3':
+      bad=dict(proxy,encryption='none')
+      badport=port()
+      (root/'wrong-enc.json').write_text(json.dumps({'mixed-port':badport,'proxies':[bad],'rules':['MATCH,XHTTP test']}))
+      start([mihomo,'-d',str(root/'wrong-client'),'-f',str(root/'wrong-enc.json')],'wrong-client.log')
+      time.sleep(1)
+      wrong=subprocess.run(['curl','-fsS','--max-time','4','--noproxy','','--proxy',f'http://127.0.0.1:{badport}',f'http://127.0.0.1:{web}/'],capture_output=True)
+      assert wrong.returncode != 0, 'XHTTP Reality accepted a client without required ENC'
+     print(f'PASS: XHTTP Reality ENC={enc or "default ML-KEM-768"} -> HTTP GET and 1.1 MB POST; ENC mismatch rejected when enabled')
     finally:
      for p,f in reversed(procs):p.terminate();p.wait(timeout=5);f.close()
      srv.shutdown()
@@ -61,4 +69,5 @@ if __name__ == '__main__':
     if not all(os.environ.get(name) for name in ('TEST_XRAY', 'TEST_MIHOMO')):
         print('SKIP: set TEST_XRAY and TEST_MIHOMO to run the traffic test')
     else:
-        run_traffic()
+        for enc in ('', '2', '3'):
+            run_traffic(enc)

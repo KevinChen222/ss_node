@@ -46,7 +46,7 @@ esac
         binary.chmod(0o700)
 
     def add(self, concurrency='', port=8444, extra=''):
-        return self.run_shell('add', f'\n{port}\n{extra}/test/\nXHTTP test\n{concurrency}\n')
+        return self.run_shell('add', f'\n{port}\n{extra}/test/\nXHTTP test\n{concurrency}\n3\n')
 
     def link_query(self):
         query = super().link_query()
@@ -70,7 +70,7 @@ esac
         self.assertNotIn('flow', self.link_query())
 
     def test_target_port_cannot_loop_into_listener(self):
-        result = self.run_shell('add', '\n8443\n/test/\nXHTTP test\n1\n', check=False)
+        result = self.run_shell('add', '\n8443\n/test/\nXHTTP test\n1\n3\n', check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.read_json('xray.json')['inbounds'], [])
 
@@ -117,7 +117,7 @@ esac
 
     def test_shared_entry_conflict(self):
         (self.root / 'router.json').write_text('{"reality":{"tag":"other"}}')
-        result = self.run_shell('add', '\n443\ny\n/test/\nXHTTP test\n1\n', check=False)
+        result = self.run_shell('add', '\n443\ny\n/test/\nXHTTP test\n1\n3\n', check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.read_json('xray.json')['inbounds'], [])
 
