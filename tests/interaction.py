@@ -127,7 +127,7 @@ class Interaction(unittest.TestCase):
         self.assertEqual(self.run_shell('delete').returncode, 2)
 
     def test_every_creation_prompt_can_cancel_or_eof(self):
-        cases = [('native', n, ['127.0.0.1', '8443', 'New'] + (['example.test'] if n >= 4 else []))
+        cases = [('native', n, ['127.0.0.1', '8443', 'New'] + (['example.test'] if n >= 4 else ['1'] if n == 1 else []))
                  for n in range(1, 7)]
         cases += [
             ('vision', '', ['127.0.0.1', 'y', '1', 'example.test', '443', 'y', 'New', '1']),

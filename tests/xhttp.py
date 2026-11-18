@@ -256,7 +256,7 @@ http {{
         for variant, protocol in ((2, 'shadowsocks'), (1, 'vless')):
             with self.subTest(landing=protocol):
                 landing_port = port()
-                self.run_shell('native', f'{variant}\n127.0.0.1\n{landing_port}\nlanding-{protocol}\n')
+                self.run_shell('native', f'{variant}\n127.0.0.1\n{landing_port}\nlanding-{protocol}\n' + ('\n' if variant == 1 else ''))
                 landing, meta = next((tag, node) for tag, node in self.json('metadata.json').items()
                                      if node['publicPort'] == landing_port)
                 self.run_shell('relay', f"{selection}\n{meta['share_link']}\n")
@@ -281,7 +281,7 @@ http {{
         for variant in range(1,7):
             with self.subTest(variant=variant):
                 public=port()
-                self.run_shell('native',f'{variant}\n127.0.0.1\n{public}\nnode{variant}\n' + ('xhttp.test\n' if variant>=4 else ''))
+                self.run_shell('native',f'{variant}\n127.0.0.1\n{public}\nnode{variant}\n' + ('xhttp.test\n' if variant>=4 else '\n' if variant == 1 else ''))
                 meta=next(m for m in self.json('metadata.json').values() if m['publicPort']==public)
                 proxy=self.exported(meta['share_link'])
                 saved=json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))

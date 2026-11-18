@@ -218,7 +218,7 @@ case "$ACTION" in
     def test_native_name_address_and_tls_fields(self):
         for variant in (1, 2, 3, 4, 5, 6):
             with self.subTest(variant=variant):
-                self.fixture.run_shell('native', f'{variant}\n127.0.0.1\n{xhttp.port()}\nNative\n'+('xhttp.test\n' if variant>=4 else ''))
+                self.fixture.run_shell('native', f'{variant}\n127.0.0.1\n{xhttp.port()}\nNative\n'+('xhttp.test\n' if variant>=4 else '\n' if variant == 1 else ''))
                 self.edit('name', 'Renamed\ny\n')
                 self.edit('server', '::1\ny\n')
                 self.assert_export()

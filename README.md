@@ -27,7 +27,9 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 | 2 | VLESS XHTTP + Reality，支持 VLESS ENC。Xray 处理握手，无需 Nginx 终止 TLS。 |
 | 3 | VLESS XHTTP + TLS，支持 VLESS ENC。Nginx 终止 HTTP/2，再转发至回环 Xray。 |
 | 4 / 5 / 6 | VLESS WS+TLS / Trojan WS+TLS / VLESS gRPC+TLS。复用 `/etc/nginx/certs/<域名>/cert` 与 `key`，由 Xray 终止 TLS。 |
-| 7 / 8 / 9 | Shadowsocks AES-128-GCM / 裸 VLESS TCP / 带密码的 SOCKS5。裸 TCP 和 SOCKS5 不提供传输加密。 |
+| 7 | Shadowsocks AES-128-GCM。 |
+| 8 | VLESS TCP + ENC，无 TLS。无需域名或证书，ENC 方式可选，适合作为链式代理的落地节点。 |
+| 9 | 带密码的 SOCKS5，不提供传输加密。 |
 
 节点管理菜单 2 / 3 / 4 用于查看分享链接、修改节点参数和删除节点，菜单 5 为选定入口绑定落地链接或 Xray outbound JSON，输入 `direct` 解除绑定。
 
@@ -35,9 +37,11 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 
 将生成的链接粘贴到 Sub-Store，输出选 `Clash.Meta / mihomo`。不要将服务器的 `xray.json` 当成客户端订阅。内部 `clash.yaml`、元数据及 `xray.json` 位于 `/usr/local/etc/sing-box/`；目录名保留以便原位更新。
 
-Vision + Reality、XHTTP + Reality 和 XHTTP + TLS 创建时均可选择 VLESS Encryption（ENC），默认启用 ML-KEM-768 认证，也可选择握手较小的 X25519 认证或不启用 ENC。两种 ENC 均使用 ML-KEM-768 + X25519 混合密钥交换，ML-KEM-768 认证额外提供后量子身份认证；代价是更长的分享链接和更多握手开销，不保证提高吞吐。XHTTP + TLS 的 ENC 独立于外层 TLS，可让 VLESS 内容在 TLS 终止后继续保持加密。旧节点不会自动更换密钥或开启 ENC；新配置的客户端必须导入完整链接。
+Vision + Reality、XHTTP + Reality、XHTTP + TLS 和无 TLS 的 VLESS TCP 创建时均可选择 VLESS Encryption（ENC），默认启用 ML-KEM-768 认证，也可选择握手较小的 X25519 认证或不启用 ENC。两种 ENC 均使用 ML-KEM-768 + X25519 混合密钥交换，ML-KEM-768 认证额外提供后量子身份认证；代价是更长的分享链接和更多握手开销，不保证提高吞吐。XHTTP + TLS 的 ENC 独立于外层 TLS，可让 VLESS 内容在 TLS 终止后继续保持加密。旧节点不会自动更换密钥或开启 ENC；新配置的客户端必须导入完整链接。
 
-上述三种节点的 ENC 选项已通过 Xray 26.11.9、Sub-Store 2.44.16、mihomo Alpha `2be2f08` 实际连接验证。服务端 `decryption` 与客户端 `encryption` 自动配对，改端口、查看链接和聚合订阅保留对应参数。
+无 TLS 的 VLESS TCP 选择关闭 ENC 后不提供代理层加密；可在已有加密隧道内使用。它不发送 TLS SNI，不能使用 HAProxy 的 SNI 共享入口，请选择独立端口。已有裸 VLESS TCP 节点可通过菜单 3 的 ENC 参数开启加密，再更新客户端链接。
+
+上述四种节点的 ENC 选项已通过 Xray 26.11.9、Sub-Store 2.44.16、mihomo Alpha `2be2f08` 实际连接验证。服务端 `decryption` 与客户端 `encryption` 自动配对，改端口、查看链接和聚合订阅保留对应参数。无 TLS VLESS ENC 作为 mihomo 的落地节点，通过 `dialer-proxy` 分别连接上述三种 TLS / Reality 前置，已验证 TCP 和 UDP 流量。
 
 Vision + Reality 和 XHTTP + Reality 的分享链接始终包含 `support-x25519mlkem768=true`，Sub-Store 导出为 `reality-opts.support-x25519mlkem768: true`。它指 Reality 的混合密钥交换，独立于 VLESS ENC；XHTTP + TLS 不使用 Reality，不添加此字段。这个 mihomo 构建没有 Reality `pqv` 验证密钥配置，生成器不启用依赖它的 ML-DSA-65 验证。Trojan 导出可省略 `tls: true`，mihomo 按 Trojan TLS 处理；仍需可信证书。
 
@@ -97,6 +101,10 @@ python3 tests/vless_encryption.py
 TEST_XRAY=/path/to/xray TEST_MIHOMO=/path/to/mihomo TEST_YQ=/path/to/yq \
 TEST_NGINX=/path/to/nginx TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs \
 python3 tests/node_edit.py
+
+TEST_XRAY=/path/to/xray TEST_MIHOMO=/path/to/mihomo TEST_YQ=/path/to/yq \
+TEST_NGINX=/path/to/nginx TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs \
+python3 tests/vless_tcp_encryption.py
 
 python3 tests/xhttp_reality.py
 python3 tests/installer.py

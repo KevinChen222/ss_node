@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.5"
+export SCRIPT_VERSION="21-xray.6"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -7481,8 +7481,9 @@ _vision_link() {
 }
 
 _vless_encryption_profile_prompt() {
-    local choice
-    printf '\nVLESS 附加加密（ENC）：\n  [1] ML-KEM-768 认证（默认，后量子认证）\n  [2] X25519 认证（握手更小）\n  [3] 不启用 ENC（仍使用 TLS / Reality）\n  [0] 返回协议选择\n两种 ENC 均使用混合密钥交换；会增加握手和计算开销，不保证提速。\n' >&2
+    local choice unencrypted="仍使用 TLS / Reality"
+    [ "${1:-}" != none ] || unencrypted="无加密，仅用于受控网络或已有加密隧道"
+    printf '\nVLESS 附加加密（ENC）：\n  [1] ML-KEM-768 认证（默认，后量子认证）\n  [2] X25519 认证（握手更小）\n  [3] 不启用 ENC（%s）\n  [0] 返回协议选择\n两种 ENC 均使用混合密钥交换；会增加握手和计算开销，不保证提速。\n' "$unencrypted" >&2
     while true; do
         _node_read -r -p '请选择 [0-3]（默认 1）：' choice || return $?
         case "${choice:-1}" in
@@ -10435,6 +10436,11 @@ print(urlunsplit((u.scheme, netloc, u.path, urlencode(q, quote_via=quote), fragm
 PY
 }
 
+_xray_enc_editable() {
+    [[ "$1" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]] ||
+        { [ "$1" = native-vless ] && [ "$2" = none ] && [[ "$3" = raw || "$3" = tcp ]]; }
+}
+
 _xray_edit_node_menu() {
     local tag="$1" meta kind name security network choice field status
     while true; do
@@ -10444,7 +10450,7 @@ _xray_edit_node_menu() {
         network=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.streamSettings.network // "raw"' "$XRAY_CONFIG_FILE") || return 1
         printf '\n  修改节点：%s\n  [1] 节点名称\n  [2] 客户端连接地址\n  [3] 公网端口\n' "$name"
         if [[ "$security" = reality || "$security" = tls || "$kind" = vless-xhttp ]]; then printf '  [4] SNI 域名 / 证书源站\n'; fi
-        if [[ "$kind" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]]; then printf '  [5] VLESS ENC 方式\n'; fi
+        if _xray_enc_editable "$kind" "$security" "$network"; then printf '  [5] VLESS ENC 方式\n'; fi
         if [[ "$network" = xhttp || "$network" = ws || "$network" = grpc ]]; then printf '  [6] 传输路径 / gRPC 服务名\n'; fi
         [ "$network" != xhttp ] || printf '  [7] XHTTP XMUX 并发数\n'
         printf '  [0] 返回节点列表\n\n'
@@ -10454,7 +10460,7 @@ _xray_edit_node_menu() {
             0) return 2 ;;
             1) field=name ;; 2) field=server ;; 3) field=port ;;
             4) [[ "$security" = reality || "$security" = tls || "$kind" = vless-xhttp ]] && field=sni ;;
-            5) [[ "$kind" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]] && field=enc ;;
+            5) _xray_enc_editable "$kind" "$security" "$network" && field=enc ;;
             6) [[ "$network" = xhttp || "$network" = ws || "$network" = grpc ]] && field=path ;;
             7) [ "$network" = xhttp ] && field=concurrency ;;
         esac
@@ -10510,7 +10516,7 @@ _xray_edit_field() {
                 [[ "$answer" =~ ^[Nn]$ ]] || routed=true
             fi ;;
         enc)
-            [[ "$kind" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]] || return 1
+            _xray_enc_editable "$kind" "$security" "$network" || return 1
             encryption=$(jq -r '.encryption // "none"' <<< "$proxy")
             old=none
             if [ "$encryption" != none ]; then
@@ -10520,6 +10526,7 @@ _xray_edit_field() {
             printf '当前 ENC 认证：%s\n' "$old"
             # 编辑时回车保持原设置；创建节点仍使用默认 ML-KEM-768。
             printf '  [1] ML-KEM-768\n  [2] X25519\n  [3] 关闭 ENC\n'
+            [ "$security" != none ] || [ "$kind" != native-vless ] || _info '此节点没有 TLS；关闭 ENC 后不提供代理层加密。'
             _node_read -r -p '新 ENC 方式（回车保持，0 取消）：' answer || return $?
             case "$answer" in '') value="$old" ;; 1) value=mlkem768 ;; 2) value=x25519 ;; 3) value=none ;; *) _error '无效的 ENC 选项。'; return 1 ;; esac ;;
         sni)
@@ -10767,10 +10774,10 @@ _xray_native_listener() {
 
 _xray_native_add() {
     local variant server port name sni='' proto net=raw path='' cert key id pw tag user=proxy settings stream proxy url host
-    local native_backend native_listen native_routed
+    local native_backend native_listen native_routed profile=none decryption=none encryption=none
     variant="${1:-}"
     if [ -z "$variant" ]; then
-        printf '  1) VLESS TCP\n  2) Shadowsocks AES-128-GCM\n  3) SOCKS5 账号密码\n  4) VLESS WS+TLS\n  5) Trojan WS+TLS\n  6) VLESS gRPC+TLS\n'
+        printf '  1) VLESS TCP + ENC（无 TLS）\n  2) Shadowsocks AES-128-GCM\n  3) SOCKS5 账号密码\n  4) VLESS WS+TLS\n  5) Trojan WS+TLS\n  6) VLESS gRPC+TLS\n'
         _node_read -r -p '选择：' variant || return $?
     fi
     case "$variant" in 1|4|6) proto=vless ;; 2) proto=shadowsocks ;; 3) proto=socks ;; 5) proto=trojan ;; *) return 1 ;; esac
@@ -10782,6 +10789,9 @@ _xray_native_add() {
     _node_read -r -p "节点名（默认 $proto-$port）：" name || return $?
     name="${name:-$proto-$port}"; _assert_node_name_free "$name" || return 1
     stream='{"network":"raw","security":"none"}'
+    if [ "$variant" = 1 ]; then
+        profile=$(_vless_encryption_profile_prompt none) || return $?
+    fi
     if ((variant >= 4)); then
         _node_read -r -p '证书域名 / SNI：' sni || return $?
         _is_valid_reality_domain "$sni" || return 1
@@ -10796,6 +10806,7 @@ _xray_native_add() {
              (if $net=="grpc" then {grpcSettings:{serviceName:$path}} else {wsSettings:{path:("/"+$path)}} end)') || return 1
     fi
     _install_xray || return 1
+    [ "$variant" != 1 ] || _vless_encryption_keypair "$profile" || return 1
     tag=$(_new_node_tag xray-in) && id=$("$XRAY_BIN" uuid) && pw=$(openssl rand -hex 24) || return 1
     _xray_native_listener "$port" "$sni" "$tag" || return 1
     if [[ "$proto" = socks || "$proto" = shadowsocks ]]; then _check_port_conflict "$port" udp && return 1; fi
@@ -10804,9 +10815,12 @@ _xray_native_add() {
     case "$proto" in
         vless|trojan)
             if [ "$proto" = vless ]; then
-                settings=$(jq -nc --arg id "$id" '{clients:[{id:$id}],decryption:"none"}')
+                settings=$(jq -nc --arg id "$id" --arg dec "$decryption" '{clients:[{id:$id}],decryption:$dec}')
                 proxy=$(jq -c --arg id "$id" '.+{type:"vless",uuid:$id}' <<< "$proxy")
-                url="vless://$id@$host:$port?encryption=none"
+                if [ "$variant" = 1 ]; then
+                    proxy=$(jq -c --arg enc "$encryption" '.+{encryption:$enc}' <<< "$proxy") || return 1
+                fi
+                url="vless://$id@$host:$port?encryption=$(_url_encode "$encryption")"
             else
                 settings=$(jq -nc --arg pw "$pw" '{clients:[{password:$pw}]}')
                 proxy=$(jq -c --arg pw "$pw" '.+{type:"trojan",password:$pw}' <<< "$proxy")
@@ -11062,7 +11076,7 @@ _retire_legacy_service() (
 _xray_add_node_menu() {
     local choice NODE_UI=true NODE_PENDING_ORIGIN=''
     while true; do
-        printf '\n  ═══════════════════════════════════════\n             Xray 添加节点\n  ═══════════════════════════════════════\n\n  【协议选择】\n    [1] VLESS (Vision + Reality)\n    [2] VLESS (XHTTP + Reality)\n    [3] VLESS (XHTTP + TLS)\n    [4] VLESS (WebSocket + TLS)\n    [5] Trojan (WebSocket + TLS)\n    [6] VLESS (gRPC + TLS)\n    [7] Shadowsocks (AES-128-GCM)\n    [8] VLESS (裸 TCP，无 TLS)\n    [9] SOCKS5 (账号密码)\n\n  ───────────────────────────────────────\n    [0] 返回节点管理\n\n'
+        printf '\n  ═══════════════════════════════════════\n             Xray 添加节点\n  ═══════════════════════════════════════\n\n  【协议选择】\n    [1] VLESS (Vision + Reality)\n    [2] VLESS (XHTTP + Reality)\n    [3] VLESS (XHTTP + TLS)\n    [4] VLESS (WebSocket + TLS)\n    [5] Trojan (WebSocket + TLS)\n    [6] VLESS (gRPC + TLS)\n    [7] Shadowsocks (AES-128-GCM)\n    [8] VLESS (TCP + ENC，无 TLS)\n    [9] SOCKS5 (账号密码)\n\n  ───────────────────────────────────────\n    [0] 返回节点管理\n\n'
         read -r -p '  请输入选项 [0-9]: ' choice || return 0
         if [[ "$choice" =~ ^[1-9]$ ]]; then
             _info '填写节点参数时输入 0 可取消并返回协议选择；回车保留提示中的默认值。'

@@ -1,5 +1,11 @@
 # 修改記錄
 
+## 21-xray.6 — 無 TLS 的 VLESS TCP ENC
+
+- 添加選單 8 改為 VLESS TCP + ENC（無 TLS），預設 ML-KEM-768 認證，可選 X25519 或關閉；關閉時明確提示不提供代理層加密。
+- TCP 節點的服務端解密與分享連結加密參數配對，參數編輯支援切換 ENC；已有裸 VLESS 節點可手動開啟，更新不自動更換密鑰。
+- 實測 Sub-Store 2.44.16 → mihomo Alpha `2be2f08` → Xray 26.11.9 的 TCP / UDP、ENC 不匹配拒絕、參數修改與連結導出，以及透過三種常用前置的 mihomo `dialer-proxy` 鏈式連接。
+
 ## 21-xray.5 — 修改現有節點參數
 
 - 節點選單 3 擴展為參數編輯，按協議提供名稱、連接地址、端口、SNI、ENC、傳輸路徑 / gRPC 服務名及 XHTTP 並發數；逐項確認，回車保留，取消不發布。
