@@ -33,7 +33,7 @@ _xray_service() { side_effect xray-service; }
 _xray_validate() { return 0; }
 _node_tx_validate() { return 0; }
 case "$ACTION" in
-    delete|port|relay) _xray_manage_node "$ACTION" ;;
+    delete|port|relay|edit) _xray_manage_node "$ACTION" ;;
     native) _node_operation _xray_native_add "$VARIANT" ;;
     vision) _node_operation _add_vless_reality_impl ;;
     xhttp-reality) _node_operation _add_vless_xhttp_reality_impl ;;
@@ -68,7 +68,8 @@ class Interaction(unittest.TestCase):
             'config.json': {'inbounds': []},
             'metadata.json': {'test': {'core': 'xray', 'name': 'Test', 'clientName': 'Test',
                                      'publicPort': 443, 'backendPort': 10443, 'type': 'vless-xhttp-reality'}},
-            'xray.json': {'inbounds': [{'tag': 'test', 'port': 10443}]},
+            'xray.json': {'inbounds': [{'tag': 'test', 'port': 10443,
+                                      'streamSettings': {'security':'reality','network':'xhttp'}}]},
             'clash.yaml': {'proxies': [{'name': 'Test', 'port': 443}]},
             'state.json': {'reality': None},
         }
@@ -92,7 +93,7 @@ class Interaction(unittest.TestCase):
         return result
 
     def test_manage_returns_and_invalid_choices(self):
-        for action in ('delete', 'port', 'relay'):
+        for action in ('delete', 'port', 'relay', 'edit'):
             for data in ('0\n', '', 'bad\n999\n0\n', '1\n0\n0\n', '1\n'):
                 with self.subTest(action=action, data=data):
                     self.assertEqual(self.run_shell(action, data).returncode, 2)
@@ -101,6 +102,15 @@ class Interaction(unittest.TestCase):
         for data in ('1\n443\n0\n', '1\nbad\n65536\n0\n0\n'):
             self.assertEqual(self.run_shell('port', data).returncode, 2)
         self.assertEqual(self.run_shell('relay', '1\n\n0\n').returncode, 2)
+
+    def test_edit_parameter_cancel_and_noop(self):
+        for data in ('1\n1\nNew\n0\n0\n0\n', '1\n2\n0\n0\n0\n',
+                     '1\n3\n443\n0\n0\n', '1\n3\n8443\n0\n0\n0\n',
+                     '1\n5\n\n0\n0\n', '1\n5\n1\n0\n0\n0\n',
+                     '1\n4\ny\ny\n1\nnew.test\n0\n0\n0\n',
+                     '1\n6\n/new/\n0\n0\n0\n', '1\n7\n5\n0\n0\n0\n'):
+            with self.subTest(data=data):
+                self.assertEqual(self.run_shell('edit', data).returncode, 2)
 
     def test_shared_port_prompt_returns_without_preparing_router(self):
         for kind in ('vless-xhttp', 'vless-xhttp-reality', 'vless-vision-reality'):

@@ -1,5 +1,12 @@
 # 修改記錄
 
+## 21-xray.5 — 修改現有節點參數
+
+- 節點選單 3 擴展為參數編輯，按協議提供名稱、連接地址、端口、SNI、ENC、傳輸路徑 / gRPC 服務名及 XHTTP 並發數；逐項確認，回車保留，取消不發布。
+- Reality 可重新選擇本機或遠端源站；本機源站與 TLS 節點復用有效證書，缺失或無效時申請。修復原域名證書丟失導致 Nginx 配置檢查阻塞申請的情況。
+- 同步分享連結、聚合訂閱及 Nginx / HAProxy 路由，保留節點憑據與中轉；證書準備和服務重啟失敗時恢復配置。
+- 新增真實 Xray / Nginx / mihomo 修改後連通、Sub-Store 導出及取消 / 回滾測試；ACME 簽發使用本地測試證書模擬。
+
 ## 21-xray.4 — VLESS ENC
 
 - Vision + Reality、XHTTP + Reality 及 XHTTP + TLS 共用 ENC 選擇，預設 ML-KEM-768 認證，可選 X25519 或關閉；取消與 EOF 不建立節點。

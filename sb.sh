@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.4"
+export SCRIPT_VERSION="21-xray.5"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -849,9 +849,13 @@ _prepare_local_reality_origin() {
     _install_managed_nginx_config "$tmp" "$challenge_conf" "$marker" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 
-    _install_sb_acme || return 1
-    _ensure_acme_renewal || return 1
-    _issue_local_origin_certificate "$domain" || return 1
+    if ! _local_certificate_usable "$domain"; then
+        _install_sb_acme || return 1
+        _ensure_acme_renewal || return 1
+        _issue_local_origin_certificate "$domain" || return 1
+    elif [ -x "$SB_ACME_SH" ]; then
+        _ensure_acme_renewal || return 1
+    fi
 
     install -d -m 755 "$site_root" || return 1
     if [ ! -f "$site_root/index.html" ]; then
@@ -7133,13 +7137,17 @@ $directive
 EOF
 }
 
-_xhttp_prepare_certificate() {
-    local domain="$1" target="$NGINX_CONF_DIR/00-sb-xhttp-acme-$1.conf" tmp
-    # 证书与私钥匹配、域名覆盖及有效期检查。
-    if [ -s "$NGINX_CERT_DIR/$domain/cert" ] && [ -s "$NGINX_CERT_DIR/$domain/key" ] &&
+_local_certificate_usable() {
+    local domain="$1"
+    [ -s "$NGINX_CERT_DIR/$domain/cert" ] && [ -s "$NGINX_CERT_DIR/$domain/key" ] &&
        openssl x509 -in "$NGINX_CERT_DIR/$domain/cert" -checkend 604800 -noout >/dev/null 2>&1 &&
        _cert_matches_hostname "$NGINX_CERT_DIR/$domain/cert" "$domain" &&
-       [ "$(openssl x509 -in "$NGINX_CERT_DIR/$domain/cert" -pubkey -noout)" = "$(openssl pkey -in "$NGINX_CERT_DIR/$domain/key" -passin pass: -pubout 2>/dev/null)" ]; then return 0; fi
+       [ "$(openssl x509 -in "$NGINX_CERT_DIR/$domain/cert" -pubkey -noout)" = "$(openssl pkey -in "$NGINX_CERT_DIR/$domain/key" -passin pass: -pubout 2>/dev/null)" ]
+}
+
+_xhttp_prepare_certificate() {
+    local domain="$1" target="$NGINX_CONF_DIR/00-sb-xhttp-acme-$1.conf" tmp
+    _local_certificate_usable "$domain" && return 0
     _validate_local_origin_dns "$domain" || return 1
     _xhttp_snapshot_nginx "$target" || return 1
     tmp=$(mktemp) || return 1
@@ -7365,11 +7373,11 @@ _add_vless_xhttp_reality_impl() {
 }
 
 _modify_xhttp_reality_port() {
-    local tag="$1" port="$2" meta name domain backend="$2" listen="::" routed=false answer
+    local tag="$1" port="$2" meta name domain backend="$2" listen="::" routed="${3:-false}" answer
     meta=$(jq -ce --arg t "$tag" '.[$t]' "$METADATA_FILE") || return 1
     name=$(jq -r '.clientName' <<< "$meta"); domain=$(jq -r '.server_name' <<< "$meta")
     _validate_reality_no_self_loop "$port" "$(jq -r '.handshakeServer' <<< "$meta")" "$(jq -r '.handshakePort' <<< "$meta")" || return 1
-    if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
+    if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ] && [ -z "${3:-}" ]; then
         _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n，0 返回节点列表]: ' answer || return $?
         [[ "$answer" =~ ^[Nn]$ ]] || routed=true
     fi
@@ -7429,15 +7437,15 @@ _delete_xhttp_node() {
 }
 
 _modify_xhttp_port() {
-    local tag="$1" port="$2" meta domain path backend conf routed=false answer
+    local tag="$1" port="$2" meta domain path backend conf routed="${3:-false}" answer
     meta=$(jq -ce --arg t "$tag" '.[$t]' "$METADATA_FILE") || return 1
     if [[ "$(jq -r '.type' <<< "$meta")" =~ ^vless-(xhttp|vision)-reality$ ]]; then
-        _modify_xhttp_reality_port "$tag" "$port"
+        _modify_xhttp_reality_port "$tag" "$port" "${3:-}"
         return $?
     fi
     domain=$(jq -r '.server_name' <<< "$meta"); path=$(jq -r '.path' <<< "$meta")
     backend=$(jq -r '.backendPort' <<< "$meta"); conf=$(jq -r '.nginxConfig' <<< "$meta")
-    if [ "$port" = 443 ]; then
+    if [ "$port" = 443 ] && [ -z "${3:-}" ]; then
         _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n，0 返回节点列表]: ' answer || return $?
         [[ "$answer" =~ ^[Nn]$ ]] || routed=true
     fi
@@ -10395,6 +10403,293 @@ _xray_route_node() {
     _atomic_modify_json "$XRAY_CONFIG_FILE" "$filter"
 }
 
+# 按字段更新现有链接，保留未编辑的协议参数与凭据。
+_xray_edit_link() {
+    python3 - "$2" "$3" 3<<< "$1" <<'PY'
+import json, os, sys
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+field, value = sys.argv[1:]
+u = urlsplit(os.fdopen(3).read().strip())
+q = dict(parse_qsl(u.query, keep_blank_values=True))
+netloc, fragment = u.netloc, u.fragment
+if field == 'name':
+    fragment = quote(value, safe='')
+elif field == 'server':
+    host = '['+value+']' if ':' in value else value
+    netloc = u.netloc.rsplit('@', 1)[0]+'@'+host+':'+str(u.port)
+elif field == 'enc':
+    q['encryption'] = value
+elif field == 'sni':
+    q['sni'] = value
+    if q.get('type') in ('ws', 'xhttp') or 'host' in q: q['host'] = value
+elif field == 'path':
+    q['serviceName' if q.get('type') == 'grpc' else 'path'] = value
+elif field == 'concurrency':
+    extra = json.loads(q.get('extra', '{}'))
+    extra.setdefault('xmux', {})['maxConcurrency'] = int(value)
+    q['extra'] = json.dumps(extra, separators=(',', ':'))
+else:
+    raise ValueError('unsupported node field')
+if q.get('security') == 'reality': q['support-x25519mlkem768'] = 'true'
+print(urlunsplit((u.scheme, netloc, u.path, urlencode(q, quote_via=quote), fragment)))
+PY
+}
+
+_xray_edit_node_menu() {
+    local tag="$1" meta kind name security network choice field status
+    while true; do
+        meta=$(jq -ce --arg t "$tag" '.[$t] | select(.core=="xray")' "$METADATA_FILE") || return 1
+        kind=$(jq -r .type <<< "$meta"); name=$(jq -r .clientName <<< "$meta")
+        security=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.streamSettings.security // "none"' "$XRAY_CONFIG_FILE") || return 1
+        network=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.streamSettings.network // "raw"' "$XRAY_CONFIG_FILE") || return 1
+        printf '\n  修改节点：%s\n  [1] 节点名称\n  [2] 客户端连接地址\n  [3] 公网端口\n' "$name"
+        if [[ "$security" = reality || "$security" = tls || "$kind" = vless-xhttp ]]; then printf '  [4] SNI 域名 / 证书源站\n'; fi
+        if [[ "$kind" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]]; then printf '  [5] VLESS ENC 方式\n'; fi
+        if [[ "$network" = xhttp || "$network" = ws || "$network" = grpc ]]; then printf '  [6] 传输路径 / gRPC 服务名\n'; fi
+        [ "$network" != xhttp ] || printf '  [7] XHTTP XMUX 并发数\n'
+        printf '  [0] 返回节点列表\n\n'
+        read -r -p '请选择要修改的参数：' choice || return 2
+        field=''
+        case "$choice" in
+            0) return 2 ;;
+            1) field=name ;; 2) field=server ;; 3) field=port ;;
+            4) [[ "$security" = reality || "$security" = tls || "$kind" = vless-xhttp ]] && field=sni ;;
+            5) [[ "$kind" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]] && field=enc ;;
+            6) [[ "$network" = xhttp || "$network" = ws || "$network" = grpc ]] && field=path ;;
+            7) [ "$network" = xhttp ] && field=concurrency ;;
+        esac
+        [ -n "$field" ] || { _error '无效选择。'; continue; }
+        status=0
+        _node_operation _xray_edit_field "$tag" "$field" "$meta" || status=$?
+        if [ "$status" = 0 ]; then _info '可继续修改其他参数；客户端请使用最新分享链接。'; fi
+    done
+}
+
+_xray_edit_field() {
+    local tag="$1" field="$2" meta kind name ib security network proxy value old json answer link label
+    local NODE_UI=true NODE_PENDING_ORIGIN='' decryption=none encryption=none profile routed=false
+    meta=$(jq -ce --arg t "$tag" '.[$t] | select(.core=="xray")' "$METADATA_FILE") || return 1
+    [ "$meta" = "$3" ] || { _error '节点记录已变化，请重新选择。'; return 1; }
+    name=$(jq -er .clientName <<< "$meta"); kind=$(jq -r .type <<< "$meta")
+    ib=$(jq -ce --arg t "$tag" '[.inbounds[]|select(.tag==$t)]|select(length==1)|.[0]' "$XRAY_CONFIG_FILE") || return 1
+    proxy=$(PROXY_NAME="$name" "$YQ_BINARY" eval -o=json -I=0 '[.proxies[]|select(.name==strenv(PROXY_NAME))]' "$CLASH_YAML_FILE") || return 1
+    proxy=$(jq -ce 'select(length==1)|.[0]' <<< "$proxy") || return 1
+    security=$(jq -r '.streamSettings.security // "none"' <<< "$ib")
+    network=$(jq -r '.streamSettings.network // "raw"' <<< "$ib")
+    case "$field" in
+        name) label=节点名称 ;; server) label=连接地址 ;; port) label=公网端口 ;;
+        enc) label=ENC方式 ;; sni) label=SNI域名 ;; path) label=路径或服务名 ;; concurrency) label=XMUX并发数 ;;
+        *) return 1 ;;
+    esac
+    _info '回车保留当前值；输入 0 取消本项修改。'
+    case "$field" in
+        name|server)
+            old=$(jq -r --arg f "$field" '.[$f]' <<< "$proxy")
+            _node_read -r -p "当前${label}: $old；新值：" value || return $?
+            value="${value:-$old}"
+            if [ "$field" = server ]; then
+                value="${value#[}"; value="${value%]}"
+                if ! _is_valid_reality_domain "$value" && ! _is_valid_ipv4 "$value" && ! [[ "$value" == *:* && "$value" =~ ^[0-9A-Fa-f:]+$ ]]; then
+                    _error '连接地址须为 IP 或域名。'; return 1
+                fi
+            elif [ "$value" != "$old" ]; then
+                [[ "$value" != *$'\r'* && "$value" != *$'\t'* ]] && _assert_node_name_free "$value" || return 1
+            fi ;;
+        port)
+            old=$(jq -r .publicPort <<< "$meta")
+            _node_read -r -p "当前公网端口 $old；新端口：" value || return $?
+            value="${value:-$old}"
+            [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && _sni_router_validate_port "$value" || { _error '端口必须在 1-65535 之间。'; return 1; }
+            if [ "$value" = "$old" ]; then
+                _info '端口未改变。'
+                [ "$value" != "$SNI_ROUTER_PUBLIC_PORT" ] || _info '切换当前 443 的共享方式时，请先改到空闲端口，再改回 443。'
+                return 0
+            fi
+            if [ "$value" = "$SNI_ROUTER_PUBLIC_PORT" ] && [[ "$kind" != native-* ]]; then
+                _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n，0 取消]: ' answer || return $?
+                [[ "$answer" =~ ^[Nn]$ ]] || routed=true
+            fi ;;
+        enc)
+            [[ "$kind" =~ ^vless-(vision-reality|xhttp|xhttp-reality)$ ]] || return 1
+            encryption=$(jq -r '.encryption // "none"' <<< "$proxy")
+            old=none
+            if [ "$encryption" != none ]; then
+                old=x25519
+                [ "${#encryption}" -lt 1000 ] || old=mlkem768
+            fi
+            printf '当前 ENC 认证：%s\n' "$old"
+            # 编辑时回车保持原设置；创建节点仍使用默认 ML-KEM-768。
+            printf '  [1] ML-KEM-768\n  [2] X25519\n  [3] 关闭 ENC\n'
+            _node_read -r -p '新 ENC 方式（回车保持，0 取消）：' answer || return $?
+            case "$answer" in '') value="$old" ;; 1) value=mlkem768 ;; 2) value=x25519 ;; 3) value=none ;; *) _error '无效的 ENC 选项。'; return 1 ;; esac ;;
+        sni)
+            old=$(jq -r '.server_name // ""' <<< "$meta")
+            printf '当前 SNI：%s\n' "$old"
+            if [ "$security" = reality ]; then
+                _node_read_yes_no '重新选择 Reality SNI 和源站？[y/N，0 取消]: ' answer || return $?
+                [[ "$answer" =~ ^[Yy]$ ]] || return 0
+                _select_reality_sni || return $?
+                value="$SELECTED_REALITY_SNI"
+                _validate_reality_no_self_loop "$(jq -r .publicPort <<< "$meta")" "$SELECTED_REALITY_HANDSHAKE_SERVER" "$SELECTED_REALITY_HANDSHAKE_PORT" || return 1
+            else
+                [[ "$security" = tls || "$kind" = vless-xhttp ]] || return 1
+                _node_read -r -p '新证书域名 / SNI（回车保留并检查证书）：' value || return $?
+                value="${value:-$old}"; value="${value,,}"
+                _is_valid_reality_domain "$value" || { _error '域名格式无效。'; return 1; }
+            fi ;;
+        path)
+            case "$network" in
+                xhttp) old=$(jq -r '.streamSettings.xhttpSettings.path' <<< "$ib") ;;
+                ws) old=$(jq -r '.streamSettings.wsSettings.path' <<< "$ib") ;;
+                grpc) old=$(jq -r '.streamSettings.grpcSettings.serviceName' <<< "$ib") ;;
+                *) return 1 ;;
+            esac
+            _node_read -r -p "当前路径 / 服务名 $old；新值：" value || return $?
+            value="${value:-$old}"
+            case "$network" in
+                xhttp) [[ "$value" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] ;;
+                ws) [[ "$value" =~ ^/[a-zA-Z0-9_/-]*$ ]] ;;
+                grpc) [[ "$value" =~ ^[a-zA-Z0-9_-]+$ ]] ;;
+            esac || { _error '路径或服务名格式无效。'; return 1; } ;;
+        concurrency)
+            [ "$network" = xhttp ] || return 1
+            old=$(jq -r '.["xhttp-opts"]["reuse-settings"]["max-concurrency"] // "未设置"' <<< "$proxy")
+            _node_read -r -p "当前 XMUX 并发数 $old；新值：" value || return $?
+            [ -n "$value" ] || return 0
+            [[ "$value" =~ ^[0-9]{1,10}$ ]] && (( 10#$value >= 1 && 10#$value <= 2147483647 )) || { _error 'XMUX 并发数必须在 1-2147483647 之间。'; return 1; }
+            value=$((10#$value)) ;;
+        *) return 1 ;;
+    esac
+    if [ "$field" != sni ] && [ "$value" = "$old" ]; then _info '参数未改变。'; return 0; fi
+    printf '将修改 %s：%s → %s\n' "$label" "$old" "$value"
+    _node_read_yes_no '保存修改并重启节点服务？[y/N，0 取消]: ' answer || return $?
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+    if [ "$field" = port ]; then
+        if [[ "$kind" = native-* ]]; then _xray_native_port "$tag" "$meta" "$value"
+        else _modify_xhttp_port "$tag" "$value" "$routed"; fi
+        return $?
+    fi
+    command -v python3 >/dev/null || _pkg_install python3 || return 1
+    json=$(jq -Rn --arg v "$value" '$v') || return 1
+    case "$field" in
+        name)
+            _atomic_modify_json "$METADATA_FILE" ".[\"$tag\"] |= (.name=$json | .clientName=$json)" || return 1
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.name)=$json | (.proxy-groups[]?.proxies[]?|select(.==strenv(PROXY_NAME)))=$json" || return 1 ;;
+        server)
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.server)=$json" || return 1 ;;
+        enc)
+            _vless_encryption_keypair "$value" || return 1
+            json=$(jq -Rn --arg v "$decryption" '$v') || return 1
+            _atomic_modify_json "$XRAY_CONFIG_FILE" "(.inbounds[]|select(.tag==\"$tag\")|.settings.decryption)=$json" || return 1
+            json=$(jq -Rn --arg v "$encryption" '$v') || return 1
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.encryption)=$json" || return 1
+            value="$encryption" ;;
+        sni)
+            _xray_edit_sni "$tag" "$meta" "$ib" "$value" || return 1 ;;
+        path)
+            case "$network" in
+                xhttp) answer=xhttpSettings.path; profile='.["xhttp-opts"].path' ;;
+                ws) answer=wsSettings.path; profile='.["ws-opts"].path' ;;
+                grpc) answer=grpcSettings.serviceName; profile='.["grpc-opts"].grpc-service-name' ;;
+            esac
+            _atomic_modify_json "$XRAY_CONFIG_FILE" "(.inbounds[]|select(.tag==\"$tag\")|.streamSettings.$answer)=$json" || return 1
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|$profile)=$json" || return 1
+            if [[ "$kind" = vless-xhttp* ]]; then _atomic_modify_json "$METADATA_FILE" ".[\"$tag\"].path=$json" || return 1; fi
+            [ "$kind" != vless-xhttp ] || _xray_edit_xhttp_nginx "$tag" || return 1 ;;
+        concurrency)
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.[\"xhttp-opts\"][\"reuse-settings\"][\"max-concurrency\"])=$json" || return 1 ;;
+    esac
+    link=$(_xray_edit_link "$(jq -er .share_link <<< "$meta")" "$field" "$value") || return 1
+    json=$(jq -Rn --arg v "$link" '$v') || return 1
+    _atomic_modify_json "$METADATA_FILE" ".[\"$tag\"].share_link=$json" || return 1
+    printf '%s\n' "$link" >> "$NODE_TX_DIR/share-links"
+}
+
+_xray_edit_xhttp_nginx() {
+    local tag="$1" meta conf domain path backend public routed
+    meta=$(jq -ce --arg t "$tag" '.[$t]' "$METADATA_FILE") || return 1
+    conf=$(jq -r .nginxConfig <<< "$meta")
+    [ "$conf" = "$NGINX_CONF_DIR/$tag.xhttp.conf" ] || return 1
+    domain=$(jq -r .server_name <<< "$meta"); path=$(jq -r .path <<< "$meta")
+    backend=$(jq -r .backendPort <<< "$meta"); public=$(jq -r .publicPort <<< "$meta")
+    routed=$(jq -r '.frontedBy=="haproxy"' <<< "$meta")
+    _xhttp_snapshot_nginx "$conf" || return 1
+    _xhttp_nginx_config "$domain" "$path" "$backend" "$public" "$routed" > "$NODE_TX_DIR/xhttp-nginx" || return 1
+    _install_managed_nginx_config "$NODE_TX_DIR/xhttp-nginx" "$conf" '# Managed by proxyall XHTTP'
+}
+
+_xray_edit_sni() {
+    local tag="$1" meta="$2" ib="$3" domain="$4" name old kind security target data cert key owner
+    name=$(jq -r .clientName <<< "$meta"); old=$(jq -r .server_name <<< "$meta")
+    kind=$(jq -r .type <<< "$meta"); security=$(jq -r .streamSettings.security <<< "$ib")
+    if [ "$domain" != "$old" ] && [ "$(jq -r '.frontedBy // ""' <<< "$meta")" = haproxy ]; then
+        _sni_router_assert_sni_available "$domain" || return 1
+    fi
+    if [ "$security" = reality ]; then
+        if [ -n "${NODE_PENDING_ORIGIN:-}" ]; then
+            for target in "$NGINX_CONF_DIR/00-sb-reality-acme-$domain.conf" "$NGINX_CONF_DIR/$domain.$REALITY_LOCAL_ORIGIN_PORT.reality.conf" "$NGINX_CERT_DIR/$domain/cert" "$NGINX_CERT_DIR/$domain/key"; do
+                _xhttp_snapshot_nginx "$target" || return 1
+            done
+            target="$NGINX_CONF_DIR/$domain.$REALITY_LOCAL_ORIGIN_PORT.reality.conf"
+            if ! _local_certificate_usable "$domain" && [ -e "$target" ]; then
+                grep -Fqx '# Generated by singbox-lite Reality local origin' "$target" || return 1
+                rm -f -- "$target" || return 1
+            fi
+            _prepare_local_reality_origin "$domain" || return 1
+        fi
+        target="$SELECTED_REALITY_HANDSHAKE_SERVER"
+        [[ "$target" != *:* || "$target" == \[* ]] || target="[$target]"
+        data=$(jq -nc --arg t "$target:$SELECTED_REALITY_HANDSHAKE_PORT" --arg sn "$domain" '{target:$t,serverNames:[$sn]}') || return 1
+        _atomic_modify_json "$XRAY_CONFIG_FILE" "(.inbounds[]|select(.tag==\"$tag\")|.streamSettings.realitySettings) |= (. + $data | del(.dest))" || return 1
+        data=$(jq -nc --arg sn "$domain" --arg hs "$SELECTED_REALITY_HANDSHAKE_SERVER" --argjson hp "$SELECTED_REALITY_HANDSHAKE_PORT" '{server_name:$sn,handshakeServer:$hs,handshakePort:$hp}') || return 1
+    else
+        if [ "$kind" = vless-xhttp ] && [ "$domain" != "$old" ]; then _xhttp_prepare_domain "$domain" || return 1; fi
+        _ensure_local_origin_dependencies || return 1
+        for target in "$NGINX_CERT_DIR/$domain/cert" "$NGINX_CERT_DIR/$domain/key"; do _xhttp_snapshot_nginx "$target" || return 1; done
+        if [ "$kind" = vless-xhttp ] && [ "$domain" = "$old" ] && ! _local_certificate_usable "$domain"; then
+            target=$(jq -r .nginxConfig <<< "$meta")
+            [ "$target" = "$NGINX_CONF_DIR/$tag.xhttp.conf" ] || return 1
+            if [ -e "$target" ]; then
+                grep -Fqx '# Managed by proxyall XHTTP' "$target" || return 1
+                _xhttp_snapshot_nginx "$target" && rm -f -- "$target" || return 1
+            fi
+        fi
+        _xhttp_prepare_certificate "$domain" || return 1
+        if [ "$kind" != vless-xhttp ]; then
+            cert="$NGINX_CERT_DIR/$domain/cert"; key="$NGINX_CERT_DIR/$domain/key"
+            data=$(jq -nc --arg c "$cert" --arg k "$key" '[{certificateFile:$c,keyFile:$k}]') || return 1
+            _atomic_modify_json "$XRAY_CONFIG_FILE" "(.inbounds[]|select(.tag==\"$tag\")|.streamSettings.tlsSettings.certificates)=$data" || return 1
+        fi
+        data=$(jq -nc --arg sn "$domain" '{server_name:$sn}') || return 1
+    fi
+    _atomic_modify_json "$METADATA_FILE" ".[\"$tag\"] += $data" || return 1
+    data=$(jq -Rn --arg sn "$domain" '$sn') || return 1
+    target=servername
+    [ "$(jq -r .protocol <<< "$ib")" != trojan ] || target=sni
+    PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.$target)=$data" || return 1
+    case "$(jq -r '.streamSettings.network // "raw"' <<< "$ib")" in
+        xhttp)
+            _atomic_modify_json "$XRAY_CONFIG_FILE" "(.inbounds[]|select(.tag==\"$tag\")|.streamSettings.xhttpSettings.host)=$data" || return 1
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.[\"xhttp-opts\"].host)=$data" || return 1 ;;
+        ws)
+            PROXY_NAME="$name" _atomic_modify_yaml "$CLASH_YAML_FILE" "(.proxies[]|select(.name==strenv(PROXY_NAME))|.[\"ws-opts\"].headers.Host)=$data" || return 1 ;;
+    esac
+    [ "$kind" != vless-xhttp ] || _xray_edit_xhttp_nginx "$tag" || return 1
+    if [ "$(jq -r '.frontedBy // ""' <<< "$meta")" = haproxy ]; then
+        case "$(jq -r .routerRole <<< "$meta")" in
+            reality-default)
+                owner=sb-xhttp; [ "$kind" != vless-vision-reality ] || owner=sb-xray
+                _sni_router_register_reality "$owner" "$tag" "$domain" "$(jq -r .backendPort <<< "$meta")" || return 1 ;;
+            xhttp-https)
+                if [ "$domain" != "$old" ]; then _sni_router_remove_https sb-xhttp "$old" || return 1; fi
+                _sni_router_register_https sb-xhttp "$domain" "$SNI_ROUTER_HTTPS_BACKEND_PORT" || return 1 ;;
+            tls-sni)
+                _sni_router_remove_tls "$tag" && _sni_router_register_tls sb-xray "$tag" "$domain" "$(jq -r .backendPort <<< "$meta")" || return 1 ;;
+            *) return 1 ;;
+        esac
+    fi
+}
+
 _xray_manage_node() {
     local action="$1" tag port answer file meta status NODE_UI=true
     while true; do
@@ -10402,6 +10697,9 @@ _xray_manage_node() {
         [[ "$tag" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
         meta=$(jq -ce --arg t "$tag" '.[$t] | select(.core=="xray")' "$METADATA_FILE") || return 1
         case "$action" in
+            edit)
+                _xray_edit_node_menu "$tag"
+                continue ;;
             delete)
                 while true; do
                     read -r -p '删除选中节点？[y/N，0 返回节点列表]：' answer || return 2
@@ -10789,7 +11087,7 @@ _xray_menu() {
     _check_root
     local choice dep answer
     while true; do
-        printf '\n  ═══════════════════════════════════════\n         Xray 节点管理 v%s\n  ═══════════════════════════════════════\n\n  【节点管理】\n    [1] 添加节点\n    [2] 分享链接与聚合订阅\n    [3] 修改节点端口\n    [4] 删除节点\n    [5] 中转 / 直连出站\n\n  【服务维护】\n    [6] 更新 Xray 核心\n    [7] 查看服务状态\n    [8] 迁移并删除旧 sing-box\n\n  ───────────────────────────────────────\n    [0] 返回主菜单\n\n' "$SCRIPT_VERSION"
+        printf '\n  ═══════════════════════════════════════\n         Xray 节点管理 v%s\n  ═══════════════════════════════════════\n\n  【节点管理】\n    [1] 添加节点\n    [2] 分享链接与聚合订阅\n    [3] 修改节点参数\n    [4] 删除节点\n    [5] 中转 / 直连出站\n\n  【服务维护】\n    [6] 更新 Xray 核心\n    [7] 查看服务状态\n    [8] 迁移并删除旧 sing-box\n\n  ───────────────────────────────────────\n    [0] 返回主菜单\n\n' "$SCRIPT_VERSION"
         read -r -p '  请输入选项 [0-8]: ' choice || return 0
         case "$choice" in
             0) return 0 ;;
@@ -10809,7 +11107,7 @@ _xray_menu() {
         ( _config_write_lock && _install_yq ) || return 1
         case "$choice" in
             1) _xray_add_node_menu ;;
-            3) _xray_manage_node port ;;
+            3) _xray_manage_node edit ;;
             4) _xray_manage_node delete ;;
             5) _xray_manage_node relay ;;
         esac

@@ -29,9 +29,9 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 | 4 / 5 / 6 | VLESS WS+TLS / Trojan WS+TLS / VLESS gRPC+TLS。复用 `/etc/nginx/certs/<域名>/cert` 与 `key`，由 Xray 终止 TLS。 |
 | 7 / 8 / 9 | Shadowsocks AES-128-GCM / 裸 VLESS TCP / 带密码的 SOCKS5。裸 TCP 和 SOCKS5 不提供传输加密。 |
 
-节点管理菜单 2 / 3 / 4 用于查看分享链接、改端口和删除节点，菜单 5 为选定入口绑定落地链接或 Xray outbound JSON，输入 `direct` 解除绑定。
+节点管理菜单 2 / 3 / 4 用于查看分享链接、修改节点参数和删除节点，菜单 5 为选定入口绑定落地链接或 Xray outbound JSON，输入 `direct` 解除绑定。
 
-节点列表输入 `0` 返回节点管理。删除确认选否、改端口输入 `0`、中转输入 `0` 或留空，会返回节点列表；填写添加参数时输入 `0` 取消本次添加并返回协议选择。取消不提交候选配置、不重启服务。核心更新需确认后执行。
+节点列表输入 `0` 返回节点管理。删除确认选否、中转输入 `0` 或留空，会返回节点列表；编辑参数时输入 `0` 取消本项并返回参数菜单。填写添加参数时输入 `0` 取消本次添加并返回协议选择。取消不提交候选配置、不重启服务。核心更新需确认后执行。
 
 将生成的链接粘贴到 Sub-Store，输出选 `Clash.Meta / mihomo`。不要将服务器的 `xray.json` 当成客户端订阅。内部 `clash.yaml`、元数据及 `xray.json` 位于 `/usr/local/etc/sing-box/`；目录名保留以便原位更新。
 
@@ -42,6 +42,14 @@ Vision + Reality、XHTTP + Reality 和 XHTTP + TLS 创建时均可选择 VLESS E
 Vision + Reality 和 XHTTP + Reality 的分享链接始终包含 `support-x25519mlkem768=true`，Sub-Store 导出为 `reality-opts.support-x25519mlkem768: true`。它指 Reality 的混合密钥交换，独立于 VLESS ENC；XHTTP + TLS 不使用 Reality，不添加此字段。这个 mihomo 构建没有 Reality `pqv` 验证密钥配置，生成器不启用依赖它的 ML-DSA-65 验证。Trojan 导出可省略 `tls: true`，mihomo 按 Trojan TLS 处理；仍需可信证书。
 
 XHTTP 使用 `stream-up`、HTTP/2 和 XMUX。单连接最大并发可调，默认 1，可复用时长为 1800 秒。使用 CDN 时，仅选择支持 HTTP/2 和流式 gRPC 的 TLS 入口；Reality 使用直连。中转链接支持本菜单生成的传输组合；无法完整转换的第三方参数用 Xray outbound JSON 配置。
+
+## 修改现有节点
+
+在节点菜单选择 `3 → 节点 → 参数`。按协议可修改节点名称、客户端连接地址、公网端口、SNI / 证书源站、VLESS ENC、传输路径或 gRPC 服务名，以及 XHTTP XMUX 并发数。每项独立确认保存，回车保留当前值，输入 `0` 返回；修改 ENC 时选择当前方式不会重新生成密钥。端口改为 443 时可选择共享入口；切换当前 443 的直连 / 共享方式，应先改到空闲端口，再改回 443。
+
+Reality 的 SNI 可重新选择自有本机源站、独立 HTTPS 源站或扫描候选。自有本机源站要求 DNS only 指向本机、TCP 80 可达；缺失、不匹配或即将到期的证书会重新申请，有效证书直接复用。原域名证书文件丢失时，也可选回该域名修复。TLS 节点输入原域名或回车后确认，可检查并补齐证书。
+
+保存时同步核心配置、客户端参数、分享链接及关联的 Nginx / HAProxy 配置，验证并重启服务。节点标识、UUID、Reality 密钥及中转出站保持原值；ENC 方式改变时生成对应的新 ENC 密钥对。取消不会发布配置或重启服务；应用失败时恢复配置。修改成功后应重新导入完整分享链接，菜单 2 的聚合订阅也会使用新参数。
 
 ## 与 Emby 共用 443
 
@@ -85,6 +93,10 @@ TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs python3 tests/xhttp_reality_traffic.p
 
 TEST_XRAY=/path/to/xray TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs \
 python3 tests/vless_encryption.py
+
+TEST_XRAY=/path/to/xray TEST_MIHOMO=/path/to/mihomo TEST_YQ=/path/to/yq \
+TEST_NGINX=/path/to/nginx TEST_SUBSTORE=/path/to/proxy-utils.esm.mjs \
+python3 tests/node_edit.py
 
 python3 tests/xhttp_reality.py
 python3 tests/installer.py
