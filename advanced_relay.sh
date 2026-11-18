@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.16"
+SCRIPT_VERSION="16-kevin.17"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -1439,20 +1439,28 @@ _import_link_config_locked() {
     if [ -z "$share_link" ]; then _error "输入为空。"; return; fi
     
     _info "正在解析链接..."
-    local outbound_json=$(bash "$PARSER_BIN" "$share_link")
-    
-    if [ -z "$outbound_json" ] || echo "$outbound_json" | jq -e '.error' >/dev/null 2>&1; then
+    local parser_output outbound_json err_msg
+    if ! parser_output=$(bash "$PARSER_BIN" "$share_link") ||
+       ! outbound_json=$(jq -es '
+            select(length == 1) | .[0]
+            | select(type == "object" and (has("error") | not)
+                and (.type | type == "string" and length > 0)
+                and (.server | type == "string" and length > 0)
+                and (.server_port | type == "number" and . >= 1 and . <= 65535 and floor == .))
+            | .tag = "TEMP_TAG"
+        ' <<< "$parser_output" 2>/dev/null); then
         _error "链接解析失败！"
-        local err_msg=$(echo "$outbound_json" | jq -r '.error // "未知错误"')
-        _error "错误信息: $err_msg"
-        return
+        err_msg=$(jq -sr 'select(length == 1) | .[0] | objects | .error | strings' \
+            <<< "$parser_output" 2>/dev/null) || err_msg=""
+        _error "错误信息: ${err_msg:-未知错误}"
+        return 1
     fi
-    
-    local dest_type=$(echo "$outbound_json" | jq -r '.type')
-    local dest_addr=$(echo "$outbound_json" | jq -r '.server')
-    local dest_port=$(echo "$outbound_json" | jq -r '.server_port')
 
-    
+    local dest_type dest_addr dest_port
+    dest_type=$(jq -r '.type' <<< "$outbound_json") || return 1
+    dest_addr=$(jq -r '.server' <<< "$outbound_json") || return 1
+    dest_port=$(jq -r '.server_port' <<< "$outbound_json") || return 1
+
     # [屏蔽逻辑] 检查是否为 SS-2022
     if [ "$dest_type" == "shadowsocks" ]; then
         local dest_method=$(echo "$outbound_json" | jq -r '.method // empty')
@@ -1468,9 +1476,6 @@ _import_link_config_locked() {
              fi
         fi
     fi
-    
-    # 修正 outbound_tag 占位符
-    outbound_json=$(echo "$outbound_json" | jq '.tag = "TEMP_TAG"')
 
     _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json"
 }

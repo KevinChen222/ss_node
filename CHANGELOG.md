@@ -1,5 +1,11 @@
 # 修改記錄
 
+## 21-xray.8 — XHTTP 節點與腳本維護
+
+- TLS 和 Reality 的 XHTTP 節點共用建立選項、mihomo 欄位及分享連結格式。
+- 反代簽發從單次 ACME 查詢讀取證書及續期設定。舊中轉拒絕失敗或輸出無效的連結解析結果。
+- 新增開發端組件雜湊更新及檢查命令。獨立的 `ssrust.sh` 移至 `archive/ssrust.sh`。
+
 ## 21-xray.7 — 精簡協議與 SS2022
 
 - 添加選單縮減為 Vision + Reality、XHTTP + Reality、XHTTP + TLS、SS2022、VLESS TCP + ENC 五項，移除 WS / gRPC / SOCKS5 的建立入口及 Xray 建立分支。

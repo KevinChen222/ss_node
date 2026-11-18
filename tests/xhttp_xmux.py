@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 REPO = Path(__file__).resolve().parents[1]
 HARNESS = r'''
@@ -84,9 +84,35 @@ class XMUXTests(unittest.TestCase):
         query = self.link_query()
         self.assertEqual(json.loads(query['extra'][0]),
                          {'xmux': {'maxConcurrency': expected, 'hMaxReusableSecs': 1800}})
+        metadata = self.read_json('metadata.json')['xhttp-in-test']
+        link = urlsplit(metadata['share_link'])
+        stream = self.read_json('xray.json')['inbounds'][0]['streamSettings']
+        self.assertEqual((link.scheme, link.username, link.hostname, link.port, unquote(link.fragment)),
+                         ('vless', proxy['uuid'], proxy['server'], proxy['port'], proxy['name']))
+        self.assertEqual(link.port, metadata['publicPort'])
+        self.assertEqual(query['type'], [proxy['network']])
+        self.assertEqual(query['encryption'], [proxy['encryption']])
+        self.assertEqual(query['sni'], [proxy['servername']])
+        self.assertEqual(query['fp'], [proxy['client-fingerprint']])
         self.assertEqual(query['mode'], ['stream-up'])
         self.assertEqual(query['alpn'], ['h2'])
         self.assertEqual(query['path'], ['/test/'])
+        self.assertEqual(stream['xhttpSettings'], {
+            key: query[key][0] for key in ('path', 'host', 'mode')
+        })
+        if stream['security'] == 'reality':
+            self.assertEqual(query['security'], ['reality'])
+            self.assertEqual(proxy['reality-opts'], {
+                'public-key': query['pbk'][0], 'short-id': query['sid'][0],
+                'support-x25519mlkem768': True,
+            })
+            self.assertEqual(query['support-x25519mlkem768'], ['true'])
+            self.assertNotIn('skip-cert-verify', proxy)
+        else:
+            self.assertEqual(query['security'], ['tls'])
+            self.assertIs(proxy['skip-cert-verify'], False)
+            self.assertNotIn('reality-opts', proxy)
+            self.assertTrue({'pbk', 'sid', 'support-x25519mlkem768'}.isdisjoint(query))
         self.assertNotIn('smux', proxy)
 
     def test_default_is_one(self):

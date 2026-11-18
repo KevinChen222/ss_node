@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.11.17-local20'
+SCRIPT_VERSION='2026.11.17-local21'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -2535,28 +2535,16 @@ install_acme() {
     "$ACME_SH" --set-default-ca --server letsencrypt
 }
 
-acme_cert_is_issued() {
-    local info cert_path
-    info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
-    cert_path=$(sed -n 's/^Le_RealFullChainPath=//p' <<<"$info" | head -n 1)
-    cert_path=${cert_path#\'}
-    cert_path=${cert_path%\'}
-    [[ -n $cert_path && -s $cert_path ]]
+acme_info_field() {
+    local field=$1 value
+    value=$(sed -n "/^${field}=/{s/^[^=]*=//;p;q;}") || return 1
+    value=${value#\'}
+    printf '%s' "${value%\'}"
 }
 
 acme_has_renewal_hooks() {
-    local info
-    info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
+    local info=$1
     grep -Eq '^Le_PreHook=.+$' <<<"$info" && grep -Eq '^Le_PostHook=.+$' <<<"$info"
-}
-
-acme_uses_webroot() {
-    local info webroot
-    info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
-    webroot=$(sed -n 's/^Le_Webroot=//p' <<<"$info" | head -n 1)
-    webroot=${webroot#\'}
-    webroot=${webroot%\'}
-    [[ $webroot == "$ACME_WEBROOT" ]]
 }
 
 prepare_acme_webroot() {
@@ -2660,7 +2648,7 @@ issue_certificate() {
     local cert_dir="/etc/nginx/certs/${format_cert_domain}"
     local issue_extra=()
     local domain_args=(-d "$format_cert_domain")
-    local cert_exists=no need_issue=yes issue_status=0
+    local acme_info cert_path cert_exists=no need_issue=yes issue_status=0
     local -a force_args=()
 
     if is_ip_address "$you_domain"; then
@@ -2671,17 +2659,20 @@ issue_certificate() {
         domain_args+=(-d "*.${format_cert_domain}")
     fi
 
-    if acme_cert_is_issued; then
+    acme_info=$("$ACME_SH" --info -d "$format_cert_domain" --ecc 2>/dev/null || true)
+    if cert_path=$(acme_info_field Le_RealFullChainPath <<<"$acme_info") &&
+        [[ -n $cert_path && -s $cert_path ]]; then
         cert_exists=yes
         need_issue=no
     fi
 
     if [[ -z $dns_provider && $cert_exists == yes ]]; then
-        if [[ $frontend_mode == haproxy ]] && ! acme_uses_webroot; then
+        if [[ $frontend_mode == haproxy ]] &&
+            [[ $(acme_info_field Le_Webroot <<<"$acme_info") != "$ACME_WEBROOT" ]]; then
             log_warn '现有证书不是 webroot 续期方式，将强制续签一次以迁移。'
             need_issue=yes
             force_args+=(--force)
-        elif [[ $frontend_mode != haproxy ]] && ! acme_has_renewal_hooks; then
+        elif [[ $frontend_mode != haproxy ]] && ! acme_has_renewal_hooks "$acme_info"; then
             log_warn '现有 standalone 证书缺少续期停启 hook，将强制续签一次以补全。'
             need_issue=yes
             force_args+=(--force)

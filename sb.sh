@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.7"
+export SCRIPT_VERSION="21-xray.8"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -41,7 +41,7 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 # 主脚本与可选中转组件均从用户自己的同一仓库更新，并用固定哈希校验。
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/KevinChen222/ss_node/main/sb.sh"
 COMPONENT_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-ADVANCED_RELAY_SHA256="1a18de9f9ed5c5e83e3f635dd5c72e12c106fcb7340e4b8fb506c9d8193db12e"
+ADVANCED_RELAY_SHA256="06e84dc58baaae4678f6d171683041869820798d6330a33a8358ebb0f63a175e"
 PARSER_SHA256="1facb8460e60c399ae259df5f01bd8bc3f95856f588ea748e68c7810aa13eb65"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
@@ -5710,23 +5710,19 @@ _show_node_link() {
             
             url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=firefox&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
             ;;
-        "vless-xhttp-reality")
-            local uuid="$1" sni="$2" path="$3" pk="$4" sid="$5" concurrency="${6:-}" extra="" encryption
+        vless-xhttp-tls|vless-xhttp-reality)
+            local uuid="$1" sni="$2" path="$3" security="${type#vless-xhttp-}"
+            local concurrency="${4:-}" reality_query="" extra="" encryption
+            if [ "$security" = reality ]; then
+                reality_query="&pbk=$(_url_encode "$4")&sid=$5&support-x25519mlkem768=true"
+                concurrency="${6:-}"
+            fi
             encryption=$(_get_proxy_field "$name" '.encryption // "none"') || return 1
             if [ -n "$concurrency" ]; then
                 extra=$(jq -nc --arg concurrency "$concurrency" '{xmux:{maxConcurrency:$concurrency,hMaxReusableSecs:1800}}') || return 1
                 extra="&extra=$(_url_encode "$extra")"
             fi
-            url="vless://${uuid}@${link_ip}:${port}?encryption=$(_url_encode "$encryption")&security=reality&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&support-x25519mlkem768=true${extra}#$(_url_encode "$name")"
-            ;;
-        "vless-xhttp-tls")
-            local uuid="$1" sni="$2" path="$3" concurrency="${4:-}" extra="" encryption
-            encryption=$(_get_proxy_field "$name" '.encryption // "none"') || return 1
-            if [ -n "$concurrency" ]; then
-                extra=$(jq -nc --arg concurrency "$concurrency" '{xmux:{maxConcurrency:$concurrency,hMaxReusableSecs:1800}}') || return 1
-                extra="&extra=$(_url_encode "$extra")"
-            fi
-            url="vless://${uuid}@${link_ip}:${port}?encryption=$(_url_encode "$encryption")&security=tls&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome${extra}#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:${port}?encryption=$(_url_encode "$encryption")&security=${security}&type=xhttp&mode=stream-up&path=$(_url_encode "$path")&host=${sni}&sni=${sni}&alpn=h2&fp=chrome${reality_query}${extra}#$(_url_encode "$name")"
             ;;
         "vless-ws-tls")
             # 参数: uuid, sni, ws_path, skip_verify
@@ -7223,9 +7219,47 @@ _xhttp_prepare_domain() {
     return 0
 }
 
+# 在开启写事务前读取公共创建选项，保留 _node_read 的取消状态。
+_xhttp_read_node_options() {
+    local default_name="$1" input_path input_name input_concurrency input_profile
+    _node_read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' input_path || return $?
+    input_path="${input_path:-/$(openssl rand -hex 12)/}"
+    [[ "$input_path" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] || { _error '路径须以 / 开始和结束，中间使用字母、数字、下划线或短横线。'; return 1; }
+    _node_read -r -p "请输入节点名称 (默认: ${default_name}): " input_name || return $?
+    input_name="${input_name:-$default_name}"
+    _assert_node_name_free "$input_name" || return 1
+    while true; do
+        _node_read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' input_concurrency || return $?
+        input_concurrency="${input_concurrency:-1}"
+        if [[ "$input_concurrency" =~ ^[0-9]{1,10}$ ]] && (( 10#$input_concurrency >= 1 && 10#$input_concurrency <= 2147483647 )); then
+            break
+        fi
+        _error 'XMUX 并发数必须是 1-2147483647 之间的整数。'
+    done
+    input_profile=$(_vless_encryption_profile_prompt) || return $?
+    printf -v "$2" '%s' "$input_path"
+    printf -v "$3" '%s' "$input_name"
+    printf -v "$4" '%d' "$((10#$input_concurrency))"
+    printf -v "$5" '%s' "$input_profile"
+}
+
+# TLS 和 Reality 共用 mihomo 节点结构，后两项参数仅供 Reality 使用。
+_xhttp_client_proxy() {
+    local name="$1" server="$2" port="$3" uuid="$4" encryption="$5" domain="$6" path="$7" concurrency="$8"
+    jq -nc --arg name "$name" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
+        --arg enc "$encryption" --arg domain "$domain" --arg path "$path" --arg concurrency "$concurrency" \
+        --arg pub "${9:-}" --arg sid "${10:-}" '
+        {name:$name,type:"vless",server:$server,port:$port,uuid:$uuid,encryption:$enc,tls:true,udp:true,
+         network:"xhttp",servername:$domain,alpn:["h2"],"client-fingerprint":"chrome"} +
+        (if $pub == "" then {"skip-cert-verify":false}
+         else {"reality-opts":{"public-key":$pub,"short-id":$sid,"support-x25519mlkem768":true}} end) +
+        {"xhttp-opts":{path:$path,host:$domain,mode:"stream-up",
+         "reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}'
+}
+
 _add_vless_xhttp_tls_impl() {
     local profile decryption=none encryption=none
-    local node_ip domain port name path tag uuid backend routed=false use_router tmp target proxy meta inbound custom_ip custom_name concurrency
+    local node_ip domain port name path tag uuid backend routed=false use_router target proxy meta inbound custom_ip concurrency
     [ -n "$server_ip" ] || server_ip=$(_get_ip)
     _node_read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " custom_ip || return $?
     node_ip="${custom_ip:-$server_ip}"
@@ -7243,22 +7277,7 @@ _add_vless_xhttp_tls_impl() {
         _node_read_yes_no '是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: ' use_router || return $?
         [[ "$use_router" =~ ^[Nn]$ ]] || routed=true
     fi
-    _node_read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' path || return $?
-    path="${path:-/$(openssl rand -hex 12)/}"
-    [[ "$path" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] || { _error '路径须以 / 开始和结束，中间使用字母、数字、下划线或短横线。'; return 1; }
-    _node_read -r -p "请输入节点名称 (默认: VLESS-XHTTP-${port}): " custom_name || return $?
-    name="${custom_name:-VLESS-XHTTP-${port}}"
-    _assert_node_name_free "$name" || return 1
-    while true; do
-        _node_read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return $?
-        concurrency="${concurrency:-1}"
-        if [[ "$concurrency" =~ ^[0-9]{1,10}$ ]] && (( 10#$concurrency >= 1 && 10#$concurrency <= 2147483647 )); then
-            concurrency=$((10#$concurrency))
-            break
-        fi
-        _error 'XMUX 并发数必须是 1-2147483647 之间的整数。'
-    done
-    profile=$(_vless_encryption_profile_prompt) || return $?
+    _xhttp_read_node_options "VLESS-XHTTP-${port}" path name concurrency profile || return $?
     _node_tx_begin || return 1
     _ensure_local_origin_dependencies || return 1
     _xhttp_prepare_domain "$domain" || return 1
@@ -7285,8 +7304,7 @@ _add_vless_xhttp_tls_impl() {
     meta=$(jq -nc --arg name "$name" --arg domain "$domain" --arg path "$path" --arg conf "$target" --argjson public "$port" --argjson backend "$backend" --argjson routed "$routed" \
         '{name:$name,core:"xray",type:"vless-xhttp",server_name:$domain,path:$path,nginxConfig:$conf,publicPort:$public,backendPort:$backend,frontedBy:(if $routed then "haproxy" else "nginx" end),routerRole:"xhttp-https"}') || return 1
     _atomic_modify_json "$METADATA_FILE" ".[$(jq -Rn --arg t "$tag" '$t')] = $meta" || return 1
-    proxy=$(jq -nc --arg enc "$encryption" --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" --arg concurrency "$concurrency" --argjson port "$port" \
-        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,encryption:$enc,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","skip-cert-verify":false,"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
+    proxy=$(_xhttp_client_proxy "$name" "$node_ip" "$port" "$uuid" "$encryption" "$domain" "$path" "$concurrency") || return 1
     _add_node_to_yaml "$proxy" || return 1
     _xhttp_nginx_config "$domain" "$path" "$backend" "$port" "$routed" > "$NODE_TX_DIR/xhttp-nginx"
     _install_managed_nginx_config "$NODE_TX_DIR/xhttp-nginx" "$target" '# Managed by proxyall XHTTP' || return 1
@@ -7315,21 +7333,7 @@ _add_vless_xhttp_reality_impl() {
         _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n]: ' answer || return $?
         [[ "$answer" =~ ^[Nn]$ ]] || routed=true
     fi
-    _node_read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' path || return $?
-    path="${path:-/$(openssl rand -hex 12)/}"
-    [[ "$path" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] || { _error '路径须以 / 开始和结束，中间使用字母、数字、下划线或短横线。'; return 1; }
-    _node_read -r -p "请输入节点名称 (默认: VLESS-XHTTP-REALITY-${port}): " name || return $?
-    name="${name:-VLESS-XHTTP-REALITY-${port}}"
-    _assert_node_name_free "$name" || return 1
-    while true; do
-        _node_read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return $?
-        concurrency="${concurrency:-1}"
-        if [[ "$concurrency" =~ ^[0-9]{1,10}$ ]] && (( 10#$concurrency >= 1 && 10#$concurrency <= 2147483647 )); then
-            concurrency=$((10#$concurrency)); break
-        fi
-        _error 'XMUX 并发数必须是 1-2147483647 之间的整数。'
-    done
-    profile=$(_vless_encryption_profile_prompt) || return $?
+    _xhttp_read_node_options "VLESS-XHTTP-REALITY-${port}" path name concurrency profile || return $?
     _validate_reality_no_self_loop "$port" "$handshake_server" "$handshake_port" || return 1
     _node_tx_begin || return 1
     backend="$port"
@@ -7364,9 +7368,8 @@ _add_vless_xhttp_reality_impl() {
         --argjson public "$port" --argjson backend "$backend" --argjson routed "$routed" \
         '{name:$name,core:"xray",type:"vless-xhttp-reality",server_name:$domain,path:$path,publicKey:$pub,shortId:$sid,handshakeServer:$hs,handshakePort:$hp,publicPort:$public,backendPort:$backend} + (if $routed then {frontedBy:"haproxy",routerRole:"reality-default"} else {} end)') || return 1
     _atomic_modify_json "$METADATA_FILE" ".[$(jq -Rn --arg t "$tag" '$t')] = $meta" || return 1
-    proxy=$(jq -nc --arg enc "$encryption" --arg n "$name" --arg server "$node_ip" --arg id "$uuid" --arg host "$domain" --arg path "$path" \
-        --arg pub "$public_key" --arg sid "$short_id" --arg concurrency "$concurrency" --argjson port "$port" \
-        '{name:$n,type:"vless",server:$server,port:$port,uuid:$id,encryption:$enc,tls:true,udp:true,network:"xhttp",servername:$host,alpn:["h2"],"client-fingerprint":"chrome","reality-opts":{"public-key":$pub,"short-id":$sid,"support-x25519mlkem768":true},"xhttp-opts":{path:$path,host:$host,mode:"stream-up","reuse-settings":{"max-concurrency":$concurrency,"h-max-reusable-secs":"1800"}}}') || return 1
+    proxy=$(_xhttp_client_proxy "$name" "$node_ip" "$port" "$uuid" "$encryption" "$domain" "$path" "$concurrency" \
+        "$public_key" "$short_id") || return 1
     _add_node_to_yaml "$proxy" || return 1
     [ "$routed" != true ] || _sni_router_register_reality sb-xhttp "$tag" "$domain" "$backend" || return 1
     _show_node_link vless-xhttp-reality "$name" "$node_ip" "$port" "$tag" "$uuid" "$domain" "$path" "$public_key" "$short_id" "$concurrency"

@@ -2,7 +2,9 @@
 """Exercise installer checks and component downloads in temporary directories."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -53,6 +55,23 @@ class InstallerTests(unittest.TestCase):
 
     def test_bundle_hashes(self):
         self.shell('pa_validate_bundle "$REPO"')
+        subprocess.run([sys.executable, REPO / 'tools/component_pins.py'], check=True)
+
+    def test_refresh_transitive_component_pins(self):
+        tool = self.root / 'tools/component_pins.py'
+        tool.parent.mkdir()
+        shutil.copyfile(REPO / 'tools/component_pins.py', tool)
+        for name in ('sb.sh', 'deploy.sh', 'advanced_relay.sh', 'parser.sh', 'proxyall'):
+            shutil.copyfile(REPO / name, self.root / name)
+        with (self.root / 'parser.sh').open('a') as parser:
+            parser.write('\n# fixture\n')
+        cmd = [sys.executable, tool]
+        check = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(check.returncode, 1)
+        self.assertEqual(check.stdout.splitlines(), ['advanced_relay.sh', 'sb.sh', 'proxyall'])
+        subprocess.run(cmd + ['--write'], check=True, capture_output=True)
+        subprocess.run(cmd, check=True)
+        self.shell('pa_validate_bundle "$WORK"')
 
     def test_unmarked_scripts_recognized_without_execution(self):
         for name, marker in (('sb.sh', '# SB_MANAGER_MANAGED_COMMAND=1'),

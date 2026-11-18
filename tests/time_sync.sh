@@ -184,7 +184,7 @@ test_cli() {
         _check_root() { printf 'root-check\n' >> "$test_calls"; }
         main() { return 99; }
         set -- sync-time
-        eval "$(sed -n '/^if \[\[ "\${BASH_SOURCE\[0\]}" == "\$0" \]\]; then/,$p' "$repo_dir/sb.sh")"
+        eval "$(sed -n '/^if \[\[ "\${BASH_SOURCE\[0\]}" == "\$0" \]\]; then$/,$p' "$repo_dir/sb.sh")"
     ) < /dev/null
     assert_contains "$test_calls" 'root-check'
     assert_contains "$test_calls" 'ntpdate -u -t 5 pool.ntp.org'
