@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.1"
+export SCRIPT_VERSION="21-xray.2"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -10363,8 +10363,11 @@ _xray_native_listener() {
 _xray_native_add() {
     local variant server port name sni='' proto net=raw path='' cert key id pw tag user=proxy settings stream proxy url host
     local native_backend native_listen native_routed
-    printf '  1) VLESS TCP     2) Shadowsocks AES-128-GCM     3) SOCKS5 账号密码\n  4) VLESS WS+TLS  5) Trojan WS+TLS                6) VLESS gRPC+TLS\n'
-    read -r -p '选择：' variant || return 1
+    variant="${1:-}"
+    if [ -z "$variant" ]; then
+        printf '  1) VLESS TCP\n  2) Shadowsocks AES-128-GCM\n  3) SOCKS5 账号密码\n  4) VLESS WS+TLS\n  5) Trojan WS+TLS\n  6) VLESS gRPC+TLS\n'
+        read -r -p '选择：' variant || return 1
+    fi
     case "$variant" in 1|4|6) proto=vless ;; 2) proto=shadowsocks ;; 3) proto=socks ;; 5) proto=trojan ;; *) return 1 ;; esac
     read -r -p '客户端连接地址（IP 或域名）：' server || return 1
     server="${server#[}"; server="${server%]}"
@@ -10446,6 +10449,120 @@ _xray_native_port() {
     jq -er --arg t "$tag" '.[$t].share_link' "$METADATA_FILE" >> "$NODE_TX_DIR/share-links"
 }
 
+_legacy_migration_plan() {
+    python3 - "$CONFIG_FILE" "$SINGBOX_DIR/relay.json" "$METADATA_FILE" "$1" <<'PY'
+import base64, json, re, sys
+from urllib.parse import quote
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+main, relay, metadata, clients = map(load, sys.argv[1:])
+def require(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+def fields(obj, allowed):
+    require(not (obj.keys() - set(allowed.split())), '含未转换的配置字段')
+
+def convert(i):
+    tag, proto, port = i['tag'], i['type'], i['listen_port']
+    require(re.fullmatch(r'[\w-]+', tag, re.ASCII), '特殊入站标签')
+    require(proto in ('vless','trojan','shadowsocks','socks'), '协议未支持')
+    fields(i, 'tag type listen listen_port tls transport users method password')
+    m = metadata.get(tag, {})
+    require(not m.get('frontedBy') and m.get('core') != 'xray' and not tag.startswith('argo-') and i.get('listen') in ('::','0.0.0.0'), '共享或转发入口')
+    for cfg in (main, relay):
+        route = cfg.get('route', {})
+        for outbound in cfg.get('outbounds', []):
+            if outbound.get('tag') == 'direct':
+                require(outbound == {'type':'direct','tag':'direct'}, '自定义 direct 出站')
+        require(route.get('final','direct') == 'direct' and all(r.get('inbound') and tag not in ([r['inbound']] if isinstance(r['inbound'],str) else r['inbound']) and not r.get('invert') for r in route.get('rules',[])), '自定义路由')
+    tls, tr = i.get('tls',{}), i.get('transport',{})
+    net = tr.get('type','tcp')
+    require(net in ('tcp','ws','grpc'), '传输未支持')
+    stream = {'network':net,'security':'none'}
+    fields(tr, {'tcp':'type','ws':'type path','grpc':'type service_name'}[net])
+    if net=='ws': stream['wsSettings']={'path':tr['path']}
+    if net=='grpc': stream['grpcSettings']={'serviceName':tr['service_name']}
+    fields(tls, 'enabled server_name certificate_path key_path alpn reality')
+    if tls.get('enabled'):
+        if tls.get('reality',{}).get('enabled'):
+            r = tls['reality']; fields(r,'enabled handshake private_key short_id'); h=r['handshake']; fields(h,'server server_port')
+            host=h['server']; host=f'[{host}]' if ':' in host and not host.startswith('[') else host
+            stream.update(security='reality', realitySettings={'target':f"{host}:{h['server_port']}",'serverNames':[tls['server_name']],'privateKey':r['private_key'],'shortIds':r['short_id']})
+        else:
+            opts={'certificates':[{'certificateFile':tls['certificate_path'],'keyFile':tls['key_path']}]}
+            if 'alpn' in tls: opts['alpn']=tls['alpn']
+            stream.update(security='tls',tlsSettings=opts)
+    users=i.get('users',[])
+    def matches(p):
+        if p.get('type')!={'socks':'socks5','shadowsocks':'ss'}.get(proto,proto) or p.get('port')!=port or (m.get('clientName') and p['name']!=m['clientName']): return False
+        if proto=='shadowsocks': return p.get('cipher')==i['method'] and p.get('password')==i['password'] and not p.get('plugin') and not p.get('smux',{}).get('enabled')
+        return any(all(u.get(k)==p.get(k) and p.get(k) for k in {'socks':['username','password'],'trojan':['password'],'vless':['uuid']}[proto]) for u in users)
+    choices=[p for p in clients if matches(p)]
+    require(len(choices)==1,'客户端记录缺失或不唯一')
+    p=choices[0]; name=p['name']; server=p['server']; host=f'[{server}]' if ':' in server and not server.startswith('[') else server
+    link=m.get('share_link'); addr=f'@{host}:{port}'; fragment='#'+quote(name,safe='')
+    if proto=='shadowsocks':
+        require(i['method'] in ('aes-128-gcm','aes-256-gcm','chacha20-ietf-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm'), 'SS 加密方式未支持')
+        settings={'method':i['method'],'password':i['password'],'network':'tcp,udp'}
+        auth=base64.urlsafe_b64encode((i['method']+':'+i['password']).encode()).decode().rstrip('=')
+        link=link or 'ss://'+auth+addr+'?udp=1'+fragment
+    elif proto=='socks':
+        for u in users: fields(u,'username password')
+        settings={'auth':'password','udp':True,'accounts':[{'user':u['username'],'pass':u['password']} for u in users]}
+        link='socks5://'+quote(p['username'],safe='')+':'+quote(p['password'],safe='')+addr+'?udp=1'+fragment
+    elif proto=='trojan':
+        for u in users: fields(u,'name password')
+        settings={'clients':[{'password':u['password']} for u in users]}
+    else:
+        for u in users: fields(u,'name uuid flow')
+        settings={'decryption':'none','clients':[{'id':u['uuid'],**({'flow':u['flow']} if u.get('flow') else {})} for u in users]}
+        if not link and net=='tcp' and not tls.get('enabled'): link='vless://'+p['uuid']+addr+'?encryption=none&type=tcp&security=none'+fragment
+    require(link and link.startswith({'shadowsocks':'ss','socks':'socks5'}.get(proto,proto)+'://'), '缺少匹配的分享链接')
+    return {'inbound':{'tag':tag,'port':port,'listen':i['listen'],'protocol':proto,'settings':settings,'streamSettings':stream},'meta':dict(m,core='xray',type='native-'+proto,name=name,clientName=name,publicPort=port,backendPort=port,server_name=tls.get('server_name',''),share_link=link)}
+
+plan=[]
+for i in main['inbounds']:
+    try:
+        entry=convert(i)
+    except (ValueError,KeyError,TypeError) as e:
+        print('跳过',i.get('tag'),i.get('type'),str(e),file=sys.stderr)
+    else:
+        plan.append(entry); print('迁移',i['tag'],i['type'],file=sys.stderr)
+for i in relay.get('inbounds',[]): print('跳过中转入口',i.get('tag'),i.get('type'),file=sys.stderr)
+json.dump(plan,sys.stdout)
+PY
+}
+
+_migration_listeners_ready() {
+    local ports pid listening attempt
+    ports=$(jq -er '.[].inbound.port' "$1") || return 1
+    for attempt in {1..20}; do
+        pid=$(systemctl show -p MainPID --value proxyall-xray) || return 1
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+            listening=$(ss -H -lntp) || return 1
+            awk -v id="pid=$pid," -v ports="$ports" '
+                BEGIN {n=split(ports,p,/\n/)} index($0,id) {sub(/^.*:/,"",$4); seen[$4]=1}
+                END {for(i=1;i<=n;i++) if(!(p[i] in seen)) exit 1}' <<< "$listening" && return 0
+        fi
+        sleep 0.25
+    done
+    _error 'Xray 未接管全部迁移端口。'
+    return 1
+}
+
+_apply_legacy_plan() {
+    local plan="$1" tmp
+    tmp=$(_node_candidate_path "$XRAY_CONFIG_FILE") || return 1
+    jq --slurpfile p "$plan" '.inbounds += [$p[0][].inbound] | select(([.inbounds[].tag]|length)==([.inbounds[].tag]|unique|length))' "$tmp" > "$NODE_TX_DIR/migrated.json" &&
+        [ -s "$NODE_TX_DIR/migrated.json" ] && mv "$NODE_TX_DIR/migrated.json" "$tmp" &&
+        jq --slurpfile p "$plan" 'reduce $p[0][] as $n (.; .[$n.inbound.tag]=$n.meta)' "$METADATA_FILE" > "$NODE_TX_DIR/migrated.meta" &&
+        mv "$NODE_TX_DIR/migrated.meta" "$METADATA_FILE"
+}
+
 _retire_legacy_service() (
     _config_write_lock || exit 1
     [ "$INIT_SYSTEM" = systemd ] && [ -f "$SINGBOX_DIR/.managed_sing_box" ] &&
@@ -10454,12 +10571,37 @@ _retire_legacy_service() (
             _error '未找到可识别的旧版受管 systemd 服务。'; exit 1;
         }
     local answer work active=false enabled=false changed=false file
-    read -r -p '停用全部旧 sing-box 入站及其 443 路由？已验证替代节点后输入 RETIRE：' answer || exit 1
-    [ "$answer" = RETIRE ] || exit 0
+    local migrate=false xr_active=false xr_enabled=false xr_committing=false stage
+    if [ "${1:-}" = migrate ]; then
+        migrate=true
+        [ -f "$SINGBOX_BIN" ] && [ ! -L "$SINGBOX_BIN" ] && [ ! -L "$SERVICE_FILE" ] || exit 1
+        command -v ss >/dev/null || _pkg_install iproute2 || exit 1
+        command -v python3 >/dev/null || _pkg_install python3 || exit 1
+        _install_yq || exit 1
+        stage=$(mktemp -d "$SINGBOX_DIR/.migration.XXXXXXXX") || exit 1
+        trap 'rm -rf -- "$stage"' EXIT
+        "$YQ_BINARY" eval -o=json '.proxies' "$CLASH_YAML_FILE" > "$stage/clients" &&
+            _legacy_migration_plan "$stage/clients" > "$stage/plan" || exit 1
+        jq -e 'length>0' "$stage/plan" >/dev/null || { _error '没有可迁移节点，保留 sing-box。'; exit 1; }
+        read -r -p '按原端口切换。跳过的节点将下线。确认迁移并删除受管 sing-box？输入 MIGRATE：' answer || exit 1
+        [ "$answer" = MIGRATE ] || exit 0
+        _install_xray || exit 1
+        _xray_running && xr_active=true
+        systemctl is-enabled --quiet proxyall-xray && xr_enabled=true
+    else
+        read -r -p '停用全部旧 sing-box 入站及其 443 路由？已验证替代节点后输入 RETIRE：' answer || exit 1
+        [ "$answer" = RETIRE ] || exit 0
+    fi
     work=$(mktemp -d "$SINGBOX_DIR/retired.XXXXXXXX") || exit 1
     for file in "$CONFIG_FILE" "$SINGBOX_DIR/relay.json" "$CLASH_YAML_FILE" "$METADATA_FILE"; do
         [ ! -f "$file" ] || cp -p -- "$file" "$work/" || exit 1
     done
+    if $migrate; then
+        for file in "$SERVICE_FILE" "$SINGBOX_BIN" "$SINGBOX_DIR/.managed_sing_box"; do cp -p -- "$file" "$work/" || exit 1; done
+        [ ! -f "$XRAY_CONFIG_FILE" ] || cp -p -- "$XRAY_CONFIG_FILE" "$work/" || exit 1
+        mv "$stage/plan" "$work/plan.json" || exit 1
+        rm -rf -- "$stage"
+    fi
     systemctl is-active --quiet sing-box && active=true
     systemctl is-enabled --quiet sing-box && enabled=true
     if [ -f "$SNI_ROUTER_STATE_FILE" ]; then
@@ -10475,6 +10617,17 @@ _retire_legacy_service() (
             for file in "$CONFIG_FILE" "$SINGBOX_DIR/relay.json"; do
                 [ ! -f "$work/${file##*/}" ] || cp -p "$work/${file##*/}" "$file"
             done
+            if $migrate; then
+                for file in "$SERVICE_FILE" "$SINGBOX_BIN" "$SINGBOX_DIR/.managed_sing_box"; do cp -p -- "$work/${file##*/}" "$file"; done
+                systemctl daemon-reload
+                if $xr_committing; then
+                    systemctl stop proxyall-xray
+                    if [ -f "$work/${XRAY_CONFIG_FILE##*/}" ]; then cp -p "$work/${XRAY_CONFIG_FILE##*/}" "$XRAY_CONFIG_FILE"; else rm -f "$XRAY_CONFIG_FILE"; fi
+                    cp -p "$work/${METADATA_FILE##*/}" "$METADATA_FILE"
+                    $xr_enabled || systemctl disable proxyall-xray
+                    $xr_active && systemctl start proxyall-xray
+                fi
+            fi
             [ "$changed" != true ] || _sni_router_restore_state "$work/state.json"
             [ "$enabled" != true ] || systemctl enable sing-box
             [ "$active" != true ] || systemctl start sing-box
@@ -10490,54 +10643,64 @@ _retire_legacy_service() (
             mv "${SNI_ROUTER_STATE_FILE}.retire" "$SNI_ROUTER_STATE_FILE" && _sni_router_apply || exit 1
     fi
     rm -f -- "$CONFIG_FILE" "$SINGBOX_DIR/relay.json" || exit 1
-    _success "旧内核已停用，配置归档：$work。"
+    if $migrate; then
+        xr_committing=true
+        _node_operation _apply_legacy_plan "$work/plan.json" && _xray_running && _migration_listeners_ready "$work/plan.json" || exit 1
+        rm -f -- "$SERVICE_FILE" "$SINGBOX_BIN" "$SINGBOX_DIR/.managed_sing_box" && systemctl daemon-reload || exit 1
+        _success "迁移完成，旧 sing-box 已删除。备份：$work"
+        jq -r '.[].meta.share_link' "$work/plan.json"
+    else
+        _success "旧内核已停用，配置归档：$work。"
+    fi
 )
 
-_xray_menu() {
-    _check_root
-    local choice what
+_xray_add_node_menu() {
+    local choice
     while true; do
-        printf '\nXray 节点管理\n  1) Vision + Reality       2) XHTTP + Reality\n  3) XHTTP + TLS (Nginx)    4) 其他 Xray 节点\n  5) 分享链接与聚合订阅      6) 修改端口      7) 删除节点\n  8) 中转 / 直连出站         9) 核心更新      10) 服务状态\n  11) 批量创建 Vision       0) 返回\n'
-        read -r -p '选择：' choice || return 0
+        printf '\n  ═══════════════════════════════════════\n             Xray 添加节点\n  ═══════════════════════════════════════\n\n  【协议选择】\n    [1] VLESS (Vision + Reality)\n    [2] VLESS (XHTTP + Reality)\n    [3] VLESS (XHTTP + TLS)\n    [4] VLESS (WebSocket + TLS)\n    [5] Trojan (WebSocket + TLS)\n    [6] VLESS (gRPC + TLS)\n    [7] Shadowsocks (AES-128-GCM)\n    [8] VLESS (裸 TCP，无 TLS)\n    [9] SOCKS5 (账号密码)\n\n  ───────────────────────────────────────\n    [0] 返回节点管理\n\n'
+        read -r -p '  请输入选项 [0-9]: ' choice || return 0
         case "$choice" in
             0) return 0 ;;
-            10) _xray_service status; continue ;;
-            5) _xray_list_links subscription; continue ;;
-            1|2|3|4|6|7|8|9|11) ;;
-            *) _error '无效选择。'; continue ;;
-        esac
-        local dep
-        for dep in jq openssl curl wget; do command -v "$dep" >/dev/null || _pkg_install "$dep" || return 1; done
-        command -v ss >/dev/null || { if command -v apk >/dev/null; then _pkg_install iproute2; else _pkg_install iproute2 || _pkg_install iproute; fi; } || return 1
-        install -d -m 700 "$SINGBOX_DIR" || return 1
-        if [ "$choice" = 9 ]; then ( _config_write_lock && _install_xray true ); continue; fi
-        ( _config_write_lock && _install_yq ) || return 1
-        case "$choice" in
             1) _node_operation _add_vless_reality_impl ;;
             2) _node_operation _add_vless_xhttp_reality_impl ;;
             3) _node_operation _add_vless_xhttp_tls_impl ;;
-            4) _node_operation _xray_native_add ;;
-            6) _node_operation _xray_manage_node port ;;
-            7) _node_operation _xray_manage_node delete ;;
-            8) _node_operation _xray_manage_node relay ;;
-            11) _node_operation _xray_batch_vision ;;
+            4) _node_operation _xray_native_add 4 ;;
+            5) _node_operation _xray_native_add 5 ;;
+            6) _node_operation _xray_native_add 6 ;;
+            7) _node_operation _xray_native_add 2 ;;
+            8) _node_operation _xray_native_add 1 ;;
+            9) _node_operation _xray_native_add 3 ;;
+            *) _error '无效选择。'; continue ;;
         esac
+        return
     done
 }
 
-_xray_batch_vision() {
-    local ports p seen=' ' BATCH_MODE=true BATCH_IP BATCH_PORT BATCH_SNI BATCH_REALITY_HANDSHAKE_SERVER BATCH_REALITY_HANDSHAKE_PORT BATCH_VISION_PROFILE
-    read -r -p '服务端 IP 或域名：' BATCH_IP && [ -n "$BATCH_IP" ] || return 1
-    _select_reality_sni || return 1
-    BATCH_SNI="$SELECTED_REALITY_SNI"; BATCH_REALITY_HANDSHAKE_SERVER="$SELECTED_REALITY_HANDSHAKE_SERVER"; BATCH_REALITY_HANDSHAKE_PORT="$SELECTED_REALITY_HANDSHAKE_PORT"
-    BATCH_VISION_PROFILE=$(_vision_profile_prompt) || return 1
-    read -r -p '监听端口（用空格分隔，443 使用共享入口）：' ports || return 1
-    [[ "$ports" =~ ^[0-9\ ]+$ && "$ports" =~ [0-9] ]] || return 1
-    for p in $ports; do
-        [[ "$p" =~ ^[1-9][0-9]{0,4}$ && "$seen" != *" $p "* ]] && _sni_router_validate_port "$p" || return 1
-        seen+="$p "
-        if [ "$p" != "$SNI_ROUTER_PUBLIC_PORT" ]; then _check_port_conflict "$p" tcp && return 1; fi
-        BATCH_PORT="$p"; _add_vless_reality_impl || return 1
+_xray_menu() {
+    _check_root
+    local choice dep
+    while true; do
+        printf '\n  ═══════════════════════════════════════\n         Xray 节点管理 v%s\n  ═══════════════════════════════════════\n\n  【节点管理】\n    [1] 添加节点\n    [2] 分享链接与聚合订阅\n    [3] 修改节点端口\n    [4] 删除节点\n    [5] 中转 / 直连出站\n\n  【服务维护】\n    [6] 更新 Xray 核心\n    [7] 查看服务状态\n    [8] 迁移并删除旧 sing-box\n\n  ───────────────────────────────────────\n    [0] 返回主菜单\n\n' "$SCRIPT_VERSION"
+        read -r -p '  请输入选项 [0-8]: ' choice || return 0
+        case "$choice" in
+            0) return 0 ;;
+            8) _retire_legacy_service migrate; continue ;;
+            7) _xray_service status; continue ;;
+            2) _xray_list_links subscription; continue ;;
+            1|3|4|5|6) ;;
+            *) _error '无效选择。'; continue ;;
+        esac
+        for dep in jq openssl curl wget; do command -v "$dep" >/dev/null || _pkg_install "$dep" || return 1; done
+        command -v ss >/dev/null || { if command -v apk >/dev/null; then _pkg_install iproute2; else _pkg_install iproute2 || _pkg_install iproute; fi; } || return 1
+        install -d -m 700 "$SINGBOX_DIR" || return 1
+        if [ "$choice" = 6 ]; then ( _config_write_lock && _install_xray true ); continue; fi
+        ( _config_write_lock && _install_yq ) || return 1
+        case "$choice" in
+            1) _xray_add_node_menu ;;
+            3) _node_operation _xray_manage_node port ;;
+            4) _node_operation _xray_manage_node delete ;;
+            5) _node_operation _xray_manage_node relay ;;
+        esac
     done
 }
 
@@ -10554,6 +10717,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 _check_root
                 shift
                 _sni_router_cli "$@"
+                exit $?
+                ;;
+            migrate-sing-box)
+                _check_root
+                _retire_legacy_service migrate
                 exit $?
                 ;;
             retire-sing-box)

@@ -10,7 +10,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/KevinChen222/ss_node/main/proxyall) --install
 ```
 
-`proxyall` 菜单 1 管理反代，2 管理节点。创建第一个节点时下载并校验 Xray；已有核心可在节点菜单 9 更新。`sb` 是节点管理命令，`nginxproxy` 是反代管理命令。
+`proxyall` 菜单 1 管理反代，2 管理节点。创建第一个节点时下载并校验 Xray；节点菜单 1 进入添加节点子菜单，已有核心可在节点菜单 6 更新。`sb` 是节点管理命令，`nginxproxy` 是反代管理命令。
 
 ```bash
 proxyall --update        # 更新管理脚本
@@ -50,11 +50,17 @@ XHTTP 使用 `stream-up`、HTTP/2 和 XMUX。单连接最大并发可调，默�
 
 ## 从 sing-box 版本升级
 
-更新脚本不会翻译旧节点、改写客户端订阅或停掉运行中的服务。已有受管 Xray XHTTP 节点继续由新菜单管理。旧 AnyTLS、TUIC 等节点需要换成新的 Xray 节点；原有 sing-box 链接不计入新的聚合订阅。
+对于本脚本安装的 systemd 服务，可运行 `sb migrate-sing-box`（节点菜单 8）。脚本先列出可迁移和跳过的入站。输入 `MIGRATE` 后会短暂停服，在原端口启动 Xray，验证服务后删除受管 sing-box 可执行文件和 systemd 服务。无可迁移节点时保留旧服务。
+
+迁移器识别有匹配客户端记录的独立 VLESS、Trojan、SOCKS5 和普通 Shadowsocks 入站，保留端口、凭据和客户端名称。AnyTLS、TUIC、中转入口、共享路由、smux 等无法完整转换的配置会跳过；这些旧节点在切换后下线。菜单 2 可查看迁移后的分享链接。`retired.*` 目录保存旧核心、服务文件及配置，含私钥和密码，仅限 root 访问。
+
+若需要先做客户端流量验证，可手动并行创建替代节点：
+
+已有受管 Xray XHTTP 节点继续由新菜单管理。
 
 1. 保留旧订阅，在空闲端口创建 Xray 节点，先用自己的客户端确认流量。
 2. 若旧服务由本脚本安装并由 systemd 管理，运行 `sb retire-sing-box` 停用其自启和监听。它将旧主配置、中转配置和路由快照归档到 `retired.*`，只摘除旧内核的 SNI 路由，保留 Emby、Xray、证书和续期任务。自建服务或 OpenRC 需要按原服务管理方式停用。
-3. 需要时在节点菜单 6 将验证过的 Reality 节点改到共享 443，再更新订阅。历史配置文件和备份包含凭据，应保留在 root 专用目录。
+3. 需要时在节点菜单 3 将验证过的 Reality 节点改到共享 443，再更新订阅。历史配置文件和备份包含凭据，应保留在 root 专用目录。
 
 ## 维护与验证
 
