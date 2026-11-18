@@ -39,6 +39,9 @@ case "$ACTION" in
     xhttp-reality) _node_operation _add_vless_xhttp_reality_impl ;;
     xhttp-tls) _node_operation _add_vless_xhttp_tls_impl ;;
     add-menu) _xray_add_node_menu ;;
+    add-dispatch)
+        _node_operation() { printf '%s\n' "$*" >> "$WORK/dispatch"; }
+        _xray_add_node_menu ;;
     main-menu) _xray_menu ;;
     failed)
         change() { _atomic_modify_json "$METADATA_FILE" '.foo={}' && return 1; }
@@ -127,8 +130,8 @@ class Interaction(unittest.TestCase):
         self.assertEqual(self.run_shell('delete').returncode, 2)
 
     def test_every_creation_prompt_can_cancel_or_eof(self):
-        cases = [('native', n, ['127.0.0.1', '8443', 'New'] + (['example.test'] if n >= 4 else ['1'] if n == 1 else []))
-                 for n in range(1, 7)]
+        cases = [('native', n, ['127.0.0.1', '8443', 'New'] + (['1'] if n == 1 else []))
+                 for n in (1, 2)]
         cases += [
             ('vision', '', ['127.0.0.1', 'y', '1', 'example.test', '443', 'y', 'New', '1']),
             ('xhttp-reality', '', ['127.0.0.1', 'y', '1', 'example.test', '443', 'y', '/test/', 'New', '1', '1']),
@@ -149,9 +152,20 @@ class Interaction(unittest.TestCase):
     def test_menu_back_and_update_declined(self):
         for data in ('0\n', '6\n0\n0\n', '6\nn\n0\n', '6\n\n0\n'):
             self.assertEqual(self.run_shell('main-menu', data).returncode, 0)
-        result = self.run_shell('add-menu', '8\n0\n0\n')
+        result = self.run_shell('add-menu', '5\n0\n0\n')
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.count('Xray 添加节点'), 2)
+
+    def test_add_menu_has_five_protocols(self):
+        result = self.run_shell('add-dispatch', '1\n2\n3\n4\n5\n6\n9\n0\n')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((self.root/'dispatch').read_text().splitlines(), [
+            '_add_vless_reality_impl', '_add_vless_xhttp_reality_impl', '_add_vless_xhttp_tls_impl',
+            '_xray_native_add 2', '_xray_native_add 1'])
+        for removed in ('WebSocket', 'gRPC', 'SOCKS5', 'AES-128-GCM'):
+            self.assertNotIn(removed, result.stdout)
+        for variant in (3, 4, 5, 6):
+            self.assertEqual(self.run_shell('native', '', variant).returncode, 1)
 
     def test_candidate_failure_and_noop_preserve_original_files(self):
         self.assertEqual(self.run_shell('failed').returncode, 1)

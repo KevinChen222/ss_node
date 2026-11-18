@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.6"
+export SCRIPT_VERSION="21-xray.7"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -10351,7 +10351,10 @@ def parse(link):
     else:
         if proto=='trojan': dest['password']=auth
         elif proto=='shadowsocks':
-            method,password=base64.urlsafe_b64decode(auth+'===').decode().split(':',1)
+            if u.password is not None:
+                method,password=auth,unquote(u.password)
+            else:
+                method,password=base64.urlsafe_b64decode(auth+'===').decode().split(':',1)
             dest.update(method=method,password=password)
         else: dest['users']=[{'user':auth,'pass':unquote(u.password or '')}]
         settings={'servers':[dest]}
@@ -10375,7 +10378,7 @@ def parse(link):
     elif network=='grpc':
         stream['grpcSettings']={'serviceName':q.pop('serviceName'),'authority':q.pop('authority','')}
     elif network not in ('tcp','raw'): raise ValueError
-    if q or (proto!='socks' and u.password is not None): raise ValueError
+    if q or (proto not in ('socks','shadowsocks') and u.password is not None): raise ValueError
     return dict(protocol=proto,settings=settings,streamSettings=stream)
 
 try:
@@ -10773,14 +10776,15 @@ _xray_native_listener() {
 }
 
 _xray_native_add() {
-    local variant server port name sni='' proto net=raw path='' cert key id pw tag user=proxy settings stream proxy url host
+    local variant server port name sni='' proto id pw tag settings stream proxy url host
+    local method=2022-blake3-aes-256-gcm
     local native_backend native_listen native_routed profile=none decryption=none encryption=none
     variant="${1:-}"
     if [ -z "$variant" ]; then
-        printf '  1) VLESS TCP + ENC（无 TLS）\n  2) Shadowsocks AES-128-GCM\n  3) SOCKS5 账号密码\n  4) VLESS WS+TLS\n  5) Trojan WS+TLS\n  6) VLESS gRPC+TLS\n'
+        printf '  1) VLESS TCP + ENC（无 TLS）\n  2) Shadowsocks 2022 AES-256-GCM\n'
         _node_read -r -p '选择：' variant || return $?
     fi
-    case "$variant" in 1|4|6) proto=vless ;; 2) proto=shadowsocks ;; 3) proto=socks ;; 5) proto=trojan ;; *) return 1 ;; esac
+    case "$variant" in 1) proto=vless ;; 2) proto=shadowsocks ;; *) return 1 ;; esac
     _node_read -r -p '客户端连接地址（IP 或域名）：' server || return $?
     server="${server#[}"; server="${server%]}"
     [[ "$server" =~ ^[A-Za-z0-9.:-]+$ ]] || return 1
@@ -10792,56 +10796,24 @@ _xray_native_add() {
     if [ "$variant" = 1 ]; then
         profile=$(_vless_encryption_profile_prompt none) || return $?
     fi
-    if ((variant >= 4)); then
-        _node_read -r -p '证书域名 / SNI：' sni || return $?
-        _is_valid_reality_domain "$sni" || return 1
-        cert="$NGINX_CERT_DIR/$sni/cert"; key="$NGINX_CERT_DIR/$sni/key"
-        if ! _cert_matches_hostname "$cert" "$sni" || [ ! -s "$key" ]; then
-            _error "请先通过反代证书管理准备 $cert 和 $key。"; return 1
-        fi
-        path=$(openssl rand -hex 12) || return 1
-        net=ws; [ "$variant" != 6 ] || net=grpc
-        stream=$(jq -nc --arg net "$net" --arg cert "$cert" --arg key "$key" --arg path "$path" \
-            '{network:$net,security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}]}} +
-             (if $net=="grpc" then {grpcSettings:{serviceName:$path}} else {wsSettings:{path:("/"+$path)}} end)') || return 1
-    fi
     _install_xray || return 1
     [ "$variant" != 1 ] || _vless_encryption_keypair "$profile" || return 1
-    tag=$(_new_node_tag xray-in) && id=$("$XRAY_BIN" uuid) && pw=$(openssl rand -hex 24) || return 1
+    tag=$(_new_node_tag xray-in) || return 1
     _xray_native_listener "$port" "$sni" "$tag" || return 1
-    if [[ "$proto" = socks || "$proto" = shadowsocks ]]; then _check_port_conflict "$port" udp && return 1; fi
+    if [ "$proto" = shadowsocks ]; then _check_port_conflict "$port" udp && return 1; fi
     host="$server"; [[ "$host" != *:* ]] || host="[$host]"
     proxy=$(jq -nc --arg n "$name" --arg s "$server" --argjson p "$port" '{name:$n,server:$s,port:$p,udp:true}') || return 1
     case "$proto" in
-        vless|trojan)
-            if [ "$proto" = vless ]; then
-                settings=$(jq -nc --arg id "$id" --arg dec "$decryption" '{clients:[{id:$id}],decryption:$dec}')
-                proxy=$(jq -c --arg id "$id" '.+{type:"vless",uuid:$id}' <<< "$proxy")
-                if [ "$variant" = 1 ]; then
-                    proxy=$(jq -c --arg enc "$encryption" '.+{encryption:$enc}' <<< "$proxy") || return 1
-                fi
-                url="vless://$id@$host:$port?encryption=$(_url_encode "$encryption")"
-            else
-                settings=$(jq -nc --arg pw "$pw" '{clients:[{password:$pw}]}')
-                proxy=$(jq -c --arg pw "$pw" '.+{type:"trojan",password:$pw}' <<< "$proxy")
-                url="trojan://$pw@$host:$port?type=ws"
-            fi
-            if [ -n "$sni" ]; then
-                proxy=$(jq -c --arg sn "$sni" --arg net "$net" --arg path "$path" '.+{tls:true,network:$net,"client-fingerprint":"chrome"}+
-                    (if .type=="trojan" then {sni:$sn} else {servername:$sn} end)+
-                    (if $net=="grpc" then {"grpc-opts":{"grpc-service-name":$path}} else {"ws-opts":{path:("/"+$path),headers:{Host:$sn}}} end)' <<< "$proxy")
-                [ "$proto" != vless ] || url+="&type=$net"
-                url+="&security=tls&sni=$sni&fp=chrome"
-                if [ "$net" = grpc ]; then url+="&serviceName=$path"; else url+="&host=$sni&path=%2F$path"; fi
-            else url+='&type=tcp&security=none'; fi ;;
+        vless)
+            id=$("$XRAY_BIN" uuid) || return 1
+            settings=$(jq -nc --arg id "$id" --arg dec "$decryption" '{clients:[{id:$id}],decryption:$dec}') || return 1
+            proxy=$(jq -c --arg id "$id" --arg enc "$encryption" '.+{type:"vless",uuid:$id,encryption:$enc}' <<< "$proxy") || return 1
+            url="vless://$id@$host:$port?encryption=$(_url_encode "$encryption")&type=tcp&security=none" ;;
         shadowsocks)
-            settings=$(jq -nc --arg pw "$pw" '{method:"aes-128-gcm",password:$pw,network:"tcp,udp"}')
-            proxy=$(jq -c --arg pw "$pw" '.+{type:"ss",cipher:"aes-128-gcm",password:$pw}' <<< "$proxy")
-            url="ss://$(printf 'aes-128-gcm:%s' "$pw" | base64 | tr -d '\r\n=' | tr '+/' '-_')@$host:$port?udp=1" ;;
-        socks)
-            settings=$(jq -nc --arg pw "$pw" --arg u "$user" '{auth:"password",accounts:[{user:$u,pass:$pw}],udp:true}')
-            proxy=$(jq -c --arg pw "$pw" --arg u "$user" '.+{type:"socks5",username:$u,password:$pw}' <<< "$proxy")
-            url="socks5://$user:$pw@$host:$port?udp=1" ;;
+            pw=$(openssl rand -base64 32) || return 1
+            settings=$(jq -nc --arg method "$method" --arg pw "$pw" '{method:$method,password:$pw,network:"tcp,udp"}') || return 1
+            proxy=$(jq -c --arg method "$method" --arg pw "$pw" '.+{type:"ss",cipher:$method,password:$pw}' <<< "$proxy") || return 1
+            url="ss://$method:$(_url_encode "$pw")@$host:$port?udp=1" ;;
     esac
     local ib meta
     ib=$(jq -nc --arg tag "$tag" --arg proto "$proto" --arg listen "$native_listen" --argjson p "$native_backend" --argjson settings "$settings" --argjson stream "$stream" \
@@ -11076,9 +11048,9 @@ _retire_legacy_service() (
 _xray_add_node_menu() {
     local choice NODE_UI=true NODE_PENDING_ORIGIN=''
     while true; do
-        printf '\n  ═══════════════════════════════════════\n             Xray 添加节点\n  ═══════════════════════════════════════\n\n  【协议选择】\n    [1] VLESS (Vision + Reality)\n    [2] VLESS (XHTTP + Reality)\n    [3] VLESS (XHTTP + TLS)\n    [4] VLESS (WebSocket + TLS)\n    [5] Trojan (WebSocket + TLS)\n    [6] VLESS (gRPC + TLS)\n    [7] Shadowsocks (AES-128-GCM)\n    [8] VLESS (TCP + ENC，无 TLS)\n    [9] SOCKS5 (账号密码)\n\n  ───────────────────────────────────────\n    [0] 返回节点管理\n\n'
-        read -r -p '  请输入选项 [0-9]: ' choice || return 0
-        if [[ "$choice" =~ ^[1-9]$ ]]; then
+        printf '\n  ═══════════════════════════════════════\n             Xray 添加节点\n  ═══════════════════════════════════════\n\n  【协议选择】\n    [1] VLESS (Vision + Reality)\n    [2] VLESS (XHTTP + Reality)\n    [3] VLESS (XHTTP + TLS)\n    [4] Shadowsocks 2022 (AES-256-GCM)\n    [5] VLESS (TCP + ENC，无 TLS)\n\n  ───────────────────────────────────────\n    [0] 返回节点管理\n\n'
+        read -r -p '  请输入选项 [0-5]: ' choice || return 0
+        if [[ "$choice" =~ ^[1-5]$ ]]; then
             _info '填写节点参数时输入 0 可取消并返回协议选择；回车保留提示中的默认值。'
         fi
         case "$choice" in
@@ -11086,12 +11058,8 @@ _xray_add_node_menu() {
             1) _node_operation _add_vless_reality_impl ;;
             2) _node_operation _add_vless_xhttp_reality_impl ;;
             3) _node_operation _add_vless_xhttp_tls_impl ;;
-            4) _node_operation _xray_native_add 4 ;;
-            5) _node_operation _xray_native_add 5 ;;
-            6) _node_operation _xray_native_add 6 ;;
-            7) _node_operation _xray_native_add 2 ;;
-            8) _node_operation _xray_native_add 1 ;;
-            9) _node_operation _xray_native_add 3 ;;
+            4) _node_operation _xray_native_add 2 ;;
+            5) _node_operation _xray_native_add 1 ;;
             *) _error '无效选择。'; continue ;;
         esac
     done

@@ -26,10 +26,8 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 | 1 | VLESS TCP + Vision + Reality。Chrome 指纹、X25519MLKEM768 握手、XUDP；支持 VLESS ENC。 |
 | 2 | VLESS XHTTP + Reality，支持 VLESS ENC。Xray 处理握手，无需 Nginx 终止 TLS。 |
 | 3 | VLESS XHTTP + TLS，支持 VLESS ENC。Nginx 终止 HTTP/2，再转发至回环 Xray。 |
-| 4 / 5 / 6 | VLESS WS+TLS / Trojan WS+TLS / VLESS gRPC+TLS。复用 `/etc/nginx/certs/<域名>/cert` 与 `key`，由 Xray 终止 TLS。 |
-| 7 | Shadowsocks AES-128-GCM。 |
-| 8 | VLESS TCP + ENC，无 TLS。无需域名或证书，ENC 方式可选，适合作为链式代理的落地节点。 |
-| 9 | 带密码的 SOCKS5，不提供传输加密。 |
+| 4 | Shadowsocks 2022 AES-256-GCM（`2022-blake3-aes-256-gcm`）。自动生成 32 字节随机密钥，支持 TCP / UDP。 |
+| 5 | VLESS TCP + ENC，无 TLS。无需域名或证书，ENC 方式可选，适合作为链式代理的落地节点。 |
 
 节点管理菜单 2 / 3 / 4 用于查看分享链接、修改节点参数和删除节点，菜单 5 为选定入口绑定落地链接或 Xray outbound JSON，输入 `direct` 解除绑定。
 
@@ -43,7 +41,9 @@ Vision + Reality、XHTTP + Reality、XHTTP + TLS 和无 TLS 的 VLESS TCP 创建
 
 上述四种节点的 ENC 选项已通过 Xray 26.11.9、Sub-Store 2.44.16、mihomo Alpha `2be2f08` 实际连接验证。服务端 `decryption` 与客户端 `encryption` 自动配对，改端口、查看链接和聚合订阅保留对应参数。无 TLS VLESS ENC 作为 mihomo 的落地节点，通过 `dialer-proxy` 分别连接上述三种 TLS / Reality 前置，已验证 TCP 和 UDP 流量。
 
-Vision + Reality 和 XHTTP + Reality 的分享链接始终包含 `support-x25519mlkem768=true`，Sub-Store 导出为 `reality-opts.support-x25519mlkem768: true`。它指 Reality 的混合密钥交换，独立于 VLESS ENC；XHTTP + TLS 不使用 Reality，不添加此字段。这个 mihomo 构建没有 Reality `pqv` 验证密钥配置，生成器不启用依赖它的 ML-DSA-65 验证。Trojan 导出可省略 `tls: true`，mihomo 按 Trojan TLS 处理；仍需可信证书。
+Vision + Reality 和 XHTTP + Reality 的分享链接始终包含 `support-x25519mlkem768=true`，Sub-Store 导出为 `reality-opts.support-x25519mlkem768: true`。它指 Reality 的混合密钥交换，独立于 VLESS ENC；XHTTP + TLS 不使用 Reality，不添加此字段。这个 mihomo 构建没有 Reality `pqv` 验证密钥配置，生成器不启用依赖它的 ML-DSA-65 验证。
+
+SS2022 使用 SIP022 分享链接，密钥按 URI 转义写入；创建、改端口、改名及聚合订阅均保留相同密钥。已通过 Sub-Store 2.44.16 → mihomo Alpha `2be2f08` → Xray 26.11.9 的字段核对及 TCP / UDP 流量验证。
 
 XHTTP 使用 `stream-up`、HTTP/2 和 XMUX。单连接最大并发可调，默认 1，可复用时长为 1800 秒。使用 CDN 时，仅选择支持 HTTP/2 和流式 gRPC 的 TLS 入口；Reality 使用直连。中转链接支持本菜单生成的传输组合；无法完整转换的第三方参数用 Xray outbound JSON 配置。
 

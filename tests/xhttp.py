@@ -278,15 +278,14 @@ http {{
 
     @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE for native exports')
     def test_native_exports_and_relay(self):
-        for variant in range(1,7):
+        for variant in (1,2):
             with self.subTest(variant=variant):
                 public=port()
-                self.run_shell('native',f'{variant}\n127.0.0.1\n{public}\nnode{variant}\n' + ('xhttp.test\n' if variant>=4 else '\n' if variant == 1 else ''))
+                self.run_shell('native',f'{variant}\n127.0.0.1\n{public}\nnode{variant}\n' + ('\n' if variant == 1 else ''))
                 meta=next(m for m in self.json('metadata.json').values() if m['publicPort']==public)
                 proxy=self.exported(meta['share_link'])
                 saved=json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))
                 for key,value in next(p for p in saved['proxies'] if p['port']==public).items():
-                    if key=='tls' and variant==5: continue  # Trojan implies TLS in mihomo.
                     self.assertEqual(proxy.get(key),value,key)
                 mixed=port()
                 cfg=self.root/f'native{variant}.json'
@@ -296,8 +295,7 @@ http {{
                 cmd=['curl','-fsS','--max-time','5','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.webport}/']
                 res=subprocess.run(cmd,capture_output=True)
                 self.assertEqual(res.stdout,b'website',(res.stderr,(self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1600:],(self.root/'xray.log').read_text()[-800:]))
-                if variant in (1,2):  # VLESS TCP without TLS, Shadowsocks
-                    self.check_udp(mixed)
+                self.check_udp(mixed)
                 if variant==1:
                     ob=self.root/'out.json'
                     ob.write_text('{"protocol":"blackhole"}')

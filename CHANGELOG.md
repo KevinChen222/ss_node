@@ -1,5 +1,11 @@
 # 修改記錄
 
+## 21-xray.7 — 精簡協議與 SS2022
+
+- 添加選單縮減為 Vision + Reality、XHTTP + Reality、XHTTP + TLS、SS2022、VLESS TCP + ENC 五項，移除 WS / gRPC / SOCKS5 的建立入口及 Xray 建立分支。
+- Shadowsocks 預設 `2022-blake3-aes-256-gcm`，使用 32 字節隨機密鑰與 SIP022 分享格式；中轉導入兼容 URI 明文 userinfo 與舊 Base64 userinfo。
+- 驗證 Sub-Store / mihomo 導出、TCP / UDP、中轉、改端口與改名後密鑰保留；同步交互測試、版本及安裝雜湊。
+
 ## 21-xray.6 — 無 TLS 的 VLESS TCP ENC
 
 - 添加選單 8 改為 VLESS TCP + ENC（無 TLS），預設 ML-KEM-768 認證，可選 X25519 或關閉；關閉時明確提示不提供代理層加密。

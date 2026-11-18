@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import unittest
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, unquote, quote
 
 import xhttp
 
@@ -88,10 +88,11 @@ case "$ACTION" in
         mixed = xhttp.port()
         cfg = self.root/f'client-{mixed}.json'
         cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[proxy],'rules':['MATCH,'+proxy['name']]}))
-        env = dict(os.environ, SSL_CERT_FILE=str(self.root/'certs'/proxy['servername']/'cert'))
+        env = dict(os.environ, SSL_CERT_FILE=str(self.root/'certs'/proxy.get('servername', 'xhttp.test')/'cert'))
         self.fixture.start([xhttp.TOOLS['mihomo'], '-d', str(self.root/f'client-{mixed}'), '-f', str(cfg)], mixed, env)
         response = subprocess.run(['curl','-fsS','--max-time','6','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.fixture.webport}/'],capture_output=True)
         self.assertEqual(response.stdout, b'website', (response.stderr, (self.root/'xray.log').read_text()[-1200:]))
+        return mixed
 
     def snapshot(self):
         paths = [self.root/name for name in ('metadata.json','xray.json','clash.yaml','xray.pid')]
@@ -215,18 +216,51 @@ case "$ACTION" in
         self.assertIn('issue xhttp.test', (self.root/'prepare.calls').read_text())
         self.traffic()
 
-    def test_native_name_address_and_tls_fields(self):
-        for variant in (1, 2, 3, 4, 5, 6):
+    def test_native_name_and_address(self):
+        for variant in (1, 2):
             with self.subTest(variant=variant):
-                self.fixture.run_shell('native', f'{variant}\n127.0.0.1\n{xhttp.port()}\nNative\n'+('xhttp.test\n' if variant>=4 else '\n' if variant == 1 else ''))
+                self.fixture.run_shell('native', f'{variant}\n127.0.0.1\n{xhttp.port()}\nNative\n'+('\n' if variant == 1 else ''))
                 self.edit('name', 'Renamed\ny\n')
                 self.edit('server', '::1\ny\n')
                 self.assert_export()
-                if variant>=4:
-                    self.edit('sni', 'native.test\ny\n')
-                    self.edit('path', ('myservice' if variant==6 else '/new/')+'\ny\n')
-                    self.assert_export()
                 self.fixture.run_shell('delete', '1\ny\n')
+
+    def test_ss2022_key_and_link_lifecycle(self):
+        self.fixture.run_shell('native', f'2\n127.0.0.1\n{xhttp.port()}\nSS2022\n')
+        method = '2022-blake3-aes-256-gcm'
+        meta, inbound, client = self.data()
+        password = client['password']
+        self.assertEqual(len(base64.b64decode(password, validate=True)), 32)
+        self.assertEqual(client['cipher'], method)
+        self.assertEqual(inbound['settings']['method'], method)
+        self.assertEqual(inbound['settings']['password'], password)
+        for changed in (False, True):
+            if changed:
+                self.edit('port', f'{xhttp.port()}\ny\n')
+                self.edit('name', 'SS 中文\ny\n')
+                self.edit('server', '::1\ny\n')
+            meta, inbound, client = self.data()
+            uri = urlsplit(meta['share_link'])
+            self.assertEqual(uri.username, method)
+            self.assertEqual(unquote(uri.password), password)
+            self.assertEqual(client['password'], password)
+            self.assertEqual(inbound['settings']['password'], password)
+            mixed = self.traffic()
+            self.fixture.check_udp(mixed)
+        # Both SIP022 plaintext userinfo and older SIP002 Base64 userinfo import losslessly.
+        special = base64.b64encode(bytes([251,255])*16).decode()
+        for auth in (method+':'+quote(special, safe=''),
+                     base64.urlsafe_b64encode((method+':'+special).encode()).decode().rstrip('=')):
+            link = f'ss://{auth}@127.0.0.1:12345?udp=1#test'
+            exported = self.fixture.exported(link)
+            self.assertEqual(exported['cipher'], method)
+            self.assertEqual(exported['password'], special)
+            outbound = json.loads(subprocess.check_output(['bash','-c','source "$REPO/sb.sh"; _xray_link_outbound "$LINK"'],
+                                 env=dict(self.fixture.env, LINK=link)))
+            self.assertEqual(outbound['settings']['servers'][0]['method'], method)
+            self.assertEqual(outbound['settings']['servers'][0]['password'], special)
+        self.fixture.run_shell('delete', '1\ny\n')
+        self.assertEqual(self.fixture.json('metadata.json'), {})
 
     def test_vision_enc_and_sni(self):
         # Prepare a local Reality origin through the same creation flow.
