@@ -1,5 +1,21 @@
 # 修改記錄
 
+## 2026-11-17 — Xray 單核心與共用 443
+
+版本：`proxyall 2.0.0`、`sb.sh 21-xray.1`、`deploy.sh 2026.11.17-local20`。
+
+- 節點與中轉共用 Xray。新增 Vision 的 VLESS Encryption 選項、混合 Reality 握手與 XUDP；分享連結可直接交給 Sub-Store。舊版 sing-box 服務可在驗證新節點後獨立停用。
+- 共享入口保留 HAProxy SNI 分流與 Nginx 的 PROXY v2。相同 HAProxy 配置不重載，單後端不發週期健康探測；Emby 主入口採用串流上傳，證書引用掃描涵蓋 Xray。
+- 統一入口安裝三個腳本，日誌維護改為每 15 分鐘執行一次。刪除最後一個 Xray 入口時停止服務並取消自啟。
+
+## 2026-11-17 — 證書域名與分享連結相容性
+
+版本：`proxyall 1.7.26`、`sb.sh 20-kevin.44`、`advanced_relay.sh 16-kevin.16`。
+
+- 修正 OpenSSL 域名不匹配仍返回成功時，XHTTP 誤用其他域名證書的問題；AnyTLS 使用相同的域名檢查。
+- 普通 AnyTLS 建立、查看及聚合訂閱均從節點設定取得完整參數；自簽模式缺少可讀指紋時不輸出不驗證身分的連結。本機中轉匯入保留 TLS 指紋與會話設定，拒絕無法等價轉換的 `pcs`。
+- 修正舊 VLESS 連結重建時空欄導致的 SNI 錯位。Sub-Store 2.44.16 → mihomo Alpha `2be2f08` 回環涵蓋 Vision、XHTTP Reality、AnyTLS 與錯誤證書指紋；服務端使用 sing-box 1.14.4 / Xray 26.11.9。
+
 ## 2026-11-15 — HTTP-01 父目錄權限
 
 版本：`proxyall 1.7.25`、`deploy.sh 2026.11.15-local19`。

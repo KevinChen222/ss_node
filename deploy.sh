@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.11.15-local19'
+SCRIPT_VERSION='2026.11.17-local20'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -611,14 +611,14 @@ EOF_HAPROXY_INSPECT
             cat <<EOF_HAPROXY_HTTPS
 
 backend sb_https_backend
-    server nginx ${https_host}:${https_port} send-proxy-v2 check
+    server nginx ${https_host}:${https_port} send-proxy-v2
 EOF_HAPROXY_HTTPS
         fi
         if [[ -n $reality_host && -n $reality_port ]]; then
             cat <<EOF_HAPROXY_REALITY
 
 backend sb_reality_backend
-    server singbox ${reality_host}:${reality_port} check
+    server reality ${reality_host}:${reality_port}
 EOF_HAPROXY_REALITY
         fi
     } > "$output"
@@ -642,6 +642,10 @@ local_sni_router_apply() {
         log_error 'HAProxy 配置验证失败，未安装新配置。'
         rm -f "$new_conf" "$old_conf"
         return 1
+    fi
+    if cmp -s "$new_conf" "$SNI_ROUTER_HAPROXY_CONF" && systemctl is-active --quiet haproxy; then
+        rm -f "$new_conf" "$old_conf"
+        return 0
     fi
     if [[ -f $SNI_ROUTER_HAPROXY_CONF ]]; then
         cp -a -- "$SNI_ROUTER_HAPROXY_CONF" "$old_conf" || { rm -f "$new_conf" "$old_conf"; return 1; }
@@ -2916,8 +2920,10 @@ map $http_upgrade $emby_connection_upgrade {
     ''      close;
 }
 EOF
-    backup_file "$map_conf"
-    stage_file_install "$map_tmp" "$map_conf"
+    if ! cmp -s "$map_tmp" "$map_conf"; then
+        backup_file "$map_conf"
+        stage_file_install "$map_tmp" "$map_conf"
+    fi
     rm -f "$map_tmp"
 
     local clean_domain=${you_domain//[\[\]]/}
@@ -3132,6 +3138,7 @@ EOF
     append_common_proxy_headers "$tmp_conf"
     cat >> "$tmp_conf" <<'EOF'
         # Emby may serve video from the main origin when no separate CDN is used.
+        proxy_request_buffering off;
         proxy_set_header Range $http_range;
         proxy_set_header If-Range $http_if_range;
         proxy_force_ranges on;
@@ -3659,18 +3666,18 @@ cm_scan() {
         [[ -e $file ]] || continue
         if ! json=$(jq -c . "$file" 2>/dev/null); then cm_scan_complete=no; continue; fi
         case "${file##*/}" in
-            config.json|relay.json)
+            xray.json|config.json|relay.json)
                 if ! jq -e 'type=="object" and (.inbounds==null or (.inbounds|type=="array"))' <<< "$json" >/dev/null; then cm_scan_complete=no; continue; fi ;;
         esac
         # Include all certificate/key path references, including outbound trust and metadata.
-        rows=$(printf '%s' "$json" | jq -c 'paths as $p | select($p[-1] | type=="string") | select($p[-1] | test("(certificate|key)_path$")) | {path:getpath($p),tag:([range(0; ($p|length)) as $n | getpath($p[0:$n]) | objects | .tag? // empty] | last // "配置/元数据")} | if (.path|type)=="array" then .path[] as $v | .path=$v else . end') || { cm_scan_complete=no; continue; }
+        rows=$(printf '%s' "$json" | jq -c 'paths as $p | select($p[-1] | type=="string") | select($p[-1] | test("(certificate|key)_path$|^(certificateFile|keyFile)$")) | {path:getpath($p),tag:([range(0; ($p|length)) as $n | getpath($p[0:$n]) | objects | .tag? // empty] | last // "配置/元数据")} | if (.path|type)=="array" then .path[] as $v | .path=$v else . end') || { cm_scan_complete=no; continue; }
         while IFS= read -r entry; do
             [[ -n $entry ]] || continue
             path=$(jq -r '.path | if type=="string" then . else "INVALID" end' <<< "$entry")
             label=$(jq -r .tag <<< "$entry")
-            [[ -z $path ]] || cm_ref "$path" "sing-box: $label ($file)"
+            [[ -z $path ]] || cm_ref "$path" "代理配置: $label ($file)"
         done <<< "$rows"
-        rows=$(printf '%s' "$json" | jq -c '.. | objects | select(.certificate_path? | type=="string") | {cert:.certificate_path,key:(.key_path // "")}') || { cm_scan_complete=no; continue; }
+        rows=$(printf '%s' "$json" | jq -c '.. | objects | select((.certificate_path // .certificateFile) | type=="string") | {cert:(.certificate_path // .certificateFile),key:(.key_path // .keyFile // "")}') || { cm_scan_complete=no; continue; }
         while IFS= read -r entry; do
             [[ -n $entry ]] || continue
             cert=$(jq -r .cert <<< "$entry"); key=$(jq -r .key <<< "$entry")
@@ -3988,7 +3995,7 @@ certificate_menu() (
     done
     while true; do
         cm_scan
-        printf '\n  证书管理（默认 ACME 目录、Nginx、sing-box）\n'
+        printf '\n  证书管理（ACME、Nginx、Xray 及旧版代理配置）\n'
         for index in "${!cm_certs[@]}"; do
             refs=$(cm_references "$index")
             if [[ -f ${cm_records[$index]} ]]; then origin='ACME'; else origin='未关联 ACME'; fi
@@ -3996,7 +4003,7 @@ certificate_menu() (
             printf '  %s) %s | %s | %s | %s\n' "$((index + 1))" "${cm_names[$index]}" "$(cm_expiry "${cm_certs[$index]}")" "$origin" "$refs"
         done
         ((${#cm_certs[@]})) || printf '  尚未发现证书。可先添加 HTTPS 反代或需要证书的节点；两者没有安装顺序要求。\n'
-        [[ $cm_scan_complete == yes ]] || printf '  引用扫描不完整，清理已禁用；检查 Nginx 配置及 sing-box JSON。\n'
+        [[ $cm_scan_complete == yes ]] || printf '  引用扫描不完整，清理已禁用；检查 Nginx 和代理配置。\n'
         printf '  R) 检查全部证书续期状态（只读）\n  0) 返回\n'
         read -r -p '  选择证书序号或操作: ' choice || return 0
         case "$choice" in
@@ -4022,7 +4029,7 @@ certificate_menu() (
                     [[ $answer != y && $answer != Y ]] || cm_renew "$index" || true
                 fi ;;
             5)
-                printf '将重新检查 Nginx/sing-box 引用，并归档到 %s。自定义其他服务的引用需自行核对。\n' "$CM_BACKUP_ROOT"
+                printf '将重新检查 Nginx 和代理配置引用，并归档到 %s。自定义其他服务的引用需自行核对。\n' "$CM_BACKUP_ROOT"
                 read -r -p "确认没有其他服务使用，输入完整名称 ${cm_names[$index]}，其余返回: " answer || return 0
                 [[ $answer != "${cm_names[$index]}" ]] || cm_archive "$index" || true ;;
             *) log_warn '操作无效，已返回列表。' ;;

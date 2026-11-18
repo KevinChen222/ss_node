@@ -162,13 +162,23 @@ class DomainReuseTests(unittest.TestCase):
         self.run_case()
         self.assertTrue(self.challenge.exists())
 
-    def test_valid_certificate_is_reused_without_acme(self):
+    def certificate(self, name):
         certdir = self.root / 'certs' / DOMAIN
         certdir.mkdir(parents=True)
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
                         '-nodes', '-keyout', str(certdir / 'key'), '-out', str(certdir / 'cert'),
-                        '-subj', f'/CN={DOMAIN}', '-addext', f'subjectAltName=DNS:{DOMAIN}', '-days', '73'],
-                       check=True, capture_output=True)
+                        '-subj', f'/CN={name}', '-addext', f'subjectAltName=DNS:{name}', '-days', '73'],
+                        check=True, capture_output=True)
+        return certdir
+
+    def test_wrong_hostname_is_not_reused(self):
+        self.certificate('other.example.com')
+        result = self.run_case(expected=1, CHECK_CERT='1')
+        self.assertIn('unexpected-dns', result.stderr)
+        self.assertTrue(self.origin.exists())
+
+    def test_valid_certificate_is_reused_without_acme(self):
+        certdir = self.certificate(DOMAIN)
         before = {name: (certdir / name).read_bytes() for name in ('cert', 'key')}
         self.run_case(CHECK_CERT='1')
         self.assertEqual(before, {name: (certdir / name).read_bytes() for name in ('cert', 'key')})

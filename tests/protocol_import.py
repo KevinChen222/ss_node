@@ -62,6 +62,19 @@ class ImportTests(unittest.TestCase):
         link = 'vmess://' + base64.urlsafe_b64encode(json.dumps(node).encode()).decode()
         return self.parse(base=link)
 
+    def test_anytls_tls_policy(self):
+        base = 'anytls://secret@example.com:443/?sni=own.example&fp=firefox&alpn=h2%2Chttp%2F1.1'
+        rc, obj = self.parse('&idle-session-timeout=30&min-idle-session=0', base)
+        self.assertEqual(rc, 0, obj)
+        self.assertFalse(obj['tls']['insecure'])
+        self.assertEqual(obj['tls']['utls']['fingerprint'], 'firefox')
+        self.assertEqual(obj['tls']['alpn'], ['h2', 'http/1.1'])
+        self.assertEqual(obj['idle_session_timeout'], '30s')
+        self.assertEqual(obj['min_idle_session'], 0)
+        rc, obj = self.parse('&insecure=1&pcs=' + 'ab'*32, base)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('pcs', obj['error'])
+
     def test_empty_credentials_rejected(self):
         for link in ('ss://@1.2.3.4:8388', 'ss://:secret@example.com:8388',
                      'ss://aes-128-gcm:@example.com:8388',
@@ -187,14 +200,11 @@ class RealityTests(unittest.TestCase):
         self.assertEqual(p.returncode,0,p.stderr)
         self.assertIn('验证通过',p.stderr)
 
-    def test_generated_reality_nodes(self):
-        for kind in ('vless', 'anytls'):
-            with self.subTest(kind=kind):
-                port = self.port()
-                env = dict(os.environ, REPO=str(REPO), WORK=str(self.root),
-                           CORE=CORE, NODE_KIND=kind, NODE_PORT=str(port),
-                           ORIGIN_PORT=str(self.origin))
-                generated = subprocess.run(['bash', '-c', r'''
+    def test_legacy_any_reality(self):
+        port = self.port()
+        env = dict(os.environ, REPO=str(REPO), WORK=str(self.root), CORE=CORE,
+                   NODE_PORT=str(port), ORIGIN_PORT=str(self.origin))
+        generated = subprocess.run(['bash', '-c', r'''
 source "$REPO/sb.sh"
 SINGBOX_DIR="$WORK"
 CONFIG_FILE="$WORK/generated.json"
@@ -211,29 +221,20 @@ printf '%s\n' '{}' > "$METADATA_FILE"
 _new_node_tag() { echo generated-reality; }
 _assert_node_name_free() { return 0; }
 _add_node_to_yaml() { printf '%s\n' "$1" > "$WORK/proxy.json"; }
-if [ "$NODE_KIND" = vless ]; then
-    _add_vless_reality_impl
-else
-    _create_anyreality_node_impl 127.0.0.1 "$NODE_PORT" localhost secret \
-        generated-anytls 127.0.0.1 "$ORIGIN_PORT" 127.0.0.1 "$NODE_PORT" false
-fi
+_create_anyreality_node_impl 127.0.0.1 "$NODE_PORT" localhost secret \
+    generated-anytls 127.0.0.1 "$ORIGIN_PORT" 127.0.0.1 "$NODE_PORT" false
 '''], env=env, capture_output=True, text=True, timeout=15)
-                self.assertEqual(generated.returncode, 0, generated.stderr)
-                metadata = json.loads((self.root/'metadata.json').read_text())['generated-reality']
-                parsed = subprocess.run(['bash', str(REPO/'parser.sh'), metadata['share_link']],
-                                        capture_output=True, text=True)
-                self.assertEqual(parsed.returncode, 0, parsed.stderr)
-                outbound = json.loads(parsed.stdout)
-                self.assertEqual(outbound['tls']['utls']['fingerprint'], 'firefox')
-                self.assertEqual(outbound['tls']['reality']['public_key'], metadata['publicKey'])
-                if kind == 'vless':
-                    proxy = json.loads((self.root/'proxy.json').read_text())
-                    self.assertEqual(proxy['client-fingerprint'], outbound['tls']['utls']['fingerprint'])
-                    self.assertEqual(proxy['reality-opts']['public-key'], metadata['publicKey'])
-                    self.assertEqual(proxy['reality-opts']['short-id'], metadata['shortId'])
-                self.start([CORE, 'run', '-c', str(self.root/'generated.json')], port)
-                result = self.probe(outbound)
-                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        metadata = json.loads((self.root/'metadata.json').read_text())['generated-reality']
+        parsed = subprocess.run(['bash', str(REPO/'parser.sh'), metadata['share_link']],
+                                capture_output=True, text=True)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        outbound = json.loads(parsed.stdout)
+        self.assertEqual(outbound['tls']['utls']['fingerprint'], 'firefox')
+        self.assertEqual(outbound['tls']['reality']['public_key'], metadata['publicKey'])
+        self.start([CORE, 'run', '-c', str(self.root/'generated.json')], port)
+        result = self.probe(outbound)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wrong_short_id(self):
         outbound=self.outbound()

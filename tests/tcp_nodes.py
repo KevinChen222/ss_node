@@ -50,6 +50,7 @@ fi
 case "$ACTION" in
     ss) _add_shadowsocks_menu_impl ;;
     vless) _add_vless_tcp_impl ;;
+    anytls) BATCH_ANYTLS_INSECURE=true _create_anytls_tls_node_impl "$server_ip" "$BATCH_PORT" any.example 'pw:@/+' 'AnyTLS test' 127.0.0.1 ;;
     view) _view_nodes ;;
     link) _ss_share_link "$TEST_NAME" ;;
 esac
@@ -195,6 +196,21 @@ class ExportTests(NodeFixture):
         self.assertNotIn('security=reality', viewed.stdout)
         self.assertNotIn('mihomo 节点 YAML', viewed.stdout)
 
+    def test_view_reconstructs_vision_with_empty_transport(self):
+        self.generate(kind='vless')
+        config = self.read('config.json')
+        node = config['inbounds'][0]
+        node['users'][0]['flow'] = 'xtls-rprx-vision'
+        node['tls'] = {'enabled':True, 'server_name':'vision.example', 'reality':{'enabled':True}}
+        (self.root/'config.json').write_text(json.dumps(config))
+        meta = self.read('metadata.json')
+        m = meta['tcp-node-test']
+        del m['share_link']
+        m.update(publicKey='example-key', shortId='aabb')
+        (self.root/'metadata.json').write_text(json.dumps(meta))
+        out = self.run_shell('view', 'n\n').stdout
+        self.assertIn('flow=xtls-rprx-vision&sni=vision.example&sid=aabb', out)
+
     @unittest.skipUnless(os.environ.get('TEST_SUBSTORE_SOURCE'), 'set TEST_SUBSTORE_SOURCE for official parser tests')
     def test_substore_preserves_all_ss_fields(self):
         nodes = []
@@ -230,6 +246,46 @@ class Target(http.server.BaseHTTPRequestHandler):
 
 @unittest.skipUnless(all(TOOLS.values()), 'set TEST_YQ, TEST_SINGBOX and TEST_MIHOMO for real-core tests')
 class TrafficTests(NodeFixture):
+    @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE to proxy-utils.esm.mjs')
+    def test_anytls_substore_tls_pin(self):
+        inbound = self.port()
+        self.run_shell('anytls', TEST_PORT=str(inbound))
+        link = self.read('metadata.json')['tcp-node-test']['share_link']
+        query = parse_qs(urlsplit(link).query)
+        meta = self.read('metadata.json')
+        meta['tcp-node-test']['share_link'] = 'anytls://old@localhost:443/?sni=any.example'
+        (self.root/'metadata.json').write_text(json.dumps(meta))
+        view = self.run_shell('view', 'y\n').stdout
+        self.assertIn(link, view)
+        self.assertIn(base64.b64encode((link+'\n').encode()).decode(), view)
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Target)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.start([TOOLS['singbox'], 'run', '-c', str(self.root/'config.json')], inbound, 'server')
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                pin = query['pcs'][0] if valid else '00' * 32
+                proxy = json.loads(subprocess.check_output(['node', str(REPO/'tests/substore_link.mjs')],
+                    input=link.replace(query['pcs'][0], pin), text=True))
+                expected = self.read('client.yaml')['proxies'][0]
+                for key, value in expected.items():
+                    if key in ('idle-session-timeout', 'idle-session-check-interval', 'min-idle-session'):
+                        self.assertEqual(int(proxy[key]), value, key)
+                    else:
+                        self.assertEqual(proxy[key], value, key)
+                self.assertEqual(proxy['fingerprint'], pin)
+                mixed = self.port()
+                config = self.root/f'client-{valid}.json'
+                config.write_text(json.dumps({'mixed-port':mixed, 'proxies':[proxy], 'rules':['MATCH,AnyTLS test']}))
+                self.start([TOOLS['mihomo'], '-d', str(self.root), '-f', str(config)], mixed, f'mihomo-{valid}')
+                result = subprocess.run(['curl','-fsS','--max-time','5','--noproxy','','--proxy',
+                    f'http://127.0.0.1:{mixed}', f'http://127.0.0.1:{server.server_port}/'],capture_output=True)
+                if valid:
+                    self.assertEqual(result.stdout, Target.payload, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0, 'mihomo accepted a wrong certificate pin')
+
     @staticmethod
     def port():
         with socket.socket() as sock:

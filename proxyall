@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
-# 配套发布时先更新 parser -> advanced_relay -> sb 的哈希，再更新以下值。
-PROXYALL_VERSION="1.7.25"
-SB_SHA256="932374be07005a5d073a825d4dd0020dab60b4c34523d3693abc052d0761aeb4"
-DEPLOY_SHA256="b5f25705f1c8dffaa411f4b453f335e0e8063aaad7d5a15c39253b74f4621b0d"
-RELAY_SHA256="cf645138ec0e5ba99336ca38e9b8da3b611a00a166d3002be0e3e00472512123"
-PARSER_SHA256="64988fa12d37b2a63372eeeeae77ca3b817fb27af6ba5de15b23d3dfdee302ea"
+# 安装同一提交的 Xray 管理器、Nginx 反代与统一入口。
+PROXYALL_VERSION="2.0.0"
+SB_SHA256="afd6c66a3d3075ae1647b92a8298216d5c6c38f152c76f3abd691f64765beeb8"
+DEPLOY_SHA256="4952913e4c5c944d7af146ecc5e87d7e0611d8a316f2db413dc236e942dca7fa"
+RELAY_SHA256="1a18de9f9ed5c5e83e3f635dd5c72e12c106fcb7340e4b8fb506c9d8193db12e"
+PARSER_SHA256="1facb8460e60c399ae259df5f01bd8bc3f95856f588ea748e68c7810aa13eb65"
 
 umask 077
 set -o pipefail
@@ -16,9 +16,8 @@ PA_MARKER="# PROXYALL_MANAGED_COMMAND=1"
 PA_STAGE=""
 PA_BACKUP=""
 PA_TRANSACTION=0
-PA_FILES=(sb.sh deploy.sh advanced_relay.sh parser.sh proxyall)
+PA_FILES=(sb.sh deploy.sh proxyall)
 PA_TARGETS=(/usr/local/bin/sb /usr/local/bin/nginxproxy
-    /usr/local/etc/sing-box/advanced_relay.sh /usr/local/etc/sing-box/parser.sh
     /usr/local/bin/proxyall)
 PA_CHANGED=()
 
@@ -28,7 +27,7 @@ pa_hash() { sha256sum -- "$1" | awk '{print $1}'; }
 
 pa_help() {
     cat <<'EOF'
-proxyall：Emby / sing-box 统一管理
+proxyall：Emby / Xray 统一管理
 
   proxyall                 打开菜单（首次运行下载并安装配套脚本）
   proxyall --install       安装或更新全部脚本，然后打开菜单
@@ -39,7 +38,7 @@ proxyall：Emby / sing-box 统一管理
   proxyall --certificates  管理现有证书（查看、检查、续期、归档清理）
   proxyall --swap          配置 1 GiB swap（保留已有启用的 swap）
 
-脚本更新不升级 sing-box 核心，也不迁移现有监听端口。
+脚本更新不切换运行中的旧节点，也不迁移现有监听端口。
 新建域名 HTTPS/443 反代默认使用 HAProxy；HTTP、自定义端口和 IP 前端使用直监听。
 新建 Reality 默认端口 443、默认启用 SNI 分流。
 共享入口要求 Linux + systemd，Emby 域名和 Reality SNI 必须不同。
@@ -139,7 +138,7 @@ pa_constant() {
 
 pa_validate_bundle() {
     local dir="$1" file key expected actual i
-    local keys=(SB_SHA256 DEPLOY_SHA256 RELAY_SHA256 PARSER_SHA256)
+    local keys=(SB_SHA256 DEPLOY_SHA256)
     grep -Fqx "$PA_MARKER" "$dir/proxyall" || return 1
     grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$dir/sb.sh" || return 1
     grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$dir/deploy.sh" || return 1
@@ -156,17 +155,13 @@ pa_validate_bundle() {
         actual=$(pa_hash "$dir/$file") || return 1
         [ "$actual" = "$expected" ] || { pa_error "$file 的 SHA-256 不匹配。"; return 1; }
     done
-    [ "$(pa_constant "$dir/sb.sh" ADVANCED_RELAY_SHA256)" = "$(pa_hash "$dir/advanced_relay.sh")" ] || return 1
-    for file in sb.sh advanced_relay.sh; do
-        [ "$(pa_constant "$dir/$file" PARSER_SHA256)" = "$(pa_hash "$dir/parser.sh")" ] || return 1
-    done
 }
 
 pa_download_bundle() {
     local ref_file commit file raw
     PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX") || return 1
     ref_file="$PA_STAGE/ref.json"
-    pa_info '查询仓库 main 的提交，下载同一提交的五个脚本...'
+    pa_info '查询仓库 main 的提交，下载同一提交的三个脚本...'
     pa_fetch "https://api.github.com/repos/$PA_REPO/git/ref/heads/main" "$ref_file" || {
         pa_error '无法读取 GitHub 提交（也可能是 API 限流）。本地文件未改动。'; return 1;
     }
@@ -176,7 +171,7 @@ pa_download_bundle() {
     for file in "${PA_FILES[@]}"; do
         pa_fetch "$raw/$file" "$PA_STAGE/$file" || { pa_error "下载失败: $file"; return 1; }
     done
-    pa_validate_bundle "$PA_STAGE" || { pa_error '整套脚本校验失败，本地文件未改动。请确保五个文件配套上传。'; return 1; }
+    pa_validate_bundle "$PA_STAGE" || { pa_error '整套脚本校验失败，本地文件未改动。'; return 1; }
     printf '%s\n' "$commit" > "$PA_STAGE/commit"
 }
 
@@ -424,7 +419,7 @@ pa_menu() {
         printf '\n  ════════════════════════════════════\n'
         printf '       proxyall  %s\n\n' "$PROXYALL_VERSION"
         printf '  1) Emby / 本机服务反代\n'
-        printf '  2) sing-box 配置（含中转 / 节点解析）\n\n'
+        printf '  2) Xray 节点、分享链接与中转\n\n'
         printf '  3) 检查脚本更新\n'
         printf '  4) 卸载统一入口（保留全部服务）\n'
         printf '  5) 修复 Nginx HTTP/2 旧语法\n'
@@ -479,7 +474,6 @@ main() {
     if [ ! -f "$PA_STATE/commit" ] || [ "$missing" = 1 ]; then
         pa_update install || return 1
     fi
-    pa_run /usr/local/bin/sb setup-maintenance || return 1
     if [ ! -d /run/systemd/system ]; then
         pa_info '当前无 systemd：可查看已有配置；HAProxy 共享 443 功能无法部署。'
     fi

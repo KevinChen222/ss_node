@@ -151,7 +151,7 @@ _runtime_log_policy() { _test_policy "$@" | sed 's/size 157286401/size 4k/'; }
         content = (self.root / 'crontab').read_text()
         self.assertIn('0 1 * * * unrelated', content)
         self.assertEqual(content.count('# sing-box-log-cleanup'), 1)
-        self.assertIn('* * * * * bash ', content)
+        self.assertIn('*/15 * * * * bash ', content)
         self.assertNotIn('17 3', content)
 
     def test_direct_mode_starts_cron(self):

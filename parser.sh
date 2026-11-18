@@ -320,8 +320,9 @@ _parse_anytls() {
             jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-firefox}" \
                 '{type:"anytls", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, reality:{enabled:true, public_key:$pbk, short_id:$sid}}}'
         else
-            jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" \
-                '{type:"anytls", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:{enabled:true, server_name:$sni, insecure:true}}'
+            jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" --arg fp "$fp" \
+                '{type:"anytls", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:({enabled:true, server_name:$sni} +
+                  (if $fp != "" then {utls:{enabled:true,fingerprint:$fp}} else {} end))}'
         fi
     fi
 }
@@ -393,6 +394,22 @@ _normalize_outbound() {
                 max_connections:$smux["max-connections"], min_streams:$smux["min-streams"]
             }' <<< "$outbound") || return 1
         fi
+    fi
+    if [[ "$link" == anytls://* ]]; then
+        # pcs 固定整张叶证书；sing-box 的 certificate_public_key_sha256 固定 SPKI，不能直接互换。
+        local pair key
+        local -a any_params
+        IFS='&' read -ra any_params <<< "$params"
+        for pair in "${any_params[@]}"; do
+            case "$pair" in
+                pcs=?*) echo '{"error":"AnyTLS pcs 为证书指纹，无法无损转换为 sing-box 公钥固定；未导入"}'; return 1 ;;
+                idle-session-check-interval=*|idle-session-timeout=*|min-idle-session=*)
+                    key=${pair%%=*}; value=$(_url_decode "${pair#*=}")
+                    [[ "$value" =~ ^[0-9]{1,9}$ ]] || { echo '{"error":"AnyTLS 会话参数须为非负整数"}'; return 1; }
+                    outbound=$(jq --arg key "${key//-/_}" --arg value "$value" '
+                        .[$key] = (if $key == "min_idle_session" then ($value|tonumber) else ($value+"s") end)' <<< "$outbound") || return 1 ;;
+            esac
+        done
     fi
     transport=$(_get_param "$params" type)
     if [[ "$link" == vmess://* ]]; then
@@ -477,7 +494,7 @@ _normalize_outbound() {
         and (if .type == "shadowsocks" then
                 (.method | type == "string" and length > 0) and (.password | type == "string" and length > 0)
              elif .type == "vless" or .type == "vmess" then (.uuid | type == "string" and length > 0)
-             elif .type == "trojan" then (.password | type == "string" and length > 0)
+              elif .type == "trojan" or .type == "anytls" then (.password | type == "string" and length > 0)
              else true end)
         and (if .tls.reality.enabled == true then (.tls.reality.public_key | type == "string" and length > 0) else true end)' \
         <<< "$outbound" >/dev/null || return 1

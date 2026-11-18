@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated XHTTP lifecycle and real mihomo -> Nginx -> Xray traffic tests.
 
-Set TEST_XRAY, TEST_MIHOMO, TEST_NGINX, TEST_YQ and TEST_SINGBOX to local binaries.
+Set TEST_XRAY, TEST_MIHOMO, TEST_NGINX and TEST_YQ to local binaries.
 """
 import hashlib
 import http.server
@@ -16,7 +16,7 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
-TOOLS = {name: os.environ.get('TEST_' + name.upper()) for name in ('xray', 'mihomo', 'nginx', 'yq', 'singbox')}
+TOOLS = {name: os.environ.get('TEST_' + name.upper()) for name in ('xray', 'mihomo', 'nginx', 'yq')}
 
 
 def port():
@@ -35,7 +35,8 @@ XRAY_CONFIG_FILE="$WORK/xray.json"
 XRAY_PID_FILE="$WORK/xray.pid"
 XRAY_LOG_FILE="$WORK/xray.log"
 XRAY_BIN="$TEST_XRAY"
-SINGBOX_BIN="$TEST_SINGBOX"
+XRAY_ONLY=true
+SINGBOX_BIN="$WORK/no-sing-box"
 YQ_BINARY="$TEST_YQ"
 PID_FILE="$WORK/singbox.pid"
 INIT_SYSTEM=direct
@@ -57,21 +58,24 @@ nginx() { "$TEST_NGINX" -p "$WORK/" -c "$WORK/nginx.conf" "$@"; }
 _sb_reload_or_start_nginx() { nginx -t && nginx -s reload; }
 _ensure_local_origin_dependencies() { return 0; }
 _install_xray() { _atomic_modify_json "$XRAY_CONFIG_FILE" '.outbounds[0].settings.finalRules=[{action:"allow",ip:["127.0.0.1/32"]}]'; }
-_manage_singbox_service_impl() {
-    if [ "$1" = restart ] && [ "${NODE_TX_STARTED:-0}" = 1 ]; then
-        _node_tx_publish || return 1
-        touch "$NODE_TX_DIR/service-touched"
-    fi
-    [ "${FAIL_RESTART:-0}" != 1 ]
-}
+_manage_service() { [ "${FAIL_RESTART:-0}" != 1 ] && _xray_service "$@"; }
 _sni_router_require_systemd() { return 0; }
 _sni_router_prepare() { _node_tx_begin && _sni_router_init_state; }
 _sni_router_apply() { return 0; }
 case "$ACTION" in
+    retire)
+        INIT_SYSTEM=systemd
+        SERVICE_FILE="$WORK/legacy.service"
+        systemctl() { if [ "$1" = show ]; then echo "$SERVICE_FILE"; else echo "$*" >> "$WORK/service.calls"; fi; }
+        _sni_router_apply() { [ "${FAIL_APPLY:-0}" != 1 ]; }
+        _retire_legacy_service ;;
+    vision) BATCH_MODE=true BATCH_PORT="$PORT" BATCH_SNI=xhttp.test BATCH_IP=127.0.0.1 BATCH_REALITY_HANDSHAKE_SERVER=127.0.0.1 BATCH_REALITY_HANDSHAKE_PORT="$ORIGIN" BATCH_VISION_PROFILE="$PROFILE" _node_operation _add_vless_reality_impl ;;
+    native) _node_operation _xray_native_add ;;
+    relay) _node_operation _xray_manage_node relay ;;
     add) _add_vless_xhttp_tls ;;
-    view) _view_nodes ;;
-    delete) _delete_node ;;
-    modify) _modify_port ;;
+    view) _xray_list_links ;;
+    delete) _node_operation _xray_manage_node delete ;;
+    modify) _node_operation _xray_manage_node port ;;
     stop) _xray_service stop ;;
     haproxy) _sni_router_generate_haproxy_config "$WORK/haproxy.raw" ;;
     render) _xhttp_nginx_config xhttp.test /test/ 10080 443 true ;;
@@ -99,7 +103,7 @@ class Echo(http.server.BaseHTTPRequestHandler):
         pass
 
 
-@unittest.skipUnless(all(TOOLS.values()), 'set TEST_XRAY, TEST_MIHOMO, TEST_NGINX, TEST_YQ, TEST_SINGBOX')
+@unittest.skipUnless(all(TOOLS.values()), 'set TEST_XRAY, TEST_MIHOMO, TEST_NGINX, TEST_YQ')
 class XHTTPTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='proxyall-xhttp-test-')
@@ -181,6 +185,127 @@ http {{
         return {p.name: p.read_bytes() for p in self.root.iterdir() if p.name in
                 ('config.json', 'metadata.json', 'clash.yaml', 'xray.json')}
 
+    def exported(self, link):
+        return json.loads(subprocess.check_output(['node', str(REPO / 'tests/substore_link.mjs')], input=link, text=True))
+
+    def test_retire_preserves_https_and_xray(self):
+        router=self.root/'router'; router.mkdir()
+        state={'version':1,'public_port':443,'reality':{'owner':'advanced-relay','tag':'old'},
+               'https_routes':{'emby.test':{'owner':'nginx-proxy'}},
+               'tls_routes':{'xray.test':{'owner':'sb-xray'},'old.test':{'owner':'sb'}}}
+        (router/'state.json').write_text(json.dumps(state))
+        (self.root/'.managed_sing_box').touch()
+        (self.root/'legacy.service').write_text(f'ExecStart={self.root}/no-sing-box run -c {self.root}/config.json -c {self.root}/relay.json\n')
+        (self.root/'relay.json').write_text('{"inbounds":[]}')
+        before=self.snapshot()
+        self.assertNotEqual(self.run_shell('retire','RETIRE\n',FAIL_APPLY='1',check=False).returncode,0)
+        self.assertEqual(before,self.snapshot())
+        self.assertEqual(self.json('router/state.json'),state)
+        self.run_shell('retire','RETIRE\n')
+        self.assertFalse((self.root/'config.json').exists())
+        self.assertFalse((self.root/'relay.json').exists())
+        self.assertTrue(any(self.root.glob('retired.*/config.json')))
+        self.assertEqual(self.json('router/state.json'),dict(state,reality=None,tls_routes={'xray.test':{'owner':'sb-xray'}}))
+        self.assertNotIn('proxyall-xray',(self.root/'service.calls').read_text())
+
+    def check_udp(self, mixed):
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as origin, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as client, socket.create_connection(('127.0.0.1',mixed),timeout=4) as tcp:
+            origin.settimeout(5); client.settimeout(5)
+            origin.bind(('127.0.0.1',0))
+            tcp.sendall(b'\x05\x01\x00')
+            self.assertEqual(tcp.recv(2,socket.MSG_WAITALL),b'\x05\x00')
+            tcp.sendall(bytes.fromhex('05030001000000000000'))
+            reply=tcp.recv(10,socket.MSG_WAITALL)
+            self.assertEqual(reply[:4],bytes.fromhex('05000001'))
+            header=bytes.fromhex('000000017f000001')+origin.getsockname()[1].to_bytes(2,'big')
+            client.sendto(header+b'udp-test',('127.0.0.1',int.from_bytes(reply[-2:],'big')))
+            payload, address=origin.recvfrom(256)
+            self.assertEqual(payload,b'udp-test')
+            origin.sendto(b'udp-ok',address)
+            self.assertEqual(client.recv(256),header+b'udp-ok')
+
+    @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE for exported Vision traffic')
+    def test_vision_profiles_from_empty_install(self):
+        for filename in ('config.json', 'metadata.json', 'clash.yaml'):
+            (self.root/filename).unlink()
+        origin = port()
+        self.start(['openssl','s_server','-accept',f'127.0.0.1:{origin}','-tls1_3','-alpn','h2','-www',
+                    '-cert',str(self.root/'certs/xhttp.test/cert'),'-key',str(self.root/'certs/xhttp.test/key')], origin)
+        for profile in ('none','x25519','mlkem768'):
+            with self.subTest(profile=profile):
+                public = port()
+                self.run_shell('vision', PORT=str(public), ORIGIN=str(origin), PROFILE=profile)
+                meta = next(m for m in self.json('metadata.json').values() if m['publicPort']==public)
+                client = self.exported(meta['share_link'])
+                expected = json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))['proxies']
+                for key, value in next(p for p in expected if p['port']==public).items():
+                    self.assertEqual(client.get(key), value, key)
+                mixed=port()
+                cfg=self.root/f'{profile}.json'
+                cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[client],'rules':['MATCH,'+client['name']]}))
+                home=self.root/profile; home.mkdir()
+                self.start([TOOLS['mihomo'],'-d',str(home),'-f',str(cfg)],mixed)
+                res=subprocess.run(['curl','-fsS','--noproxy','','-x',f'http://127.0.0.1:{mixed}','--max-time','5',f'http://127.0.0.1:{self.webport}'],capture_output=True)
+                self.assertEqual(res.stdout,b'website',(res.stderr,(self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1600:],(self.root/'xray.log').read_text()[-800:]))
+                self.check_udp(mixed)
+        self.assertFalse((self.root/'config.json').exists())
+        self.assertFalse((self.root/'relay.json').exists())
+        nodes = self.json('metadata.json')
+        inlet = next(tag for tag, node in nodes.items() if node['publicPort'] == public)
+        selection = list(nodes).index(inlet) + 1
+        for variant, protocol in ((2, 'shadowsocks'), (1, 'vless')):
+            with self.subTest(landing=protocol):
+                landing_port = port()
+                self.run_shell('native', f'{variant}\n127.0.0.1\n{landing_port}\nlanding-{protocol}\n')
+                landing, meta = next((tag, node) for tag, node in self.json('metadata.json').items()
+                                     if node['publicPort'] == landing_port)
+                self.run_shell('relay', f"{selection}\n{meta['share_link']}\n")
+                # Start a fresh client after the server restart for each landing handshake.
+                mixed = port()
+                cfg = self.root/f'relay-{protocol}.json'
+                cfg.write_text(json.dumps({'mixed-port': mixed, 'proxies': [client],
+                                           'rules': ['MATCH,' + client['name']]}))
+                self.start([TOOLS['mihomo'], '-d', str(self.root/f'client-{protocol}'), '-f', str(cfg)], mixed)
+                response = subprocess.run(['curl', '-fsS', '--max-time', '5', '--noproxy', '',
+                                           '-x', f'http://127.0.0.1:{mixed}',
+                                           f'http://127.0.0.1:{self.webport}/'], capture_output=True)
+                self.assertEqual(response.stdout, b'website', (response.stderr, (self.root/'xray.log').read_text()[-2500:],
+                                                               (self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1000:]))
+                self.check_udp(mixed)
+                log = (self.root/'xray.log').read_text()
+                for transport in ('tcp', 'udp'):
+                    self.assertRegex(log, rf'accepted {transport}:.*\[{landing} >> direct\]')
+
+    @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE for native exports')
+    def test_native_exports_and_relay(self):
+        for variant in range(1,7):
+            with self.subTest(variant=variant):
+                public=port()
+                self.run_shell('native',f'{variant}\n127.0.0.1\n{public}\nnode{variant}\n' + ('xhttp.test\n' if variant>=4 else ''))
+                meta=next(m for m in self.json('metadata.json').values() if m['publicPort']==public)
+                proxy=self.exported(meta['share_link'])
+                saved=json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))
+                for key,value in next(p for p in saved['proxies'] if p['port']==public).items():
+                    if key=='tls' and variant==5: continue  # Trojan implies TLS in mihomo.
+                    self.assertEqual(proxy.get(key),value,key)
+                mixed=port()
+                cfg=self.root/f'native{variant}.json'
+                cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[proxy],'rules':['MATCH,'+proxy['name']]}))
+                home=self.root/f'home{variant}'; home.mkdir()
+                self.start([TOOLS['mihomo'],'-d',str(home),'-f',str(cfg)],mixed,dict(os.environ,SSL_CERT_FILE=str(self.root/'certs/xhttp.test/cert')))
+                cmd=['curl','-fsS','--max-time','5','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.webport}/']
+                res=subprocess.run(cmd,capture_output=True)
+                self.assertEqual(res.stdout,b'website',(res.stderr,(self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1600:],(self.root/'xray.log').read_text()[-800:]))
+                if variant in (1,2):  # VLESS TCP without TLS, Shadowsocks
+                    self.check_udp(mixed)
+                if variant==1:
+                    ob=self.root/'out.json'
+                    ob.write_text('{"protocol":"blackhole"}')
+                    self.run_shell('relay',f'1\n{ob}\n')
+                    self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
+                    self.run_shell('relay','1\ndirect\n')
+                    self.assertEqual(subprocess.run(cmd,capture_output=True).stdout,b'website')
+
     def test_real_mihomo_h2_upload_download_and_lifecycle(self):
         self.add()
         cfg = self.json('xray.json')
@@ -193,6 +318,10 @@ http {{
         self.assertEqual(proxy['xhttp-opts']['reuse-settings']['max-concurrency'], '1')
         self.assertNotIn('flow', proxy)
         self.assertNotIn('smux', proxy)
+        if os.environ.get('TEST_SUBSTORE'):
+            exported=self.exported(next(iter(self.json('metadata.json').values()))['share_link'])
+            for key,value in proxy.items(): self.assertEqual(exported.get(key),value,key)
+            proxy=exported
         mixed = port()
         client = {'mixed-port': mixed, 'mode': 'rule', 'log-level': 'info', 'proxies': [proxy], 'rules': ['MATCH,' + proxy['name']]}
         (self.root / 'mihomo.json').write_text(json.dumps(client))
@@ -276,6 +405,13 @@ server {{
         state = self.json('router/state.json')
         self.assertEqual(state['https_routes']['emby.test']['owner'], 'nginx-proxy')
         self.assertEqual(state['https_routes']['xhttp.test']['owner'], 'sb-xhttp')
+        origin=port()
+        self.start(['openssl','s_server','-accept',f'127.0.0.1:{origin}','-tls1_3','-alpn','h2','-www',
+                    '-cert',str(self.root/'certs/xhttp.test/cert'),'-key',str(self.root/'certs/xhttp.test/key')],origin)
+        # The same HAProxy has an HTTPS vhost and a default Reality backend.
+        harness=self.root/'harness.sh'
+        harness.write_text(HARNESS.replace('BATCH_SNI=xhttp.test','BATCH_SNI=vision.test'))
+        self.run_shell('vision',PORT=str(frontend),ORIGIN=str(origin),PROFILE='x25519')
         self.run_shell('haproxy')
         raw = (self.root / 'haproxy.raw').read_text()
         config = '\n'.join(line for line in raw.splitlines() if not line.strip().startswith(('user ', 'group ', 'stats socket ')))
@@ -290,6 +426,21 @@ server {{
                              capture_output=True, timeout=5)
         self.assertIn('ALPN protocol: h2', tls.stdout)
         self.assertIn('CN = xhttp.test', tls.stdout)
+        def get_vision():
+            m=next(m for m in self.json('metadata.json').values() if m['type']=='vless-vision-reality')
+            if os.environ.get('TEST_SUBSTORE'): p=self.exported(m['share_link'])
+            else: p=next(p for p in json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))['proxies'] if p['name']==m['name'])
+            mixed=port(); home=self.root/str(mixed); home.mkdir()
+            cfg=home/'client.json'; cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[p],'rules':['MATCH,'+p['name']]}))
+            self.start([TOOLS['mihomo'],'-d',str(home),'-f',str(cfg)],mixed)
+            self.assertEqual(subprocess.check_output(['curl','-fsS','--max-time','5','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.webport}/']),b'website')
+        get_vision()
+        before=self.json('metadata.json')
+        self.run_shell('modify',f'2\n{port()}\n')
+        get_vision()
+        first=next(iter(before))
+        self.assertEqual(before[first],self.json('metadata.json')[first])
+        self.run_shell('delete','2\ny\n')
         self.run_shell('delete', '1\ny\n')
         remaining = self.json('router/state.json')
         self.assertEqual(remaining['https_routes'], {'emby.test': {'owner': 'nginx-proxy'}})

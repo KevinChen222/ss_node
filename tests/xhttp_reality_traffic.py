@@ -15,16 +15,19 @@ def run_traffic():
     (root/'metadata.json').write_text('{}')
     (root/'xray.json').write_text('{"log":{"loglevel":"debug"},"inbounds":[],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]}')
     (root/'router.json').write_text('{"reality":null}')
-    pair=subprocess.check_output([xray,'x25519'],text=True).splitlines()
-    priv=pair[0].split(': ',1)[1];pub=pair[1].split(': ',1)[1]
-    (root/'singbox').write_text(f'#!/bin/bash\nif [ "$2" = uuid ]; then echo 80c7a55c-8951-423f-a420-2af7d59d19e6; else printf "PrivateKey: {priv}\\nPublicKey: {pub}\\n"; fi\n')
-    (root/'singbox').chmod(0o700)
     (root/'harness.sh').write_text(REALITY_HARNESS.replace('SELECTED_REALITY_HANDSHAKE_PORT=8443',f'SELECTED_REALITY_HANDSHAKE_PORT={origin}'))
-    env=dict(os.environ,WORK=str(root),REPO=str(Path(__file__).resolve().parents[1]),ACTION='add')
+    env=dict(os.environ,WORK=str(root),REPO=str(Path(__file__).resolve().parents[1]),ACTION='add',TEST_REALITY_KEYGEN=xray)
     r=subprocess.run(['bash',str(root/'harness.sh')],input=f'\n{public}\n/test/\nXHTTP test\n1\n',text=True,env=env,capture_output=True)
     assert r.returncode==0,r.stderr
     subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(root/'key'),'-out',str(root/'cert'),'-subj','/CN=own.example.com','-days','1'],capture_output=True,check=True)
-    proxy=json.loads((root/'client.json').read_text())['proxies'][0];proxy['server']='127.0.0.1'
+    proxy=json.loads((root/'client.json').read_text())['proxies'][0]
+    if os.environ.get('TEST_SUBSTORE'):
+     link=json.loads((root/'metadata.json').read_text())['xhttp-in-test']['share_link']
+     exported=json.loads(subprocess.check_output(['node',str(Path(__file__).with_name('substore_link.mjs'))],input=link,text=True))
+     for key in ('uuid','network','alpn','client-fingerprint','servername','reality-opts','xhttp-opts'):
+      assert exported[key]==proxy[key],(key,exported.get(key),proxy[key])
+     proxy=exported
+    proxy['server']='127.0.0.1'
     client={'mixed-port':mixed,'mode':'rule','log-level':'debug','proxies':[proxy],'rules':['MATCH,XHTTP test']}
     (root/'mihomo.json').write_text(json.dumps(client))
     procs=[]

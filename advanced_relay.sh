@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.15"
+SCRIPT_VERSION="16-kevin.16"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -39,7 +39,7 @@ REALITY_LOCAL_ORIGIN_PORT=8443
 SNI_ROUTER_API_VERSION=1
 SNI_ROUTER_PUBLIC_PORT=443
 SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
-PARSER_SHA256="64988fa12d37b2a63372eeeeae77ca3b817fb27af6ba5de15b23d3dfdee302ea"
+PARSER_SHA256="1facb8460e60c399ae259df5f01bd8bc3f95856f588ea748e68c7810aa13eb65"
 REALITL_SCANNER_VERSION="v0.2.3"
 REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
 REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
@@ -4773,5 +4773,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             ;;
     esac
 
-    _menu
+    printf '%s\n' '中转已整合到 Xray 节点菜单：先创建入口，再选 8 绑定落地出站。' >&2
+    exec /usr/local/bin/sb
 fi

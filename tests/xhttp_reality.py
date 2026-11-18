@@ -12,7 +12,7 @@ REALITY_HARNESS = HARNESS.replace(
     'case "$ACTION" in', r'''
 SNI_ROUTER_PUBLIC_PORT=443
 SNI_ROUTER_STATE_FILE="$WORK/router.json"
-SINGBOX_BIN="$WORK/singbox"
+XRAY_BIN="${TEST_REALITY_KEYGEN:-$WORK/xray-fixture}"
 _select_reality_sni() {
     SELECTED_REALITY_SNI=own.example.com
     SELECTED_REALITY_HANDSHAKE_SERVER="${TARGET_HOST:-127.0.0.1}"
@@ -36,11 +36,11 @@ class RealityTests(xhttp_xmux.XMUXTests):
         super().setUp()
         (self.root / 'harness.sh').write_text(REALITY_HARNESS)
         (self.root / 'router.json').write_text('{"reality":null}')
-        binary = self.root / 'singbox'
+        binary = self.root / 'xray-fixture'
         binary.write_text('''#!/bin/bash
-case "$2" in
+case "$1" in
  uuid) echo 80c7a55c-8951-423f-a420-2af7d59d19e6 ;;
- reality-keypair) printf 'PrivateKey: test-private-key\\nPublicKey: test-public-key\\n' ;;
+ x25519) printf 'PrivateKey: test-private-key\\nPassword (PublicKey): test-public-key\\n' ;;
 esac
 ''')
         binary.chmod(0o700)
