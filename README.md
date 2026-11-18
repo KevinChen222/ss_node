@@ -21,14 +21,17 @@ proxyall --swap          # 配置 1 GiB swap，保留已有启用的 swap
 
 ## 节点与客户端
 
-| 节点菜单 | 服务端与客户端 |
+| 添加节点子菜单 | 服务端与客户端 |
 | --- | --- |
-| 1 / 11 | 单个 / 批量 VLESS TCP + Vision + Reality。Chrome 指纹、X25519MLKEM768 握手、XUDP；可选 X25519 或 ML-KEM-768 认证的 VLESS Encryption。默认 `encryption=none` 仍有 Reality 保护。 |
+| 1 | VLESS TCP + Vision + Reality。Chrome 指纹、X25519MLKEM768 握手、XUDP；可选 X25519 或 ML-KEM-768 认证的 VLESS Encryption。默认 `encryption=none` 仍有 Reality 保护。 |
 | 2 | VLESS XHTTP + Reality。Xray 处理握手，无需 Nginx 终止 TLS。 |
 | 3 | VLESS XHTTP + TLS。Nginx 终止 HTTP/2，再转发至回环 Xray。 |
-| 4 | 裸 VLESS TCP、Shadowsocks AES-128-GCM、带密码的 SOCKS5、VLESS / Trojan WS+TLS、VLESS gRPC+TLS。后三项复用 `/etc/nginx/certs/<域名>/cert` 与 `key`，由 Xray 终止 TLS。裸 TCP 和 SOCKS5 不提供传输加密。 |
-| 5 / 6 / 7 | 查看链接和聚合 Base64 订阅 / 改公网端口 / 删除节点。 |
-| 8 | 为一个入口绑定落地分享链接或 Xray outbound JSON 文件；输入 `direct` 解除绑定。其他入口继续走各自出站。 |
+| 4 / 5 / 6 | VLESS WS+TLS / Trojan WS+TLS / VLESS gRPC+TLS。复用 `/etc/nginx/certs/<域名>/cert` 与 `key`，由 Xray 终止 TLS。 |
+| 7 / 8 / 9 | Shadowsocks AES-128-GCM / 裸 VLESS TCP / 带密码的 SOCKS5。裸 TCP 和 SOCKS5 不提供传输加密。 |
+
+节点管理菜单 2 / 3 / 4 用于查看分享链接、改端口和删除节点，菜单 5 为选定入口绑定落地链接或 Xray outbound JSON，输入 `direct` 解除绑定。
+
+节点列表输入 `0` 返回节点管理。删除确认选否、改端口输入 `0`、中转输入 `0` 或留空，会返回节点列表；填写添加参数时输入 `0` 取消本次添加并返回协议选择。取消不提交候选配置、不重启服务。核心更新需确认后执行。
 
 将生成的链接粘贴到 Sub-Store，输出选 `Clash.Meta / mihomo`。不要将服务器的 `xray.json` 当成客户端订阅。内部 `clash.yaml`、元数据及 `xray.json` 位于 `/usr/local/etc/sing-box/`；目录名保留以便原位更新。
 

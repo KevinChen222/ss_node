@@ -28,7 +28,7 @@ umask 077
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then XRAY_ONLY=true; fi
 
 # 基础路径定义
-export SCRIPT_VERSION="21-xray.2"
+export SCRIPT_VERSION="21-xray.3"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -476,7 +476,7 @@ _ensure_compatible_go() {
     else
         _warn "未检测到 Go ${GO_MIN_VERSION}+。"
     fi
-    read -r -p "是否从 go.dev 安装满足要求的官方 Go 工具链？[Y/n]: " install_go
+    _node_read -r -p "是否从 go.dev 安装满足要求的官方 Go 工具链？[Y/n]: " install_go || return $?
     if [[ "$install_go" == "n" || "$install_go" == "N" ]]; then
         _warn "已取消 RealiTLScanner 安装。"
         return 1
@@ -1199,7 +1199,7 @@ _confirm_reality_china_reachability() {
     local domain="$1" result force_unverified
     if [ "$REALITY_CHINA_CHECK_ENABLED" != "true" ]; then
         _warn "${domain} 尚未从中国大陆网络验证；境外 TLS/H2 成功不能证明其未被 GFW 屏蔽。"
-        read -r -p "仍要使用这个未经大陆验证的 SNI？[y/N]: " force_unverified
+        _node_read_yes_no "仍要使用这个未经大陆验证的 SNI？[y/N]: " force_unverified || return $?
         [[ "$force_unverified" == "y" || "$force_unverified" == "Y" ]]
         return
     fi
@@ -1218,7 +1218,7 @@ _confirm_reality_china_reachability() {
             ;;
         *)
             _warn "无法取得明确的大陆侧结论：${GREATFIRE_RESULT_LABEL}。"
-            read -r -p "仍要使用这个结果不明确的 SNI？[y/N]: " force_unverified
+            _node_read_yes_no "仍要使用这个结果不明确的 SNI？[y/N]: " force_unverified || return $?
             [[ "$force_unverified" == "y" || "$force_unverified" == "Y" ]]
             return
             ;;
@@ -1243,7 +1243,9 @@ _prepare_reality_custom_scan_file() {
     echo "请粘贴域名、IPv4 或 IPv4 CIDR；支持每行一个，也可用空格或逗号分隔。"
     echo "CIDR 仅允许 /24-/32，全部条目展开后最多 ${REALITY_SNI_MAX_SCAN_TARGETS} 个目标；输入空行结束。"
     while true; do
-        IFS= read -r raw_line || break
+        if [ "${NODE_UI:-false}" = true ]; then
+            IFS= _node_read -r raw_line || return $?
+        else IFS= read -r raw_line || break; fi
         raw_line="${raw_line//$'\r'/}"
         [ -z "${raw_line//[[:space:]]/}" ] && break
         raw_line="${raw_line//,/ }"
@@ -1308,10 +1310,6 @@ _scan_reality_sni_once() {
     REALITY_SNI_TARGETS=()
     REALITY_SNI_CHINA_STATUSES=()
 
-    _install_realitlscanner || {
-        _error "RealiTLScanner 安装或校验失败，尚未开始扫描。"
-        return 1
-    }
     local temp_dir csv_file scan_log scan_status input_file scan_mode scan_label entry_count
     local public_ipv4 default_cidr="" scan_cidr
     local scan_args=()
@@ -1333,12 +1331,12 @@ _scan_reality_sni_once() {
     echo "  1) 扫描 VPS 邻近 IPv4 /24"
     echo "  2) 检测内置大厂域名种子（推荐）"
     echo "  3) 粘贴自定义域名/IPv4/CIDR 列表"
-    read -r -p "请选择 [1-3] (默认: 2): " scan_mode
+    _node_read -r -p "请选择 [1-3] (默认: 2): " scan_mode || { scan_status=$?; rm -rf -- "$temp_dir"; return "$scan_status"; }
     scan_mode="${scan_mode:-2}"
     case "$scan_mode" in
         1)
             _warn "上游建议在本地而非云 VPS 扫描；本模式限制为最多 /24、16 线程、3 秒单目标超时。"
-            read -r -p "请输入扫描 IPv4 CIDR [${default_cidr:-例如 203.0.113.0/24}]: " scan_cidr
+            _node_read -r -p "请输入扫描 IPv4 CIDR [${default_cidr:-例如 203.0.113.0/24}]: " scan_cidr || { scan_status=$?; rm -rf -- "$temp_dir"; return "$scan_status"; }
             scan_cidr="${scan_cidr:-$default_cidr}"
             if ! _is_safe_reality_scan_cidr "$scan_cidr"; then
                 [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
@@ -1374,6 +1372,11 @@ _scan_reality_sni_once() {
             ;;
     esac
 
+    _install_realitlscanner || {
+        rm -rf -- "$temp_dir"
+        _error "RealiTLScanner 安装或校验失败，尚未开始扫描。"
+        return 1
+    }
     _info "正在使用 RealiTLScanner 检测 ${scan_label}..."
     timeout 180 "$REALITL_SCANNER_BIN" "${scan_args[@]}" -port 443 -thread 16 -timeout 3 \
         -out "$csv_file" > "$scan_log" 2>&1
@@ -1471,15 +1474,16 @@ _select_reality_sni() {
     SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
     SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
     SELECTED_REALITY_HANDSHAKE_PORT=443
+    NODE_PENDING_ORIGIN=''
 
     echo "Reality 目标优先使用你自己控制的、真实可访问的 HTTPS 域名。"
-    read -r -p "你是否有符合条件的自有域名？[y/N]: " own_domain_choice
+    _node_read_yes_no "你是否有符合条件的自有域名？[y/N]: " own_domain_choice || return $?
     if [[ "$own_domain_choice" == "y" || "$own_domain_choice" == "Y" ]]; then
         echo "  自有域名使用方式："
         echo "  1) 单机自动模式：本机安装 Nginx、申请证书并配置自动续期（默认）"
         echo "  2) 使用已经存在的独立 HTTPS 源站"
         local own_mode own_domain
-        read -r -p "请选择 [1-2] (默认: 1): " own_mode
+        _node_read -r -p "请选择 [1-2] (默认: 1): " own_mode || return $?
         own_mode="${own_mode:-1}"
         if [ "$own_mode" = "1" ]; then
             echo "  单机自动模式要求："
@@ -1487,10 +1491,11 @@ _select_reality_sni() {
             echo "  2) 公网 TCP 80 可访问，用于 Let's Encrypt HTTP-01；不需要 Cloudflare Token。"
             echo "  3) Nginx 仅在 127.0.0.1:${REALITY_LOCAL_ORIGIN_PORT} 提供 Reality HTTPS 源站。"
             echo "  4) 若 Reality 与 Emby 都使用公网 443，请启用 HAProxy SNI 分流，并确保两个域名不同。"
-            read -r -p "请输入自有域名: " own_domain
+            _node_read -r -p "请输入自有域名: " own_domain || return $?
             own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
             _is_valid_reality_domain "$own_domain" || { _error "自有域名格式无效。"; return 1; }
-            _prepare_local_reality_origin "$own_domain" || return 1
+            if [ "${NODE_UI:-false}" = true ]; then NODE_PENDING_ORIGIN="$own_domain"
+            else _prepare_local_reality_origin "$own_domain" || return 1; fi
             SELECTED_REALITY_SNI="$own_domain"
             SELECTED_REALITY_HANDSHAKE_SERVER="$REALITY_LOCAL_ORIGIN_HOST"
             SELECTED_REALITY_HANDSHAKE_PORT="$REALITY_LOCAL_ORIGIN_PORT"
@@ -1505,7 +1510,7 @@ _select_reality_sni() {
         echo "  2) 使用 DNS only，不要开启 Cloudflare 代理/CDN。"
         echo "  3) 证书匹配域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
         echo "  4) 不要指向当前 Reality 公网监听端口，以免形成自连接回环。"
-        read -r -p "请输入自有 Reality 目标域名: " own_domain
+        _node_read -r -p "请输入自有 Reality 目标域名: " own_domain || return $?
         own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
         if _is_valid_reality_domain "$own_domain" && _probe_reality_target "$own_domain" "$own_domain"; then
             SELECTED_REALITY_SNI="$own_domain"
@@ -1523,7 +1528,7 @@ _select_reality_sni() {
     _warn "境外 VPS 无法自行证明候选域名在中国大陆可达。"
     echo "  可选的大陆侧校验会把候选 HTTPS 域名提交给 GreatFire。"
     echo "  GreatFire 使用中国大陆探针与境外对照点测试，测量结果可能公开；不会提交你的 VPS IP、UUID 或 Reality 密钥。"
-    read -r -p "是否启用 GreatFire 大陆可达性筛查？[Y/n]: " greatfire_choice
+    _node_read_yes_no "是否启用 GreatFire 大陆可达性筛查？[Y/n]: " greatfire_choice || return $?
     if [[ "$greatfire_choice" == "n" || "$greatfire_choice" == "N" ]]; then
         REALITY_CHINA_CHECK_ENABLED=false
         _warn "已关闭大陆侧校验；选择候选时需要再次明确确认风险。"
@@ -1531,14 +1536,15 @@ _select_reality_sni() {
         REALITY_CHINA_CHECK_ENABLED=true
     fi
 
-    read -r -p "是否使用 XTLS/RealiTLScanner 查找 Reality 候选？[Y/n]: " scan_choice
+    _node_read_yes_no "是否使用 XTLS/RealiTLScanner 查找 Reality 候选？[Y/n]: " scan_choice || return $?
     if [[ "$scan_choice" != "n" && "$scan_choice" != "N" ]]; then
         while ! _scan_reality_sni_once; do
+            [ ! -f "${NODE_TX_DIR:-}/cancelled" ] || return 2
             while true; do
                 echo "  1) 重新扫描（默认）"
                 echo "  2) 跳过扫描，进入默认域名选择"
                 echo "  0) 取消本次 Reality 节点添加"
-                read -r -p "扫描未成功，请选择 [0-2] (默认: 1): " scan_action
+                _node_read -r -p "扫描未成功，请选择 [0-2] (默认: 1): " scan_action || return $?
                 scan_action="${scan_action:-1}"
                 case "$scan_action" in
                     1) break ;;
@@ -1572,7 +1578,7 @@ _select_reality_sni() {
         SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
         SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
         SELECTED_REALITY_HANDSHAKE_PORT=443
-        read -r -p "请输入候选编号，回车使用 ${DEFAULT_REALITY_SNI}，或输入 0 取消: " sni_choice
+        _node_read -r -p "请输入候选编号，回车使用 ${DEFAULT_REALITY_SNI}，或输入 0 取消: " sni_choice || return $?
         if [ "$sni_choice" = "0" ]; then
             _info "已取消本次 Reality 节点添加。"
             return 1
@@ -1586,7 +1592,7 @@ _select_reality_sni() {
         if [ "$SELECTED_REALITY_SNI" = "$DEFAULT_REALITY_SNI" ] && \
            ! _probe_reality_target "$DEFAULT_REALITY_SNI" "$DEFAULT_REALITY_SNI"; then
             _warn "默认目标当前复核失败：${REALITY_PROBE_ERROR}；建议重新选择扫描结果。"
-            read -r -p "仍要继续检查该默认目标的大陆可达性？[y/N]: " force_default
+            _node_read_yes_no "仍要继续检查该默认目标的大陆可达性？[y/N]: " force_default || return $?
             if [[ "$force_default" != "y" && "$force_default" != "Y" ]]; then
                 continue
             fi
@@ -1594,6 +1600,7 @@ _select_reality_sni() {
         if _confirm_reality_china_reachability "$SELECTED_REALITY_SNI"; then
             break
         fi
+        [ ! -f "${NODE_TX_DIR:-}/cancelled" ] || return 2
         _warn "该候选未通过严格大陆可达性筛查，请重新选择。"
     done
     _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
@@ -2654,9 +2661,41 @@ _node_tx_publish() {
         fi
     done
 }
+_node_cancel() {
+    [ -z "${NODE_TX_DIR:-}" ] || touch "$NODE_TX_DIR/cancelled"
+    return 2
+}
+
+# 交互取消通过标记跨命令替换传递，不与配置失败混淆。
+_node_read() {
+    local result=0 variable="${@: -1}"
+    builtin read "$@" || result=$?
+    if [ "${NODE_UI:-false}" = true ] && { [ "$result" != 0 ] || [ "${!variable}" = 0 ]; }; then
+        _node_cancel
+        return 2
+    fi
+    return "$result"
+}
+
+_node_read_yes_no() {
+    local prompt="$1" destination="$2"
+    while true; do
+        _node_read -r -p "$prompt" "$destination" || return $?
+        case "${!destination}" in ''|y|Y|n|N) return 0 ;; esac
+        _error '请输入 y、n，或按提示返回。'
+    done
+}
+
 _node_tx_finish() {
     local status="$1" i file failed=0
     trap - EXIT INT TERM HUP
+    if [ "${XRAY_ONLY:-false}" = true ] && [ "${NODE_TX_COMMITTED:-0}" != 1 ] && [ ! -f "$NODE_TX_DIR/published" ] &&
+       [ ! -f "$NODE_TX_DIR/router-touched" ] && [ ! -f "$NODE_TX_DIR/nginx-paths" ] &&
+       [ ! -f "$NODE_TX_DIR/service-touched" ] && [ ! -f "$NODE_TX_DIR/xray-touched" ] &&
+       [ ! -f "$NODE_TX_DIR/nft-touched" ]; then
+        # 候选文件尚未发布，无需覆盖原件或重启任何服务。
+        NODE_TX_STARTED=0
+    fi
     if [ "${NODE_TX_STARTED:-0}" = 1 ] && [ "${NODE_TX_COMMITTED:-0}" != 1 ]; then
         _error '节点操作失败或中断，正在恢复配置与路由。'
         CONFIG_FILE=${NODE_TX_FILES[0]:-$SINGBOX_DIR/config.json}; METADATA_FILE=${NODE_TX_FILES[1]}
@@ -2711,7 +2750,18 @@ _node_operation() (
     NODE_TX_BASE=$(_node_fingerprint) || exit 1
     if [ "${XRAY_ONLY:-false}" = true ]; then _node_tx_begin || exit 1; fi
     "$@" || status=$?
+    if [ -f "$NODE_TX_DIR/cancelled" ]; then exit 2; fi
     [ ! -f "$NODE_TX_DIR/failed" ] || status=1
+    if [ "$status" = 0 ] && [ "$NODE_TX_STARTED" = 1 ] && [ "${XRAY_ONLY:-false}" = true ]; then
+        local changed=false i
+        for i in 1 2 9; do
+            cmp -s "$NODE_TX_DIR/candidate.$i" "$NODE_TX_DIR/backup.$i" || changed=true
+        done
+        if [ "$changed" = false ] && [ ! -f "$NODE_TX_DIR/router-touched" ] && [ ! -f "$NODE_TX_DIR/nginx-paths" ]; then
+            NODE_TX_COMMITTED=1
+            exit 0
+        fi
+    fi
     if [ "$status" = 0 ] && [ "$NODE_TX_STARTED" = 1 ]; then
         _node_tx_publish && _manage_service restart || status=1
     fi
@@ -7166,30 +7216,30 @@ _xhttp_prepare_domain() {
 _add_vless_xhttp_tls_impl() {
     local node_ip domain port name path tag uuid backend routed=false use_router tmp target proxy meta inbound custom_ip custom_name concurrency
     [ -n "$server_ip" ] || server_ip=$(_get_ip)
-    read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " custom_ip || return 1
+    _node_read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " custom_ip || return $?
     node_ip="${custom_ip:-$server_ip}"
     if ! _is_valid_reality_domain "$node_ip" && ! _is_valid_ipv4 "$node_ip" && ! [[ "$node_ip" == *:* && "$node_ip" =~ ^[0-9A-Fa-f:]+$ ]]; then
         _error '服务器地址须为 IP 或域名。'; return 1
     fi
     echo '自有域名需解析到本机。Nginx 提供 TLS / HTTP/2；申请证书需要公网 TCP 80 可达。'
-    read -r -p '请输入 XHTTP 自有域名: ' domain || return 1
+    _node_read -r -p '请输入 XHTTP 自有域名: ' domain || return $?
     domain="${domain,,}"
     _is_valid_reality_domain "$domain" || { _error '自有域名格式无效。'; return 1; }
-    read -r -p '请输入监听端口 (默认: 443): ' port || return 1
+    _node_read -r -p '请输入监听端口 (默认: 443): ' port || return $?
     port="${port:-443}"
     _sni_router_validate_port "$port" || { _error '端口必须在 1-65535 之间。'; return 1; }
     if [ "$port" = 443 ]; then
-        read -r -p '是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: ' use_router || return 1
+        _node_read_yes_no '是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: ' use_router || return $?
         [[ "$use_router" =~ ^[Nn]$ ]] || routed=true
     fi
-    read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' path || return 1
+    _node_read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' path || return $?
     path="${path:-/$(openssl rand -hex 12)/}"
     [[ "$path" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] || { _error '路径须以 / 开始和结束，中间使用字母、数字、下划线或短横线。'; return 1; }
-    read -r -p "请输入节点名称 (默认: VLESS-XHTTP-${port}): " custom_name || return 1
+    _node_read -r -p "请输入节点名称 (默认: VLESS-XHTTP-${port}): " custom_name || return $?
     name="${custom_name:-VLESS-XHTTP-${port}}"
     _assert_node_name_free "$name" || return 1
     while true; do
-        read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return 1
+        _node_read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return $?
         concurrency="${concurrency:-1}"
         if [[ "$concurrency" =~ ^[0-9]{1,10}$ ]] && (( 10#$concurrency >= 1 && 10#$concurrency <= 2147483647 )); then
             concurrency=$((10#$concurrency))
@@ -7235,7 +7285,7 @@ _add_vless_xhttp_reality_impl() {
     local node_ip domain handshake_server handshake_port port backend listen="::" routed=false answer
     local path name concurrency tag uuid keypair private_key public_key short_id target inbound meta proxy
     [ -n "$server_ip" ] || server_ip=$(_get_ip)
-    read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " node_ip || return 1
+    _node_read -r -p "请输入服务器IP地址或连接域名 (默认: ${server_ip}): " node_ip || return $?
     node_ip="${node_ip:-$server_ip}"
     if ! _is_valid_reality_domain "$node_ip" && ! _is_valid_ipv4 "$node_ip" && ! [[ "$node_ip" == *:* && "$node_ip" =~ ^[0-9A-Fa-f:]+$ ]]; then
         _error '服务器地址须为 IP 或域名。'; return 1
@@ -7244,21 +7294,21 @@ _add_vless_xhttp_reality_impl() {
     domain="$SELECTED_REALITY_SNI"
     handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
     handshake_port="$SELECTED_REALITY_HANDSHAKE_PORT"
-    read -r -p '请输入监听端口 (默认: 443): ' port || return 1
+    _node_read -r -p '请输入监听端口 (默认: 443): ' port || return $?
     port="${port:-443}"
     _sni_router_validate_port "$port" || { _error '端口必须在 1-65535 之间。'; return 1; }
     if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
-        read -r -p '是否由 HAProxy 复用公网 443？[Y/n]: ' answer || return 1
+        _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n]: ' answer || return $?
         [[ "$answer" =~ ^[Nn]$ ]] || routed=true
     fi
-    read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' path || return 1
+    _node_read -r -p '请输入 XHTTP 路径 (默认: 自动生成): ' path || return $?
     path="${path:-/$(openssl rand -hex 12)/}"
     [[ "$path" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] || { _error '路径须以 / 开始和结束，中间使用字母、数字、下划线或短横线。'; return 1; }
-    read -r -p "请输入节点名称 (默认: VLESS-XHTTP-REALITY-${port}): " name || return 1
+    _node_read -r -p "请输入节点名称 (默认: VLESS-XHTTP-REALITY-${port}): " name || return $?
     name="${name:-VLESS-XHTTP-REALITY-${port}}"
     _assert_node_name_free "$name" || return 1
     while true; do
-        read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return 1
+        _node_read -r -p '请输入 XHTTP XMUX 每条连接的最大并发数 (默认: 1): ' concurrency || return $?
         concurrency="${concurrency:-1}"
         if [[ "$concurrency" =~ ^[0-9]{1,10}$ ]] && (( 10#$concurrency >= 1 && 10#$concurrency <= 2147483647 )); then
             concurrency=$((10#$concurrency)); break
@@ -7277,6 +7327,7 @@ _add_vless_xhttp_reality_impl() {
         backend=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
         listen=127.0.0.1
     elif _check_port_conflict "$port" tcp; then return 1; fi
+    [ -z "${NODE_PENDING_ORIGIN:-}" ] || _prepare_local_reality_origin "$NODE_PENDING_ORIGIN" || return 1
     _install_xray || return 1
     uuid=$("$XRAY_BIN" uuid) || return 1
     keypair=$("$XRAY_BIN" x25519) || return 1
@@ -7311,7 +7362,7 @@ _modify_xhttp_reality_port() {
     name=$(jq -r '.clientName' <<< "$meta"); domain=$(jq -r '.server_name' <<< "$meta")
     _validate_reality_no_self_loop "$port" "$(jq -r '.handshakeServer' <<< "$meta")" "$(jq -r '.handshakePort' <<< "$meta")" || return 1
     if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
-        read -r -p '是否由 HAProxy 复用公网 443？[Y/n]: ' answer || return 1
+        _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n，0 返回节点列表]: ' answer || return $?
         [[ "$answer" =~ ^[Nn]$ ]] || routed=true
     fi
     _node_tx_begin || return 1
@@ -7379,7 +7430,7 @@ _modify_xhttp_port() {
     domain=$(jq -r '.server_name' <<< "$meta"); path=$(jq -r '.path' <<< "$meta")
     backend=$(jq -r '.backendPort' <<< "$meta"); conf=$(jq -r '.nginxConfig' <<< "$meta")
     if [ "$port" = 443 ]; then
-        read -r -p '是否由 HAProxy 复用公网 443？[Y/n]: ' answer || return 1
+        _node_read_yes_no '是否由 HAProxy 复用公网 443？[Y/n，0 返回节点列表]: ' answer || return $?
         [[ "$answer" =~ ^[Nn]$ ]] || routed=true
     fi
     _node_tx_begin || return 1
@@ -7415,7 +7466,7 @@ _vision_link() {
 
 _vision_profile_prompt() {
     local choice
-    read -r -p 'VLESS 附加加密认证：1) 无（默认，仍使用 Reality） 2) X25519 3) ML-KEM-768：' choice || return 1
+    _node_read -r -p 'VLESS 附加加密认证：1) 无（默认，仍使用 Reality） 2) X25519 3) ML-KEM-768：' choice || return $?
     case "${choice:-1}" in
         1) echo none ;; 2) echo x25519 ;; 3) echo mlkem768 ;;
         *) _error '无效的 VLESS 加密选项。'; return 1 ;;
@@ -7454,26 +7505,24 @@ _add_vless_reality_impl() {
             backend_port="$port"
         fi
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        _node_read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip || return $?
         node_ip=${custom_ip:-$server_ip}
-        _select_reality_sni || return 1
+        _select_reality_sni || return $?
         server_name="$SELECTED_REALITY_SNI"
         handshake_server="$SELECTED_REALITY_HANDSHAKE_SERVER"
         handshake_port="$SELECTED_REALITY_HANDSHAKE_PORT"
         while true; do
-            read -r -p "请输入监听端口 (默认: 443，共享 SNI 入口): " port || return 1
+            _node_read -r -p "请输入监听端口 (默认: 443，共享 SNI 入口): " port || return $?
             port="${port:-443}"
             _sni_router_validate_port "$port" || { _error "端口必须在 1-65535 之间。"; continue; }
             if [ "$port" = "$SNI_ROUTER_PUBLIC_PORT" ]; then
                 local use_router
-                read -r -p "是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: " use_router
+                _node_read_yes_no "是否由 HAProxy 复用公网 443（Emby 与 Reality 可共存）？[Y/n]: " use_router || return $?
                 if [[ ! "$use_router" =~ ^[Nn]$ ]]; then
-                    _sni_router_prepare || continue
                     if jq -e '.reality != null' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
                         _error "HAProxy 443 已经登记了一个 Reality 默认后端，请复用或删除该节点。"
                         continue
                     fi
-                    backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || continue
                     listen_address="127.0.0.1"
                     router_mode=true
                     break
@@ -7484,9 +7533,9 @@ _add_vless_reality_impl() {
             break
         done
         local default_name="VLESS-REALITY-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        _node_read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name || return $?
         name=${custom_name:-$default_name}
-        profile=$(_vision_profile_prompt) || return 1
+        profile=$(_vision_profile_prompt) || return $?
     fi
 
     local uuid keypair private_key public_key short_id decryption=none encryption=none pair section target
@@ -7500,6 +7549,11 @@ _add_vless_reality_impl() {
         _error '客户端连接地址须为 IP 或域名。'; return 1
     fi
     _node_tx_begin || return 1
+    if [ "$router_mode" = true ] && [ "$BATCH_MODE" != true ]; then
+        _sni_router_prepare || return 1
+        backend_port=$(_sni_router_allocate_backend_port "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT") || return 1
+    fi
+    [ -z "${NODE_PENDING_ORIGIN:-}" ] || _prepare_local_reality_origin "$NODE_PENDING_ORIGIN" || return 1
     _install_xray || return 1
     uuid=$("$XRAY_BIN" uuid) && keypair=$("$XRAY_BIN" x25519) && short_id=$(openssl rand -hex 8) || return 1
     private_key=$(awk -F': ' '$1=="PrivateKey"{print $2}' <<< "$keypair")
@@ -10228,13 +10282,17 @@ _xray_list_links() {
 
 _xray_select_tag() {
     local keys choice
-    [ -s "$METADATA_FILE" ] || { _error '尚无 Xray 节点。'; return 1; }
-    keys=$(jq -ce '[to_entries[] | select(.value.core=="xray")] | select(length>0)' "$METADATA_FILE") || {
-        _error '尚无 Xray 节点。'; return 1;
-    }
+    [ -s "$METADATA_FILE" ] || { _info '尚无 Xray 节点。' >&2; return 2; }
+    keys=$(jq -ce '[to_entries[] | select(.value.core=="xray")]' "$METADATA_FILE") || return 1
+    if [ "$keys" = '[]' ]; then _info '尚无 Xray 节点。' >&2; return 2; fi
     jq -r 'to_entries[] | "\(.key+1)) \(.value.value.name)  :\(.value.value.publicPort)  [\(.value.value.type)]"' <<< "$keys" >&2
-    read -r -p '选择节点：' choice || return 1
-    [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && jq -er --argjson n "$choice" '.[$n-1].key // empty' <<< "$keys"
+    printf '0) 返回节点管理\n' >&2
+    while true; do
+        read -r -p '选择节点 [0 返回]：' choice || return 2
+        [ "$choice" != 0 ] || return 2
+        if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && jq -er --argjson n "$choice" '.[$n-1].key // empty' <<< "$keys"; then return 0; fi
+        _error '无效编号，请重新选择。'
+    done
 }
 
 _xray_link_outbound() {
@@ -10319,20 +10377,53 @@ _xray_route_node() {
 }
 
 _xray_manage_node() {
-    local action="$1" tag port answer file meta kind name
-    tag=$(_xray_select_tag) || return 1
-    [[ "$tag" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    local action="$1" tag port answer file meta status NODE_UI=true
+    while true; do
+        tag=$(_xray_select_tag) || return $?
+        [[ "$tag" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+        meta=$(jq -ce --arg t "$tag" '.[$t] | select(.core=="xray")' "$METADATA_FILE") || return 1
+        case "$action" in
+            delete)
+                while true; do
+                    read -r -p '删除选中节点？[y/N，0 返回节点列表]：' answer || return 2
+                    case "$answer" in y|Y) break ;; ''|n|N|0) break ;; *) _error '请输入 y、n 或 0。' ;; esac
+                done
+                [[ "$answer" =~ ^[Yy]$ ]] || continue
+                file='' ;;
+            port)
+                while true; do
+                    read -r -p '新公网端口（0 返回节点列表）：' port || return 2
+                    [ "$port" != 0 ] || break
+                    if [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && _sni_router_validate_port "$port"; then break; fi
+                    _error '端口必须在 1-65535 之间。'
+                done
+                [ "$port" != 0 ] || continue
+                if [ "$port" = "$(jq -r '.publicPort' <<< "$meta")" ]; then
+                    _info '端口未改变。'; continue
+                fi
+                file="$port" ;;
+            relay)
+                read -r -p '落地链接或 Xray outbound JSON 路径（direct 直连，0 或留空返回节点列表）：' file || return 2
+                [ -n "$file" ] && [ "$file" != 0 ] || continue
+                [ "$file" != direct ] || file='' ;;
+            *) return 1 ;;
+        esac
+        status=0
+        _node_operation _xray_manage_node_apply "$action" "$tag" "$file" "$meta" || status=$?
+        [ "$status" != 2 ] || continue
+        return "$status"
+    done
+}
+
+_xray_manage_node_apply() {
+    local action="$1" tag="$2" file="$3" port="$3" meta kind
     meta=$(jq -ce --arg t "$tag" '.[$t] | select(.core=="xray")' "$METADATA_FILE") || return 1
+    [ "$meta" = "$4" ] || { _error '选择期间节点记录已变化，请重新选择。'; return 1; }
     kind=$(jq -r '.type' <<< "$meta")
     case "$action" in
         relay)
-            read -r -p '落地分享链接或 Xray outbound JSON 文件路径（direct 解除绑定）：' file || return 1
-            [ -n "$file" ] || return 1
-            [ "$file" != direct ] || file=''
             _xray_route_node "$tag" "$file" ;;
         delete)
-            read -r -p '删除选中节点？[y/N]：' answer || return 1
-            [[ "$answer" =~ ^[Yy]$ ]] || return 1
             _xray_route_node "$tag" "" || return 1
             if [[ "$kind" = native-* ]]; then
                 if [ "$(jq -r '.frontedBy // ""' <<< "$meta")" = haproxy ]; then _sni_router_remove_tls "$tag" || return 1; fi
@@ -10341,9 +10432,6 @@ _xray_manage_node() {
                 _remove_node_from_yaml "$(jq -r '.clientName' <<< "$meta")"
             else _delete_xhttp_node "$tag"; fi ;;
         port)
-            read -r -p '新公网端口：' port || return 1
-            [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && _sni_router_validate_port "$port" || return 1
-            if [ "$port" = "$(jq -r '.publicPort' <<< "$meta")" ]; then return 0; fi
             if [[ "$kind" = native-* ]]; then _xray_native_port "$tag" "$meta" "$port"
             else _modify_xhttp_port "$tag" "$port"; fi ;;
     esac
@@ -10366,21 +10454,19 @@ _xray_native_add() {
     variant="${1:-}"
     if [ -z "$variant" ]; then
         printf '  1) VLESS TCP\n  2) Shadowsocks AES-128-GCM\n  3) SOCKS5 账号密码\n  4) VLESS WS+TLS\n  5) Trojan WS+TLS\n  6) VLESS gRPC+TLS\n'
-        read -r -p '选择：' variant || return 1
+        _node_read -r -p '选择：' variant || return $?
     fi
     case "$variant" in 1|4|6) proto=vless ;; 2) proto=shadowsocks ;; 3) proto=socks ;; 5) proto=trojan ;; *) return 1 ;; esac
-    read -r -p '客户端连接地址（IP 或域名）：' server || return 1
+    _node_read -r -p '客户端连接地址（IP 或域名）：' server || return $?
     server="${server#[}"; server="${server%]}"
     [[ "$server" =~ ^[A-Za-z0-9.:-]+$ ]] || return 1
-    read -r -p '公网端口：' port || return 1
+    _node_read -r -p '公网端口：' port || return $?
     [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && _sni_router_validate_port "$port" || return 1
-    read -r -p "节点名（默认 $proto-$port）：" name || return 1
+    _node_read -r -p "节点名（默认 $proto-$port）：" name || return $?
     name="${name:-$proto-$port}"; _assert_node_name_free "$name" || return 1
-    _install_xray || return 1
-    tag=$(_new_node_tag xray-in) && id=$("$XRAY_BIN" uuid) && pw=$(openssl rand -hex 24) || return 1
     stream='{"network":"raw","security":"none"}'
     if ((variant >= 4)); then
-        read -r -p '证书域名 / SNI：' sni || return 1
+        _node_read -r -p '证书域名 / SNI：' sni || return $?
         _is_valid_reality_domain "$sni" || return 1
         cert="$NGINX_CERT_DIR/$sni/cert"; key="$NGINX_CERT_DIR/$sni/key"
         if ! _cert_matches_hostname "$cert" "$sni" || [ ! -s "$key" ]; then
@@ -10392,6 +10478,8 @@ _xray_native_add() {
             '{network:$net,security:"tls",tlsSettings:{certificates:[{certificateFile:$cert,keyFile:$key}]}} +
              (if $net=="grpc" then {grpcSettings:{serviceName:$path}} else {wsSettings:{path:("/"+$path)}} end)') || return 1
     fi
+    _install_xray || return 1
+    tag=$(_new_node_tag xray-in) && id=$("$XRAY_BIN" uuid) && pw=$(openssl rand -hex 24) || return 1
     _xray_native_listener "$port" "$sni" "$tag" || return 1
     if [[ "$proto" = socks || "$proto" = shadowsocks ]]; then _check_port_conflict "$port" udp && return 1; fi
     host="$server"; [[ "$host" != *:* ]] || host="[$host]"
@@ -10655,10 +10743,13 @@ _retire_legacy_service() (
 )
 
 _xray_add_node_menu() {
-    local choice
+    local choice NODE_UI=true NODE_PENDING_ORIGIN=''
     while true; do
         printf '\n  ═══════════════════════════════════════\n             Xray 添加节点\n  ═══════════════════════════════════════\n\n  【协议选择】\n    [1] VLESS (Vision + Reality)\n    [2] VLESS (XHTTP + Reality)\n    [3] VLESS (XHTTP + TLS)\n    [4] VLESS (WebSocket + TLS)\n    [5] Trojan (WebSocket + TLS)\n    [6] VLESS (gRPC + TLS)\n    [7] Shadowsocks (AES-128-GCM)\n    [8] VLESS (裸 TCP，无 TLS)\n    [9] SOCKS5 (账号密码)\n\n  ───────────────────────────────────────\n    [0] 返回节点管理\n\n'
         read -r -p '  请输入选项 [0-9]: ' choice || return 0
+        if [[ "$choice" =~ ^[1-9]$ ]]; then
+            _info '填写节点参数时输入 0 可取消并返回协议选择；回车保留提示中的默认值。'
+        fi
         case "$choice" in
             0) return 0 ;;
             1) _node_operation _add_vless_reality_impl ;;
@@ -10672,13 +10763,12 @@ _xray_add_node_menu() {
             9) _node_operation _xray_native_add 3 ;;
             *) _error '无效选择。'; continue ;;
         esac
-        return
     done
 }
 
 _xray_menu() {
     _check_root
-    local choice dep
+    local choice dep answer
     while true; do
         printf '\n  ═══════════════════════════════════════\n         Xray 节点管理 v%s\n  ═══════════════════════════════════════\n\n  【节点管理】\n    [1] 添加节点\n    [2] 分享链接与聚合订阅\n    [3] 修改节点端口\n    [4] 删除节点\n    [5] 中转 / 直连出站\n\n  【服务维护】\n    [6] 更新 Xray 核心\n    [7] 查看服务状态\n    [8] 迁移并删除旧 sing-box\n\n  ───────────────────────────────────────\n    [0] 返回主菜单\n\n' "$SCRIPT_VERSION"
         read -r -p '  请输入选项 [0-8]: ' choice || return 0
@@ -10687,7 +10777,10 @@ _xray_menu() {
             8) _retire_legacy_service migrate; continue ;;
             7) _xray_service status; continue ;;
             2) _xray_list_links subscription; continue ;;
-            1|3|4|5|6) ;;
+            6)
+                read -r -p '更新 Xray 核心并按需重启服务？[y/N，0 返回]：' answer || return 0
+                [[ "$answer" =~ ^[Yy]$ ]] || continue ;;
+            1|3|4|5) ;;
             *) _error '无效选择。'; continue ;;
         esac
         for dep in jq openssl curl wget; do command -v "$dep" >/dev/null || _pkg_install "$dep" || return 1; done
@@ -10697,9 +10790,9 @@ _xray_menu() {
         ( _config_write_lock && _install_yq ) || return 1
         case "$choice" in
             1) _xray_add_node_menu ;;
-            3) _node_operation _xray_manage_node port ;;
-            4) _node_operation _xray_manage_node delete ;;
-            5) _node_operation _xray_manage_node relay ;;
+            3) _xray_manage_node port ;;
+            4) _xray_manage_node delete ;;
+            5) _xray_manage_node relay ;;
         esac
     done
 }
