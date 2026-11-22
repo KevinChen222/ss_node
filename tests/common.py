@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Cover the shared entry bootstrap and the real first-stage maintenance call."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+REPO = Path(__file__).resolve().parents[1]
+BWRAP = shutil.which('bwrap')
+LEGACY = '52431e518f6b1941f4f6aab577d0c9331afa1543'
+
+
+class CommonTests(unittest.TestCase):
+    def setUp(self):
+        work = tempfile.TemporaryDirectory(prefix='proxyall-common-test-')
+        self.addCleanup(work.cleanup)
+        self.work = Path(work.name)
+
+    def shell(self, body, *args):
+        result = subprocess.run(
+            ['bash', '-eu', '-o', 'pipefail', '-c', body, 'test', *args],
+            cwd=self.work, env=dict(os.environ, REPO=str(REPO)),
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def test_both_checkout_entries_source_the_libraries_and_keep_validator_behavior(self):
+        for entry, validator in (('sb.sh', '_is_valid_ipv4'), ('deploy.sh', 'is_valid_ipv4')):
+            with self.subTest(entry=entry):
+                self.shell(r'''
+source "$REPO/$1"
+declare -F _config_write_lock _sni_router_cli >/dev/null
+"$2" 001.02.255.0
+for bad in 256.1.2.3 0.0.0 0001.2.3.4 1.2.3.4.5; do
+    if "$2" "$bad"; then exit 1; fi
+done
+''', entry, validator)
+
+    def test_incomplete_checkout_returns_before_loading_either_library(self):
+        (self.work / 'lib').mkdir()
+        (self.work / 'lib/common.sh').write_text('# PROXYALL_LIB=common.sh\ntouch loaded\n')
+        for entry in ('sb.sh', 'deploy.sh'):
+            with self.subTest(entry=entry):
+                shutil.copyfile(REPO / entry, self.work / entry)
+                result = self.shell(r'''
+if source "./$1"; then exit 1; fi
+[[ ! -e loaded ]]
+''', entry)
+                self.assertIn('proxyall --install', result.stderr)
+
+    def test_standalone_updates_require_the_bundle(self):
+        for entry, command in (('sb.sh', '_update_script'), ('deploy.sh', 'update_script')):
+            with self.subTest(entry=entry):
+                result = self.shell(r'''
+source "$REPO/$1"
+curl() { touch attempted_download; return 1; }
+wget() { touch attempted_download; return 1; }
+if "$2"; then exit 1; fi
+[[ ! -e attempted_download ]]
+''', entry, command)
+                self.assertIn('proxyall --update', result.stderr)
+
+    @unittest.skipUnless(BWRAP and all(shutil.which(cmd) for cmd in (
+        'cron', 'crontab', 'logrotate', 'pgrep', 'flock',
+    )), 'bubblewrap, cron, logrotate, pgrep and flock are required')
+    def test_legacy_installer_runs_real_maintenance_without_libraries(self):
+        namespace = [BWRAP, '--die-with-parent', '--unshare-user', '--uid', '0', '--gid', '0',
+                     '--unshare-pid', '--unshare-net', '--dev', '/dev', '--proc', '/proc',
+                     '--dir', '/usr', '--ro-bind', '/usr/bin', '/usr/bin',
+                     '--ro-bind', '/usr/sbin', '/usr/sbin', '--ro-bind', '/usr/lib', '/usr/lib',
+                     '--ro-bind-try', '/usr/lib64', '/usr/lib64', '--ro-bind', '/etc', '/etc',
+                     '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/sbin', '/sbin',
+                     '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--chdir', '/']
+        probe = subprocess.run(namespace + ['true'], capture_output=True, text=True, timeout=10)
+        if probe.returncode:
+            self.skipTest(probe.stderr.strip())
+        legacy = self.work / 'legacy-proxyall'
+        legacy.write_bytes(subprocess.check_output(['git', 'show', f'{LEGACY}:proxyall'], cwd=REPO))
+        result = subprocess.run(namespace + [
+            '--tmpfs', '/run', '--tmpfs', '/var', '--tmpfs', '/tmp',
+            '--tmpfs', '/etc/cron.d', '--ro-bind', '/dev/null', '/etc/crontab',
+            '--ro-bind', str(legacy), '/tmp/legacy-proxyall', '--ro-bind', str(REPO), '/tmp/repo',
+            '--chdir', '/tmp', 'bash', '-euc', r'''
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PROXYALL_MAINTENANCE_DIR=/var/lib/proxyall-maintenance
+export PROXYALL_LOGROTATE_DIR=/tmp/logrotate.d
+export PROXYALL_WRITE_LOCK_FILE=/run/lock/proxyall-config.lock
+umask 022
+mkdir -p /usr/local/bin /usr/local/lib /var/spool/cron/crontabs
+chmod 1730 /var/spool/cron/crontabs
+ln -s /run /var/run
+
+# Use the original install transaction with the two current production scripts.
+source /tmp/legacy-proxyall
+pa_prepare_state
+PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX")
+cp /tmp/repo/sb.sh /tmp/repo/deploy.sh "$PA_STAGE/"
+cp /tmp/legacy-proxyall "$PA_STAGE/proxyall"
+printf '%s\n' "$1" > "$PA_STAGE/commit"
+test ! -e /usr/local/lib/proxyall/common.sh
+test ! -e /usr/local/lib/proxyall/sni_router.sh
+test ! -d /run/systemd/system
+pa_install_bundle
+cmp /tmp/repo/sb.sh /usr/local/bin/sb
+test -f "$PROXYALL_WRITE_LOCK_FILE"
+grep -Fx '# Managed by proxyall log maintenance' "$PROXYALL_LOGROTATE_DIR/proxyall"
+crontab -l | grep -Fx '*/15 * * * * bash /usr/local/bin/sb cleanup-logs >/dev/null 2>&1 # sing-box-log-cleanup'
+pgrep -a -x cron
+
+# Installed commands ignore a marked library tree in cwd or the environment.
+mkdir lib /usr/local/bin/lib
+for name in common.sh sni_router.sh; do
+    printf '# PROXYALL_LIB=%s\ntouch /tmp/loaded\n' "$name" > "lib/$name"
+    cp "lib/$name" "/usr/local/bin/lib/$name"
+done
+export PROXYALL_LIB_DIR=/tmp/lib _proxyall_lib_dir=/tmp/lib
+export PROXYALL_WRITE_LOCK_FILE=/run/lock/blocked.lock
+export PROXYALL_MAINTENANCE_DIR=/tmp/blocked
+must_refuse() {
+    if "$@" >/tmp/stdout 2>/tmp/stderr; then return 1; fi
+    grep -Fq 'proxyall --install' /tmp/stderr
+}
+must_refuse bash /usr/local/bin/sb cleanup-logs
+must_refuse bash /usr/local/bin/nginxproxy --install-command
+[[ ! -e /tmp/loaded && ! -e /tmp/blocked && ! -e $PROXYALL_WRITE_LOCK_FILE ]]
+
+mkdir /usr/local/lib/proxyall
+cp /tmp/repo/lib/common.sh /usr/local/lib/proxyall/
+must_refuse env PROXYALL_MANAGED=1 bash /usr/local/bin/sb setup-maintenance
+[[ ! -e /tmp/blocked && ! -e $PROXYALL_WRITE_LOCK_FILE ]]
+cp /tmp/repo/lib/sni_router.sh /usr/local/lib/proxyall/
+chmod g+w /usr/local/lib/proxyall/common.sh
+must_refuse bash /usr/local/bin/sb sni-router api-version
+must_refuse bash /usr/local/bin/nginxproxy --version
+chmod g-w /usr/local/lib/proxyall/common.sh
+[[ $(bash /usr/local/bin/sb sni-router api-version) == 1 ]]
+bash /usr/local/bin/nginxproxy --version
+must_refuse bash /usr/local/bin/nginxproxy --install-command
+cmp /tmp/repo/deploy.sh /usr/local/bin/nginxproxy
+''', 'test', LEGACY], capture_output=True, text=True, timeout=20,
+            env={'PATH': '/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('# Managed by proxyall log maintenance', result.stdout)
+        self.assertIn('bash /usr/local/bin/sb cleanup-logs', result.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

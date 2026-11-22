@@ -28,6 +28,10 @@ SNI_ROUTER_BIN="$WORK/${SB_COMMAND:-no-sb}"
 _sni_router_require_systemd() { return 0; }
 has_systemd() { return 0; }
 haproxy() {
+    if [[ ${EXPECT_ROUTER_LOCK:-0} == 1 ]]; then
+        [[ /dev/fd/8 -ef $PROXYALL_WRITE_LOCK_FILE && /dev/fd/9 -ef $SNI_ROUTER_LOCK_FILE ]] || return 1
+        ! flock -n "$PROXYALL_WRITE_LOCK_FILE" true && ! flock -n "$SNI_ROUTER_LOCK_FILE" true || return 1
+    fi
     [[ $# == 3 && $1 == -c && $2 == -f && -s $3 && ${FAIL_CHECK:-0} != 1 ]]
 }
 systemctl() {
@@ -80,44 +84,71 @@ class SniRouterTests(unittest.TestCase):
     def snapshot(self):
         return [f.read_bytes() if f.exists() else None for f in (self.state, self.conf, self.loaded)]
 
-    def test_fallback_refuses_tls_routes_then_delegates_to_sb(self):
+    def test_alternating_entry_points_preserve_mixed_routes_and_ownership(self):
         self.run_router('''
 _sni_router_cli register-reality sb-xray vision reality.example.com 2443
 _sni_router_cli register-tls sb-xray ws ws.example.com 10443
+_sni_router_cli register-https sb-xhttp portal.example.com 8444
 ''')
         before = self.snapshot()
-        for action in ('status', 'check', 'prepare', 'register-https nginx-proxy emby.example.com 8444',
-                       'remove-https nginx-proxy emby.example.com'):
-            with self.subTest(action=action):
-                result = self.run_router('sni_router_call ' + action, 'deploy.sh', ok=False)
-                self.assertIn('TLS SNI', result.stderr)
-                self.assertEqual(self.snapshot(), before)
-        wrapper = self.work / 'sb'
+        original_state = json.loads(before[0])
+        # The executable path deliberately contains a space. Its only job is to
+        # dispatch to the real sb CLI without requiring root or touching the host.
+        wrapper = self.work / 'mock sb'
         wrapper.write_text('#!/usr/bin/env bash\nset -Eeuo pipefail\nsource "$REPO/sb.sh"\n'
                            '[[ $1 == sni-router ]] || exit 2\nshift\n_sni_router_cli "$@"\n')
         wrapper.chmod(0o700)
-        self.run_router('sni_router_call register-https nginx-proxy WS.example.com 8444',
-                        'deploy.sh', ok=False, SB_COMMAND='sb')
-        self.assertEqual(self.snapshot(), before)
-        result = self.run_router('''
-sni_router_call register-https nginx-proxy Emby.example.com 8444
-sni_router_call check
-sni_router_call status
-''', 'deploy.sh', SB_COMMAND='sb')
-        self.assertIn('reality=reality.example.com -> 127.0.0.1:2443', result.stdout)
-        self.assertIn('https=emby.example.com -> 127.0.0.1:8444 (nginx-proxy)', result.stdout)
-        self.assertIn('tls=ws.example.com -> 127.0.0.1:10443 (ws)', result.stdout)
-        cfg = self.conf.read_text()
-        self.assertIn('server nginx 127.0.0.1:8444 send-proxy-v2', cfg)
-        self.assertIn('server tls_0 127.0.0.1:10443', cfg)
-        self.assertIn('default_backend sb_reality_backend', cfg)
-        self.run_router('sni_router_call remove-https nginx-proxy emby.example.com',
-                        'deploy.sh', SB_COMMAND='sb')
+        for sb in ('no-sb', wrapper.name):
+            with self.subTest(sb=sb):
+                deploy = dict(entry='deploy.sh', SB_COMMAND=sb)
+                for domain in ('REALITY.example.com', 'WS.example.com'):
+                    self.run_router(f'sni_router_call register-https nginx-proxy {domain} 8444',
+                                    ok=False, **deploy)
+                    result = self.run_router(f'you_domain={domain}; prepare_sni_router',
+                                             ok=False, **deploy)
+                    self.assertIn('已被 Reality/TLS 节点使用', result.stderr)
+                self.run_router('sni_router_call remove-https nginx-proxy portal.example.com',
+                                ok=False, **deploy)
+                self.assertEqual(self.snapshot(), before)
+                self.run_router('sni_router_call register-https nginx-proxy Emby.example.com 8444',
+                                EXPECT_ROUTER_LOCK='1', **deploy)
+                expected = {**original_state, 'https_routes': {
+                    **original_state['https_routes'], 'emby.example.com': {'owner': 'nginx-proxy'}}}
+                self.assertEqual(json.loads(self.state.read_text()), expected)
+                registered = self.snapshot()
+                self.run_router('_sni_router_cli register-https sb-xhttp emby.example.com 8444', ok=False)
+                self.run_router('_sni_router_cli remove-https sb-xhttp emby.example.com', ok=False)
+                self.assertEqual(self.snapshot(), registered)
+                result = self.run_router('sni_router_call check\nsni_router_call status', **deploy)
+                sb_status = self.run_router('_sni_router_cli status').stdout
+                self.assertEqual(result.stdout, sb_status)
+                self.assertIn('reality=reality.example.com -> 127.0.0.1:2443', sb_status)
+                self.assertIn('https=emby.example.com -> 127.0.0.1:8444 (nginx-proxy)', sb_status)
+                self.assertIn('tls=ws.example.com -> 127.0.0.1:10443 (ws)', sb_status)
+                cfg = self.conf.read_text()
+                self.assertIn('server nginx 127.0.0.1:8444 send-proxy-v2', cfg)
+                self.assertIn('server tls_0 127.0.0.1:10443', cfg)
+                self.assertIn('default_backend sb_reality_backend', cfg)
+                self.assertEqual(self.loaded.read_text(), cfg)
+                self.run_router('sni_router_call remove-https nginx-proxy EMBY.example.com',
+                                EXPECT_ROUTER_LOCK='1', **deploy)
+                self.assertEqual(self.snapshot(), before)
+        self.run_router('_sni_router_cli remove-https sb-xhttp portal.example.com')
         self.run_router('_sni_router_cli remove-reality vision')
         self.assertTrue(self.loaded.exists())
         self.assertIn('reject if sb_tls_client_hello !sb_tls_route_0', self.conf.read_text())
         self.run_router('_sni_router_cli remove-tls ws')
         self.assertFalse(self.loaded.exists())
+
+    def test_incompatible_sb_is_rejected_without_writing_state(self):
+        wrapper = self.work / 'sb'
+        wrapper.write_text('#!/usr/bin/env bash\n[[ $* == "sni-router api-version" ]] || exit 2\necho 2\n')
+        wrapper.chmod(0o700)
+        result = self.run_router('sni_router_call register-https nginx-proxy emby.example.com 8444',
+                                 'deploy.sh', ok=False, SB_COMMAND=wrapper.name)
+        self.assertIn('接口不兼容', result.stderr)
+        self.assertEqual(self.snapshot(), [None, None, None])
+        self.assertFalse(self.calls.exists())
 
     def test_fallback_accepts_legacy_state_and_preserves_reality(self):
         for tls in ({}, {'tls_routes': None}, {'tls_routes': {}}):
@@ -138,6 +169,40 @@ sni_router_call status
                 self.assertIn('public=:443', result.stdout)
                 self.assertIn('reality=Reality.Example.com -> 127.0.0.1:2443', result.stdout)
                 self.assertIn('tls=未登记', result.stdout)
+
+    def test_fallback_protects_case_insensitive_legacy_routes(self):
+        self.state.write_text(json.dumps(dict(version=1, public_port=443, reality=None,
+            https_backend={'host': '127.0.0.1', 'port': 8444},
+            https_routes={'Portal.example.com': {'owner': 'sb-xhttp'},
+                          'Emby.example.com': {'owner': 'nginx-proxy'}},
+            tls_routes={'WS.example.com': {'owner': 'sb-xray', 'tag': 'ws',
+                                           'backend_host': '127.0.0.1', 'backend_port': 10443}})))
+        self.run_router('sni_router_call prepare', 'deploy.sh')
+        before = self.snapshot()
+        for action in ('register-https nginx-proxy ws.example.com 8444',
+                       'register-https nginx-proxy portal.example.com 8444',
+                       'remove-https nginx-proxy portal.example.com'):
+            with self.subTest(action=action):
+                self.run_router(f'sni_router_call {action}', 'deploy.sh', ok=False)
+                self.assertEqual(self.snapshot(), before)
+        self.run_router('you_domain=ws.example.com; prepare_sni_router', 'deploy.sh', ok=False)
+        self.run_router('you_domain=Emby.example.com; frontend_mode=haproxy\n'
+                        'prepare_sni_router\nregister_sni_route\nrollback_new_sni_route', 'deploy.sh')
+        self.assertEqual(self.snapshot(), before)
+        self.run_router('sni_router_call remove-https nginx-proxy emby.example.com', 'deploy.sh')
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state['https_routes'], {'Portal.example.com': {'owner': 'sb-xhttp'}})
+        self.assertEqual(state['tls_routes'], json.loads(before[0])['tls_routes'])
+
+    @unittest.skipIf(os.geteuid() == 0, 'requires an unprivileged caller')
+    def test_executed_entry_points_require_root(self):
+        for entry, args in (('sb.sh', ['sni-router', 'api-version']),
+                            ('deploy.sh', ['--install-command'])):
+            with self.subTest(entry=entry):
+                result = subprocess.run(['bash', str(REPO / entry), *args],
+                                        capture_output=True, text=True, timeout=12)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('root', result.stderr)
 
     def test_invalid_or_missing_state_never_replaces_managed_config(self):
         self.run_router('_sni_router_cli register-tls sb-xray ws ws.example.com 10443')

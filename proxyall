@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 安装同一提交的 Xray 管理器、Nginx 反代与统一入口。
-PROXYALL_VERSION="2.0.8"
-SB_SHA256="1e4f00cfa91992d1bdc829007584e705f168ed819b95a65a7d873a8d79294b2d"
-DEPLOY_SHA256="722809a510d3ef1fa2aac0acacc9bc441d862bd3bac4f04a5cbeeeb5c216f316"
+PROXYALL_VERSION="2.1.0"
+SB_SHA256="097ac01be181a4614652832504365209817f9db45549ff98c0013ca58b655a29"
+DEPLOY_SHA256="5866071bfa16444ab7e81d48940fcc25b7f4c492ef915b536a5567b1c4895d82"
+COMMON_SHA256="4bf5d2cb9f26d40f4135ab041752ae90a4322a175cf16c6a6a2a6752c74f5354"
+SNI_ROUTER_SHA256="abcbfd6a3b017fcaddd0365de185ec70c8514af1ce4c240df20458a9bd44daca"
 RELAY_SHA256="aeaf92390b3b7b2dd04b91a2c81b4f68d18b11776b0f6aaa620dcbc9a684b238"
 PARSER_SHA256="1facb8460e60c399ae259df5f01bd8bc3f95856f588ea748e68c7810aa13eb65"
 
@@ -16,10 +18,16 @@ PA_MARKER="# PROXYALL_MANAGED_COMMAND=1"
 PA_STAGE=""
 PA_BACKUP=""
 PA_TRANSACTION=0
-PA_FILES=(sb.sh deploy.sh proxyall)
+# 配套库写入后才切换统一入口。库路径同时用于下载和备份。
+PA_FILES=(sb.sh deploy.sh lib/common.sh lib/sni_router.sh proxyall)
 PA_TARGETS=(/usr/local/bin/sb /usr/local/bin/nginxproxy
-    /usr/local/bin/proxyall)
+    /usr/local/lib/proxyall/common.sh /usr/local/lib/proxyall/sni_router.sh "$PA_COMMAND")
+PA_KEYS=(SB_SHA256 DEPLOY_SHA256 COMMON_SHA256 SNI_ROUTER_SHA256 '')
+PA_MARKERS=('# SB_MANAGER_MANAGED_COMMAND=1' '# NGINXPROXY_MANAGED_COMMAND=1'
+    '# PROXYALL_LIB=common.sh' '# PROXYALL_LIB=sni_router.sh' "$PA_MARKER")
 PA_CHANGED=()
+PA_CREATED_DIRS=()
+PA_COMMIT_CHANGED=0
 
 pa_info() { printf '\n[proxyall] %s\n' "$*" >&2; }
 pa_error() { printf '\n[错误] %s\n' "$*" >&2; }
@@ -47,7 +55,7 @@ EOF
 }
 
 pa_fetch() {
-    curl --proto '=https' --tlsv1.2 -fLsS --connect-timeout 10 --max-time 120 \
+    curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fLsS --connect-timeout 10 --max-time 120 \
         --retry 2 --retry-delay 2 -H 'User-Agent: proxyall' "$1" -o "$2"
 }
 
@@ -87,7 +95,7 @@ pa_trusted_directory_chain() {
         fi
         if [ -e "$path" ]; then
             [ -d "$path" ] || return 1
-            read -r owner mode < <(stat -Lc '%u %a' -- "$path")
+            read -r owner mode < <(stat -Lc '%u %a' -- "$path") || return 1
             [[ "$owner" = 0 || "$owner" = "$EUID" ]] || return 1
             [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
             (( (8#$mode & 0022) == 0 )) || return 1
@@ -98,30 +106,47 @@ pa_trusted_directory_chain() {
 }
 
 pa_safe_directory() {
-    local path="$1" parent="$1"
+    local path="$1"
     [ ! -L "$path" ] || { pa_error "目录是符号链接，已停止: $path"; return 1; }
-    while [ "$parent" != / ] && [ -n "$parent" ]; do
-        if [ -L "$parent" ]; then
-            if ! pa_trusted_directory_chain "$path"; then
-                pa_error "目录符号链接的目标或权限不安全，已停止: $parent"
-                return 1
-            fi
-        fi
-        parent=$(dirname -- "$parent")
-    done
-    [ ! -e "$path" ] || [ -d "$path" ]
+    if ! pa_trusted_directory_chain "$path"; then
+        pa_error "目录路径或权限不安全，已停止: $path"
+        return 1
+    fi
+}
+
+pa_trusted_file() {
+    local path="$1" owner mode
+    [ ! -L "$path" ] && [ -f "$path" ] || return 1
+    read -r owner mode < <(stat -c '%u %a' -- "$path") || return 1
+    [[ "$owner" = 0 || "$owner" = "$EUID" ]] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022) == 0 ))
+}
+
+pa_safe_file_slot() {
+    [ ! -L "$1" ] && { [ ! -e "$1" ] || pa_trusted_file "$1"; }
 }
 
 pa_prepare_state() {
+    local file
     pa_safe_directory "$PA_STATE" || return 1
-    if [ -e "$PA_STATE" ] && ! grep -Fqx "$PA_MARKER" "$PA_STATE/.managed" 2>/dev/null; then
-        pa_error "$PA_STATE 已存在且不属于 proxyall，拒绝覆盖。"
-        return 1
+    if [ -d "$PA_STATE" ]; then
+        if ! pa_trusted_file "$PA_STATE/.managed" || ! grep -Fqx "$PA_MARKER" "$PA_STATE/.managed"; then
+            pa_error "$PA_STATE 已存在且不属于 proxyall，拒绝覆盖。"
+            return 1
+        fi
+    else
+        install -d -m 700 "$PA_STATE" || return 1
+        (set -o noclobber; printf '%s\n' "$PA_MARKER" > "$PA_STATE/.managed") || return 1
     fi
-    install -d -m 700 "$PA_STATE" || return 1
-    printf '%s\n' "$PA_MARKER" > "$PA_STATE/.managed" || return 1
-    exec 8>"$PA_STATE/manager.lock" || return 1
+    for file in commit manager.lock; do
+        if ! pa_safe_file_slot "$PA_STATE/$file"; then
+            pa_error "状态文件不安全，已停止: $PA_STATE/$file"
+            return 1
+        fi
+    done
+    exec 8<>"$PA_STATE/manager.lock" || return 1
     flock -n 8 || {
+        exec 8>&-
         pa_error '已有一个 proxyall 会话或旧版后台进程持锁。请先退出另一个菜单。'
         pa_info "若没有其他菜单，请运行 fuser -v $PA_STATE/manager.lock 查看持锁进程；不要删除锁文件或直接杀服务。"
         return 1
@@ -130,44 +155,59 @@ pa_prepare_state() {
 
 # 提取常量而不 source 下载文件。每个字段必须恰好出现一次。
 pa_constant() {
-    local file="$1" key="$2" value
-    value=$(sed -n "s/^${key}=\"\([a-f0-9]\{64\}\)\"$/\1/p" "$file")
-    [[ "$value" =~ ^[a-f0-9]{64}$ ]] || return 1
-    printf '%s\n' "$value"
+    local file="$1" key="$2" assignment
+    assignment=$(grep -E "^${key}=" "$file") || return 1
+    [[ "$assignment" =~ ^${key}=\"([a-f0-9]{64})\"$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 pa_validate_bundle() {
-    local dir="$1" file key expected actual i
-    local keys=(SB_SHA256 DEPLOY_SHA256)
-    grep -Fqx "$PA_MARKER" "$dir/proxyall" || return 1
-    grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$dir/sb.sh" || return 1
-    grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$dir/deploy.sh" || return 1
-    for file in "${PA_FILES[@]}"; do
-        [ -s "$dir/$file" ] && bash -n "$dir/$file" || return 1
-        if LC_ALL=C grep -q $'\r' "$dir/$file"; then
+    local dir="$1" file path key expected actual i
+    pa_safe_directory "$dir" && pa_safe_directory "$dir/lib" || return 1
+    pa_trusted_file "$dir/proxyall" || return 1
+    for i in "${!PA_FILES[@]}"; do
+        file=${PA_FILES[$i]}; path="$dir/$file"; key=${PA_KEYS[$i]}
+        pa_trusted_file "$path" && grep -Fqx "${PA_MARKERS[$i]}" "$path" || return 1
+        if LC_ALL=C grep -q $'\r' "$path"; then
             pa_error "$file 含有 CRLF，请在仓库中以 LF 保存。"
             return 1
         fi
-    done
-    for i in "${!keys[@]}"; do
-        file=${PA_FILES[$i]}; key=${keys[$i]}
+        bash -n "$path" || return 1
+        [ -n "$key" ] || continue
         expected=$(pa_constant "$dir/proxyall" "$key") || return 1
-        actual=$(pa_hash "$dir/$file") || return 1
+        actual=$(pa_hash "$path") || return 1
         [ "$actual" = "$expected" ] || { pa_error "$file 的 SHA-256 不匹配。"; return 1; }
     done
+}
+
+pa_libs_ready() {
+    local i target key actual
+    for i in "${!PA_FILES[@]}"; do
+        [[ ${PA_FILES[$i]} = lib/* ]] || continue
+        target=${PA_TARGETS[$i]}; key=${PA_KEYS[$i]}
+        pa_safe_directory "${target%/*}" && pa_trusted_file "$target" &&
+            grep -Fqx "${PA_MARKERS[$i]}" "$target" || return 1
+        actual=$(pa_hash "$target") || return 1
+        [ "$actual" = "${!key}" ] || return 1
+    done
+}
+
+pa_incomplete_notice() {
+    pa_info '配套库缺失或版本不匹配。请在菜单选择 3) 检查脚本更新并输入 y，或运行 proxyall --update。'
 }
 
 pa_download_bundle() {
     local ref_file commit file raw
     PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX") || return 1
     ref_file="$PA_STAGE/ref.json"
-    pa_info '查询仓库 main 的提交，下载同一提交的三个脚本...'
-    pa_fetch "https://api.github.com/repos/$PA_REPO/git/ref/heads/main" "$ref_file" || {
+    pa_info '查询仓库 main 的提交，下载同一提交的全部管理脚本和配套库...'
+    pa_fetch "https://api.github.com/repos/$PA_REPO/git/ref/heads/main" "$ref_file" && pa_trusted_file "$ref_file" || {
         pa_error '无法读取 GitHub 提交（也可能是 API 限流）。本地文件未改动。'; return 1;
     }
     commit=$(sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([a-f0-9]\{40\}\)".*/\1/p' "$ref_file")
     [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || { pa_error 'GitHub 提交格式无效。'; return 1; }
     raw="https://raw.githubusercontent.com/$PA_REPO/$commit"
+    mkdir -m 700 -- "$PA_STAGE/lib" || return 1
     for file in "${PA_FILES[@]}"; do
         pa_fetch "$raw/$file" "$PA_STAGE/$file" || { pa_error "下载失败: $file"; return 1; }
     done
@@ -199,13 +239,13 @@ pa_legacy_component() {
 
 pa_known_target() {
     local target="$1" file="$2" actual
-    [ ! -L "$target" ] || return 1
+    pa_safe_file_slot "$target" || return 1
     [ -e "$target" ] || return 0
-    [ -f "$target" ] || return 1
     case "$file" in
         sb.sh) grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$target" || pa_legacy_component "$target" "$file" ;;
         deploy.sh) grep -Fqx '# NGINXPROXY_MANAGED_COMMAND=1' "$target" || pa_legacy_component "$target" "$file" ;;
         proxyall) grep -Fqx "$PA_MARKER" "$target" ;;
+        lib/common.sh|lib/sni_router.sh) grep -Fqx "# PROXYALL_LIB=${file##*/}" "$target" ;;
         advanced_relay.sh|parser.sh)
             if grep -Fqx "# PROXYALL_COMPONENT=$file" "$target"; then return 0; fi
             actual=$(pa_hash "$target") || return 1
@@ -218,26 +258,41 @@ pa_known_target() {
     esac
 }
 
-pa_atomic_install() {
-    local source="$1" target="$2" tmp
+pa_atomic_install() (
+    local source="$1" target="$2" mode="${3:-700}" tmp=""
+    trap '[ -z "$tmp" ] || rm -f -- "$tmp"' EXIT
     tmp=$(mktemp "${target}.proxyall.XXXXXXXX") || return 1
-    if ! install -m 700 -- "$source" "$tmp" || ! mv -f -- "$tmp" "$target"; then
-        rm -f -- "$tmp"
-        return 1
+    if [ "$mode" = preserve ]; then
+        cp -p -- "$source" "$tmp" || return 1
+    else
+        install -m "$mode" -- "$source" "$tmp" || return 1
+    fi
+    mv -fT -- "$tmp" "$target" || return 1
+    tmp=""
+)
+
+pa_restore_target() {
+    local backup="$1" target="$2"
+    if [ -f "$backup" ]; then
+        pa_atomic_install "$backup" "$target" preserve
+    else
+        rm -f -- "$target"
     fi
 }
 
 pa_rollback() {
-    local i target failed=0
+    local j i failed=0
     [ "$PA_TRANSACTION" = 1 ] || return 0
-    pa_error '安装未完成，正在恢复安装前的脚本文件...'
-    for i in "${PA_CHANGED[@]}"; do
-        target=${PA_TARGETS[$i]}
-        if [ -f "$PA_BACKUP/${PA_FILES[$i]}" ]; then
-            pa_atomic_install "$PA_BACKUP/${PA_FILES[$i]}" "$target" || failed=1
-        else
-            rm -f -- "$target" || failed=1
-        fi
+    pa_error '安装未完成，正在恢复安装前的脚本和提交记录...'
+    if [ "$PA_COMMIT_CHANGED" = 1 ]; then
+        pa_restore_target "$PA_BACKUP/commit" "$PA_STATE/commit" || failed=1
+    fi
+    for ((j=${#PA_CHANGED[@]} - 1; j >= 0; j--)); do
+        i=${PA_CHANGED[$j]}
+        pa_restore_target "$PA_BACKUP/${PA_FILES[$i]}" "${PA_TARGETS[$i]}" || failed=1
+    done
+    for ((j=${#PA_CREATED_DIRS[@]} - 1; j >= 0; j--)); do
+        rmdir -- "${PA_CREATED_DIRS[$j]}" 2>/dev/null || true
     done
     PA_TRANSACTION=0
     [ "$failed" = 0 ] || pa_error "部分文件恢复失败，原文件备份保留在 $PA_BACKUP"
@@ -253,50 +308,86 @@ pa_cleanup() {
     PA_STAGE=""
 }
 
-pa_install_bundle() {
-    local i target parent
+pa_check_targets() {
+    local i target
+    pa_safe_file_slot "$PA_STATE/commit" || return 1
     for i in "${!PA_FILES[@]}"; do
-        target=${PA_TARGETS[$i]}; parent=$(dirname -- "$target")
-        pa_safe_directory "$parent" || return 1
+        target=${PA_TARGETS[$i]}
+        pa_safe_directory "${target%/*}" || return 1
         pa_known_target "$target" "${PA_FILES[$i]}" || {
-            pa_error "路径已被无法识别的文件占用，已保留: $target"; return 1;
+            pa_error "路径已被无法识别或权限不安全的文件占用，已保留: $target"; return 1;
         }
     done
-    PA_BACKUP=$(mktemp -d "$PA_STATE/backup.XXXXXXXX") || return 1
+}
+
+pa_make_target_directory() {
+    local dir="$1"
+    [ ! -d "$dir" ] || return 0
+    pa_make_target_directory "${dir%/*}" || return 1
+    PA_CREATED_DIRS+=("$dir")
+    mkdir -- "$dir"
+}
+
+pa_publish_backup() {
+    local backup old_backup
+    # 自动维护只保留最新的 backup.*。仅在更新成功且安装前的
+    # 快照确实完整时才发布它，避免清理任务删除唯一可用的旧版。
+    pa_validate_bundle "$PA_BACKUP" >/dev/null 2>&1 || return 0
+    backup="$PA_STATE/backup.${PA_BACKUP##*.}"
+    if [ -e "$backup" ] || [ -L "$backup" ] || ! mv -T -- "$PA_BACKUP" "$backup"; then
+        pa_error "无法发布备份，原文件仍保留在 $PA_BACKUP"
+        return 0
+    fi
+    PA_BACKUP="$backup"
+    for old_backup in "$PA_STATE"/backup.*; do
+        [ "$old_backup" != "$PA_BACKUP" ] && [ -d "$old_backup" ] || continue
+        pa_safe_directory "$old_backup" || continue
+        rm -rf -- "$old_backup" || pa_error "无法清理旧备份: $old_backup"
+    done
+}
+
+pa_install_bundle() {
+    local i target file mode
+    pa_check_targets || return 1
+    PA_BACKUP=$(mktemp -d "$PA_STATE/rollback.XXXXXXXX") || return 1
+    mkdir -m 700 -- "$PA_BACKUP/lib" || return 1
     for i in "${!PA_FILES[@]}"; do
         target=${PA_TARGETS[$i]}
         if [ -e "$target" ]; then cp -p -- "$target" "$PA_BACKUP/${PA_FILES[$i]}" || return 1; fi
     done
+    if [ -e "$PA_STATE/commit" ]; then cp -p -- "$PA_STATE/commit" "$PA_BACKUP/commit" || return 1; fi
     PA_CHANGED=()
+    PA_CREATED_DIRS=()
+    PA_COMMIT_CHANGED=0
     PA_TRANSACTION=1
     for i in "${!PA_FILES[@]}"; do
-        target=${PA_TARGETS[$i]}
-        mkdir -p -- "$(dirname -- "$target")" || return 1
+        target=${PA_TARGETS[$i]}; file=${PA_FILES[$i]}
+        pa_make_target_directory "${target%/*}" || return 1
+        mode=700
+        [[ "$file" != lib/* ]] || mode=644
         PA_CHANGED+=("$i")
-        pa_atomic_install "$PA_STAGE/${PA_FILES[$i]}" "$target" || return 1
-    done
-    cp -- "$PA_STAGE/commit" "$PA_STATE/commit" || return 1
-    PA_TRANSACTION=0
-    local old_backup
-    for old_backup in "$PA_STATE"/backup.*; do
-        [ "$old_backup" != "$PA_BACKUP" ] && [ -d "$old_backup" ] || continue
-        pa_safe_directory "$old_backup" || continue
-        rm -rf -- "$old_backup" || return 1
+        pa_atomic_install "$PA_STAGE/$file" "$target" "$mode" || return 1
     done
     PROXYALL_MANAGED=1 bash "${PA_TARGETS[0]}" setup-maintenance 8>&- || {
-        pa_error '脚本已安装，但自动日志维护设置失败；请运行 sb setup-maintenance 重试。'
+        pa_error '自动日志维护设置失败，已停止更新；请检查错误后重试。'
         return 1
     }
+    PA_COMMIT_CHANGED=1
+    pa_atomic_install "$PA_STAGE/commit" "$PA_STATE/commit" 600 || return 1
+    PA_TRANSACTION=0
+    pa_publish_backup
     pa_info "脚本已配套安装。旧脚本备份: $PA_BACKUP"
     pa_info '现有节点、证书、Nginx 和 HAProxy 配置均保留。以后输入 proxyall 即可打开。'
 }
 
 pa_update() {
     local mode="${1:-ask}" i changed=0 answer
+    pa_check_targets || return 1
     pa_download_bundle || { pa_cleanup; return 1; }
     printf '\n  文件                   状态\n\n'
     for i in "${!PA_FILES[@]}"; do
-        if [ -f "${PA_TARGETS[$i]}" ] && cmp -s "$PA_STAGE/${PA_FILES[$i]}" "${PA_TARGETS[$i]}"; then
+        if { [[ ${PA_FILES[$i]} = lib/* ]] || [ -x "${PA_TARGETS[$i]}" ]; } &&
+            cmp -s "$PA_STAGE/${PA_FILES[$i]}" "${PA_TARGETS[$i]}"; then
             printf '  %-22s 已是仓库版本\n\n' "${PA_FILES[$i]}"
         else
             printf '  %-22s 待安装 / 有变化\n\n' "${PA_FILES[$i]}"
@@ -304,7 +395,7 @@ pa_update() {
         fi
     done
     if [ "$changed" = 0 ]; then
-        install -m 600 "$PA_STAGE/commit" "$PA_STATE/commit" || { pa_cleanup; return 1; }
+        pa_atomic_install "$PA_STAGE/commit" "$PA_STATE/commit" 600 || { pa_cleanup; return 1; }
         pa_cleanup
         return 0
     fi
@@ -324,7 +415,7 @@ pa_uninstall() {
     pa_info '只卸载 proxyall 入口；保留 sb、nginxproxy、组件、备份以及全部运行服务。'
     read -r -p '输入 UNINSTALL 确认，其他输入返回: ' answer || return 1
     [ "$answer" = UNINSTALL ] || return 0
-    if [ -L "$PA_COMMAND" ] || { [ -e "$PA_COMMAND" ] && ! grep -Fqx "$PA_MARKER" "$PA_COMMAND"; }; then
+    if ! pa_safe_directory "${PA_COMMAND%/*}" || ! pa_known_target "$PA_COMMAND" proxyall; then
         pa_error '入口文件不属于 proxyall，已保留。'; return 1
     fi
     rm -f -- "$PA_COMMAND" || return 1
@@ -334,7 +425,10 @@ pa_uninstall() {
 
 pa_run() {
     local component="$1" status=0
-    [ -f "$component" ] && bash -n "$component" || { pa_error '组件缺失或语法损坏，请先检查脚本更新。'; return 1; }
+    pa_libs_ready || { pa_incomplete_notice; return 1; }
+    pa_safe_directory "${component%/*}" && pa_trusted_file "$component" && bash -n "$component" || {
+        pa_error '组件缺失、不安全或语法损坏，请先检查脚本更新。'; return 1;
+    }
     # 必须作为子进程运行，避免 deploy 的 errexit/trap/变量污染统一菜单。
     # 只有菜单持锁；子脚本启动的后台服务不能继承这个文件描述符。
     shift
@@ -414,27 +508,35 @@ pa_setup_swap() (
 )
 
 pa_menu() {
-    local choice
+    local choice prompt
     while true; do
         printf '\n  ════════════════════════════════════\n'
         printf '       proxyall  %s\n\n' "$PROXYALL_VERSION"
-        printf '  1) Emby / 本机服务反代\n'
-        printf '  2) Xray 节点、分享链接与中转\n\n'
+        if pa_libs_ready; then
+            printf '  1) Emby / 本机服务反代\n'
+            printf '  2) Xray 节点、分享链接与中转\n\n'
+            prompt='0-7'
+        else
+            pa_incomplete_notice
+            prompt='0/3/4/7'
+        fi
         printf '  3) 检查脚本更新\n'
         printf '  4) 卸载统一入口（保留全部服务）\n'
-        printf '  5) 修复 Nginx HTTP/2 旧语法\n'
-        printf '  6) 证书管理\n'
+        if [ "$prompt" = '0-7' ]; then
+            printf '  5) 修复 Nginx HTTP/2 旧语法\n'
+            printf '  6) 证书管理\n'
+        fi
         printf '  7) 配置 1 GiB swap\n\n'
         printf '  0) 退出脚本\n'
         printf '  ════════════════════════════════════\n'
-        read -r -p '  请选择 [0-7]: ' choice || return 0
+        read -r -p "  请选择 [$prompt]: " choice || return 0
         case "$choice" in
-            1) pa_run /usr/local/bin/nginxproxy ;;
-            2) pa_run /usr/local/bin/sb ;;
+            1) pa_run "${PA_TARGETS[1]}" || true ;;
+            2) pa_run "${PA_TARGETS[0]}" || true ;;
             3) pa_update || true ;;
             4) pa_uninstall || true ;;
-            5) pa_run /usr/local/bin/nginxproxy --fix-http2 || true ;;
-            6) pa_run /usr/local/bin/nginxproxy --certificates || true ;;
+            5) pa_run "${PA_TARGETS[1]}" --fix-http2 || true ;;
+            6) pa_run "${PA_TARGETS[1]}" --certificates || true ;;
             7) pa_setup_swap || true ;;
             0) return 0 ;;
             *) pa_error '请输入 0-7。' ;;
@@ -443,7 +545,7 @@ pa_menu() {
 }
 
 main() {
-    local action="${1:-}" i missing=0
+    local action="${1:-}"
     [ "$#" -le 1 ] || { pa_error '参数过多，请只指定一个操作。'; pa_help >&2; return 2; }
     case "$action" in
         --version) printf '%s\n' "$PROXYALL_VERSION"; return 0 ;;
@@ -455,12 +557,13 @@ main() {
     [ "$(uname -s)" = Linux ] || { pa_error '此脚本用于 Linux VPS。'; return 1; }
     # 查看证书无需安装下载依赖；续期和归档由 nginxproxy 持配置写锁并复核证书引用。
     if [ "$action" = --certificates ]; then
-        pa_run /usr/local/bin/nginxproxy --certificates
+        pa_run "${PA_TARGETS[1]}" --certificates
         return $?
     fi
     pa_dependencies || return 1
     pa_prepare_state || return 1
-    trap pa_cleanup EXIT
+    trap 'pa_cleanup; exec 8>&-' EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     case "$action" in
@@ -468,10 +571,10 @@ main() {
         --install) pa_update install || return 1; pa_menu; return $? ;;
         --update) pa_update; return $? ;;
         --uninstall) pa_uninstall; return $? ;;
-        --fix-http2) pa_run /usr/local/bin/nginxproxy --fix-http2; return $? ;;
+        --fix-http2) pa_run "${PA_TARGETS[1]}" --fix-http2; return $? ;;
     esac
-    for i in "${!PA_TARGETS[@]}"; do [ -s "${PA_TARGETS[$i]}" ] || missing=1; done
-    if [ ! -f "$PA_STATE/commit" ] || [ "$missing" = 1 ]; then
+    # 三文件旧版更新已经写入 commit；库缺失时保留菜单中的显式更新入口。
+    if [ ! -e "$PA_COMMAND" ] && [ ! -L "$PA_COMMAND" ]; then
         pa_update install || return 1
     fi
     if [ ! -d /run/systemd/system ]; then

@@ -1,27 +1,51 @@
 #!/usr/bin/env bash
 
-# 所有组件固定先取配置写锁，再取 SNI/端口转发资源锁。
-_config_write_lock() {
-    local lock_file="${PROXYALL_WRITE_LOCK_FILE:-/run/lock/proxyall-config.lock}"
-    if [ "${PROXYALL_WRITE_LOCK_HELD:-}" = "$lock_file" ] && [ /dev/fd/8 -ef "$lock_file" ]; then
-        return 0
-    fi
-    if ! command -v flock >/dev/null 2>&1; then
-        if declare -F _pkg_install >/dev/null; then _pkg_install util-linux || return 1
-        elif command -v apk >/dev/null 2>&1; then apk add --no-cache util-linux || return 1
-        elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y util-linux || return 1
-        else echo '请先安装 util-linux（flock）；拒绝无锁修改配置。' >&2; return 1; fi
-        command -v flock >/dev/null 2>&1 || return 1
-    fi
-    mkdir -p "$(dirname "$lock_file")" || return 1
-    exec 8>"$lock_file" || return 1
-    flock -x -w 30 8 || { echo '配置正被其他管理进程修改，请稍后重试。' >&2; return 1; }
-    export PROXYALL_WRITE_LOCK_HELD="$lock_file"
+# NGINXPROXY_MANAGED_COMMAND=1
+
+# Keep this bootstrap in sync with sb.sh. Installed entries use only the
+# fixed library directory, even when reached through a symlink.
+_proxyall_trusted_lib_path() {
+    local path=$1 depth=${2:-0} owner mode link
+    (( depth < 40 )) || return 1
+    while :; do
+        if [[ -L $path ]]; then
+            [[ $(stat -c '%u' -- "$path") == 0 ]] || return 1
+            link=$(readlink -- "$path") || return 1
+            [[ $link == /* ]] || link="${path%/*}/$link"
+            _proxyall_trusted_lib_path "$link" "$((depth + 1))" || return 1
+        fi
+        read -r owner mode < <(stat -Lc '%u %a' -- "$path") || return 1
+        [[ $owner == 0 && $mode =~ ^[0-7]{3,4}$ ]] || return 1
+        (( (8#$mode & 0022) == 0 )) || return 1
+        [[ $path != / ]] || break
+        path=${path%/*}; path=${path:-/}
+    done
 }
 
+_proxyall_check_libraries() {
+    local dir=$1 name
+    [[ -d $dir && ! -L $dir ]] || return 1
+    for name in common.sh sni_router.sh; do
+        [[ -f $dir/$name && -r $dir/$name && ! -L $dir/$name ]] || return 1
+        if [[ $dir == /usr/local/lib/proxyall ]]; then
+            _proxyall_trusted_lib_path "$dir/$name" || return 1
+        fi
+        grep -Fqx -- "# PROXYALL_LIB=$name" "$dir/$name" || return 1
+    done
+}
 
-# NGINXPROXY_MANAGED_COMMAND=1
+_proxyall_entry=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || _proxyall_entry=
+_proxyall_lib_dir=/usr/local/lib/proxyall
+if [[ $_proxyall_entry == */deploy.sh && -f $_proxyall_entry && ! $_proxyall_entry -ef /usr/local/bin/nginxproxy ]]; then
+    _proxyall_lib_dir=${_proxyall_entry%/*}/lib
+fi
+if ! { _proxyall_check_libraries "$_proxyall_lib_dir" &&
+    source "$_proxyall_lib_dir/common.sh" && source "$_proxyall_lib_dir/sni_router.sh"; }; then
+    printf '配套库缺失或不可信（%s）。请运行 proxyall --install 或 proxyall --update，或从完整仓库运行。\n' "$_proxyall_lib_dir" >&2
+    return 1 2>/dev/null || exit 1
+fi
+unset _proxyall_entry _proxyall_lib_dir
+unset -f _proxyall_trusted_lib_path _proxyall_check_libraries
 
 # Nginx Emby reverse-proxy deployment script with optional HAProxy SNI sharing.
 # Supports multiple
@@ -61,22 +85,13 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.11.22-local22'
-SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
+SCRIPT_VERSION='2026.11.22-local23'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
 SNI_ROUTER_BIN='/usr/local/bin/sb'
-SNI_ROUTER_API_VERSION='1'
 SNI_ROUTER_OWNER='nginx-proxy'
-SNI_ROUTER_PUBLIC_PORT='443'
 SNI_ROUTER_BACKEND_HOST='127.0.0.1'
-SNI_ROUTER_BACKEND_PORT='8444'
-SNI_ROUTER_STATE_DIR='/var/lib/sb-sni-router'
-SNI_ROUTER_STATE_FILE="${SNI_ROUTER_STATE_DIR}/state.json"
-SNI_ROUTER_LOCK_FILE='/run/lock/sb-sni-router.lock'
-SNI_ROUTER_HAPROXY_CONF='/etc/haproxy/haproxy.cfg'
-SNI_ROUTER_HAPROXY_BACKUP_DIR='/etc/haproxy/backup'
-SNI_ROUTER_MARKER='# Managed by singbox-lite SNI router'
+SNI_ROUTER_BACKEND_PORT=$SNI_ROUTER_HTTPS_BACKEND_PORT
 TRANSFER_SCHEMA='nginxproxy-links'
 TRANSFER_VERSION=2
 
@@ -109,7 +124,6 @@ domain_to_remove=''
 install_command_only='no'
 fix_http2_only='no'
 certificates_only='no'
-script_update_performed='no'
 force_yes='no'
 no_proxy_redirect='no'
 upstream_tls_verify='yes'
@@ -213,68 +227,7 @@ current_script_path() {
 }
 
 install_quick_command() {
-    local source_path source_real target_real install_tmp
-    source_path=${1:-}
-    if [[ -z $source_path ]]; then
-        if ! source_path=$(current_script_path); then
-            log_error '当前脚本不是普通本地文件，无法安全安装快捷命令。'
-            log_error '请先下载 deploy.sh，通过 Bash 语法校验后再安装到 /usr/local/bin/nginxproxy。'
-            return 1
-        fi
-    fi
-
-    if ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$source_path" || ! bash -n "$source_path"; then
-        log_error '当前脚本缺少管理标记或 Bash 语法校验失败，拒绝安装快捷命令。'
-        return 1
-    fi
-
-    source_real=$(readlink -f -- "$source_path" 2>/dev/null || printf '%s\n' "$source_path")
-    if [[ -L $QUICK_COMMAND_PATH ]]; then
-        log_error "快捷命令路径是符号链接，拒绝覆盖: $QUICK_COMMAND_PATH"
-        return 1
-    fi
-    if [[ -e $QUICK_COMMAND_PATH ]]; then
-        target_real=$(readlink -f -- "$QUICK_COMMAND_PATH" 2>/dev/null || printf '%s\n' "$QUICK_COMMAND_PATH")
-        if [[ $source_real == "$target_real" ]]; then
-            chmod 700 -- "$QUICK_COMMAND_PATH"
-            log_success "快捷命令已就绪: nginxproxy"
-            return 0
-        fi
-        if [[ ! -f $QUICK_COMMAND_PATH ]] || ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$QUICK_COMMAND_PATH"; then
-            log_error "路径已被其他文件占用，拒绝覆盖: $QUICK_COMMAND_PATH"
-            return 1
-        fi
-    fi
-
-    install_tmp=$(mktemp "${QUICK_COMMAND_PATH}.tmp.XXXXXXXXXX") || return 1
-    if ! install -m 700 -- "$source_path" "$install_tmp" || ! mv -f -- "$install_tmp" "$QUICK_COMMAND_PATH"; then
-        rm -f -- "$install_tmp"
-        log_error "安装快捷命令失败: $QUICK_COMMAND_PATH"
-        return 1
-    fi
-    log_success "快捷命令已安装: nginxproxy"
-}
-
-ensure_quick_command() {
-    if [[ -L $QUICK_COMMAND_PATH ]]; then
-        log_warn "快捷命令路径是符号链接，已跳过自动安装: $QUICK_COMMAND_PATH"
-        return 0
-    fi
-    if [[ -e $QUICK_COMMAND_PATH ]]; then
-        if [[ -f $QUICK_COMMAND_PATH ]] && grep -Fqx -- "$QUICK_COMMAND_MARKER" "$QUICK_COMMAND_PATH"; then
-            chmod 700 -- "$QUICK_COMMAND_PATH" || log_warn "无法修复快捷命令权限: $QUICK_COMMAND_PATH"
-        else
-            log_warn "快捷命令路径已被其他文件占用，已保留原文件: $QUICK_COMMAND_PATH"
-        fi
-        return 0
-    fi
-
-    if [[ ! -f ${BASH_SOURCE[0]} ]]; then
-        log_warn '当前通过管道或进程替换运行，已跳过自动安装 nginxproxy。'
-        return 0
-    fi
-    log_info '正在安装快捷命令 nginxproxy...'
-    install_quick_command || log_warn '快捷命令安装失败，但不会影响本次反代配置。'
+    _proxyall_require_bundle_install
 }
 
 show_help() {
@@ -307,7 +260,7 @@ show_help() {
       --version                显示脚本版本
 
 管理选项:
-      --install-command        将当前脚本安装为 /usr/local/bin/nginxproxy
+      --install-command        显示配套安装指引（proxyall --install）
       --fix-http2              备份并修复受管 Nginx 配置的 HTTP/2 旧语法
       --certificates           管理现有证书（查看、检查、续期、归档清理）
       --remove <URL>           删除指定前端 URL 的配置及其独占证书/续期记录
@@ -344,89 +297,8 @@ version_at_least() {
     [[ $(printf '%s\n%s\n' "$required" "$current" | sort -V | head -n 1) == "$required" ]]
 }
 
-download_script_update() {
-    local destination=$1
-    local update_url="${SCRIPT_DOWNLOAD_URL}?v=$(date +%s)"
-
-    rm -f -- "$destination"
-    if command -v curl >/dev/null 2>&1 && \
-       curl -LfsS --connect-timeout 15 --max-time 120 "$update_url" -o "$destination"; then
-        return 0
-    fi
-    rm -f -- "$destination"
-    if command -v wget >/dev/null 2>&1 && \
-       wget -q --timeout=120 -O "$destination" "$update_url"; then
-        return 0
-    fi
-    rm -f -- "$destination"
-    log_error '脚本下载失败，请检查网络以及 GitHub 连接。'
-    return 1
-}
-
-validate_script_update() {
-    local candidate=$1
-    local candidate_version
-
-    if [[ ! -s $candidate ]] || ! head -n 1 "$candidate" | grep -Fqx '#!/usr/bin/env bash'; then
-        log_error '下载内容不是有效的 deploy.sh，已拒绝更新。'
-        return 1
-    fi
-    if ! grep -Fqx -- "$QUICK_COMMAND_MARKER" "$candidate"; then
-        log_error '下载内容缺少脚本管理标记，已拒绝更新。'
-        return 1
-    fi
-    candidate_version=$(sed -n "s/^SCRIPT_VERSION='\([^']*\)'.*/\1/p" "$candidate" | head -n 1)
-    if [[ -z $candidate_version ]] || ! bash -n "$candidate"; then
-        log_error '下载脚本的版本号无效或 Bash 语法校验失败，已拒绝更新。'
-        return 1
-    fi
-    printf '%s\n' "$candidate_version"
-}
-
 update_script() {
-    if [[ ${PROXYALL_MANAGED:-0} == 1 ]]; then
-        log_info '请返回 proxyall 主菜单选择【检查脚本更新】，统一更新配套组件。'
-        return 0
-    fi
-    local candidate candidate_version answer
-    candidate=$(mktemp) || return 1
-    script_update_performed='no'
-    log_info "正在检查更新，当前版本: ${SCRIPT_VERSION}"
-
-    if ! download_script_update "$candidate"; then
-        rm -f -- "$candidate"
-        return 1
-    fi
-    if ! candidate_version=$(validate_script_update "$candidate"); then
-        rm -f -- "$candidate"
-        return 1
-    fi
-
-    if [[ $candidate_version == "$SCRIPT_VERSION" ]]; then
-        rm -f -- "$candidate"
-        log_success "当前已是最新版本: ${SCRIPT_VERSION}"
-        return 0
-    fi
-    if version_at_least "$SCRIPT_VERSION" "$candidate_version"; then
-        rm -f -- "$candidate"
-        log_warn "本地版本 ${SCRIPT_VERSION} 高于远端版本 ${candidate_version}，已跳过降级。"
-        return 0
-    fi
-
-    echo "发现新版本: ${SCRIPT_VERSION} -> ${candidate_version}"
-    read -r -p '是否立即更新？[Y/n]: ' answer
-    if [[ $answer =~ ^[Nn]$ ]]; then
-        rm -f -- "$candidate"
-        log_info '已取消更新。'
-        return 0
-    fi
-    if ! install_quick_command "$candidate"; then
-        rm -f -- "$candidate"
-        return 1
-    fi
-    rm -f -- "$candidate"
-    script_update_performed='yes'
-    log_success "脚本已更新: ${SCRIPT_VERSION} -> ${candidate_version}"
+    _proxyall_require_bundle_install
 }
 
 uninstall_quick_command() {
@@ -468,404 +340,59 @@ has_systemd() {
     [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
 }
 
-local_sni_router_lock() {
-    command -v flock >/dev/null 2>&1 || {
-        log_error '缺少 flock，无法安全修改 HAProxy SNI 路由状态。'
-        return 1
-    }
-    mkdir -p "$(dirname "$SNI_ROUTER_LOCK_FILE")" || return 1
-    _config_write_lock || return 1
-    exec 9>"$SNI_ROUTER_LOCK_FILE" || return 1
-    flock -x -w 30 9 || { log_error 'SNI 路由正被其他进程修改，请稍后重试。'; return 1; }
-}
-
-local_sni_router_init_state() {
-    mkdir -p "$SNI_ROUTER_STATE_DIR" || return 1
-    chmod 700 "$SNI_ROUTER_STATE_DIR" 2>/dev/null || true
-    if [[ ! -e $SNI_ROUTER_STATE_FILE ]]; then
-        if [[ -L $SNI_ROUTER_STATE_FILE ]] || grep -Fxq -- "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF" 2>/dev/null; then
-            log_error "SNI 路由状态丢失，拒绝重新初始化: $SNI_ROUTER_STATE_FILE"
-            return 1
-        fi
-        local tmp
-        tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXXXXXX") || return 1
-        if ! jq -n --argjson version "$SNI_ROUTER_API_VERSION" --argjson port "$SNI_ROUTER_PUBLIC_PORT" \
-            '{version:$version,public_port:$port,reality:null,https_backend:null,https_routes:{}}' > "$tmp" ||
-           ! mv -- "$tmp" "$SNI_ROUTER_STATE_FILE"; then
-            rm -f -- "$tmp"
-            return 1
-        fi
-    fi
-    if ! jq -se --argjson version "$SNI_ROUTER_API_VERSION" '
-        def port: type == "number" and . >= 1 and . <= 65535 and . == floor;
-        def sni: type == "string" and test("^[a-z0-9][a-z0-9.-]*\\z"; "i") and contains(".");
-        length == 1 and (.[0] |
-            .version == $version and (.public_port | port) and
-            (.reality | . == null or (.backend_host == "127.0.0.1" and (.backend_port | port) and (.sni | sni))) and
-            (.https_routes | type == "object" and all(keys[]; sni)) and
-            ((.https_routes | length) == 0 or
-                (.https_backend | .host == "127.0.0.1" and (.port | port))) and
-            (.tls_routes | . == null or type == "object"))
-    ' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
-        log_error "SNI 路由状态损坏或版本不兼容: $SNI_ROUTER_STATE_FILE"
-        return 1
-    fi
-    # 独立兜底渲染器不支持 sb 的额外 TLS 路由，不能重写后使它们消失。
-    if ! jq -e '.tls_routes == null or .tls_routes == {}' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
-        log_error '存在由 sb 管理的 TLS SNI 路由。请先恢复 /usr/local/bin/sb，再管理反代。'
-        return 1
-    fi
-}
-
-local_sni_router_state_has_routes() {
-    jq -e '(.reality != null) or ((.https_routes | length) > 0)' \
-        "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1
-}
-
-local_sni_router_validate_port() {
-    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && [[ $1 -le 65535 ]]
-}
-
-local_sni_router_prepare_haproxy() {
+# nginxproxy runs as root. Keep local calls in this shell so the shared
+# router can hold the same file-descriptor locks as sb.
+_sni_router_error() { log_error "$@"; }
+_sni_router_info() { log_info "$@"; }
+_sni_router_status_has_systemd() { has_systemd; }
+_sni_router_validate_https_sni() { is_valid_dns_name "$1"; }
+_sni_router_require_systemd() {
     has_systemd || { log_error 'HAProxy SNI 分流当前仅支持 systemd。'; return 1; }
-    command -v haproxy >/dev/null 2>&1 || {
-        log_error '未安装 HAProxy；请重新运行脚本以完成依赖安装。'
-        return 1
-    }
-
-    mkdir -p "$(dirname "$SNI_ROUTER_HAPROXY_CONF")" "$SNI_ROUTER_HAPROXY_BACKUP_DIR" || return 1
-    chmod 700 "$SNI_ROUTER_HAPROXY_BACKUP_DIR" 2>/dev/null || true
-    if [[ -f $SNI_ROUTER_HAPROXY_CONF ]] && ! grep -Fxq -- "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF"; then
-        if grep -Eq '^[[:space:]]*(frontend|listen)[[:space:]]' "$SNI_ROUTER_HAPROXY_CONF"; then
-            log_error "检测到非 sb.sh/nginxproxy 管理的 HAProxy 前端，拒绝覆盖: $SNI_ROUTER_HAPROXY_CONF"
-            log_error '请先手动整合现有 HAProxy 配置。'
-            return 1
-        fi
-        cp -a -- "$SNI_ROUTER_HAPROXY_CONF" \
-            "${SNI_ROUTER_HAPROXY_BACKUP_DIR}/haproxy.cfg.$(date +%Y%m%d_%H%M%S).$$" || return 1
-    fi
 }
-
-local_sni_router_generate_haproxy_config() {
-    local output=$1 public_port reality_host reality_port https_host https_port route_count
-    public_port=$(jq -r '.public_port' "$SNI_ROUTER_STATE_FILE")
-    reality_host=$(jq -r '.reality.backend_host // empty' "$SNI_ROUTER_STATE_FILE")
-    reality_port=$(jq -r '.reality.backend_port // empty' "$SNI_ROUTER_STATE_FILE")
-    https_host=$(jq -r '.https_backend.host // empty' "$SNI_ROUTER_STATE_FILE")
-    https_port=$(jq -r '.https_backend.port // empty' "$SNI_ROUTER_STATE_FILE")
-    route_count=$(jq -r '.https_routes | length' "$SNI_ROUTER_STATE_FILE")
-
-    local_sni_router_validate_port "$public_port" || { log_error 'HAProxy 公网监听端口无效。'; return 1; }
-    if (( route_count > 0 )) && { [[ -z $https_host ]] || ! local_sni_router_validate_port "$https_port"; }; then
-        log_error 'SNI 路由状态缺少有效的 HTTPS 后端。'
-        return 1
-    fi
-    if [[ -n $reality_host ]] && ! local_sni_router_validate_port "$reality_port"; then
-        log_error 'SNI 路由状态中的 Reality 后端端口无效。'
-        return 1
-    fi
-
-    {
-        echo "$SNI_ROUTER_MARKER"
-        echo '# TLS remains end-to-end; HAProxy only inspects ClientHello SNI.'
-        cat <<'EOF_HAPROXY_GLOBAL'
-global
-    log /dev/log local0
-    log /dev/log local1 notice
-    user haproxy
-    group haproxy
-    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
-
-defaults
-    log global
-    mode tcp
-    option tcplog
-    timeout connect 5s
-    timeout client 1h
-    timeout server 1h
-
-frontend sb_sni_443
-EOF_HAPROXY_GLOBAL
-        echo "    bind 0.0.0.0:${public_port}"
-        if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && \
-           [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) == 0 ]]; then
-            echo "    bind [::]:${public_port} v6only"
-        fi
-        cat <<'EOF_HAPROXY_INSPECT'
-    tcp-request inspect-delay 5s
-    acl sb_tls_client_hello req.ssl_hello_type 1
-EOF_HAPROXY_INSPECT
-
-        local domain index=0 conditions='' i
-        while IFS= read -r domain; do
-            [[ -n $domain ]] || continue
-            echo "    acl sb_https_${index} req.ssl_sni -i ${domain}"
-            ((index += 1))
-        done < <(jq -r '.https_routes | keys[]?' "$SNI_ROUTER_STATE_FILE")
-
-        if [[ -z $reality_host && -z $reality_port ]] && (( index > 0 )); then
-            for ((i = 0; i < index; i++)); do
-                conditions+=" !sb_https_${i}"
-            done
-            echo "    tcp-request content reject if sb_tls_client_hello${conditions}"
-        fi
-        echo '    tcp-request content accept if sb_tls_client_hello'
-        for ((i = 0; i < index; i++)); do
-            echo "    use_backend sb_https_backend if sb_https_${i}"
-        done
-        if [[ -n $reality_host && -n $reality_port ]]; then
-            echo '    default_backend sb_reality_backend'
-        fi
-
-        if (( index > 0 )); then
-            cat <<EOF_HAPROXY_HTTPS
-
-backend sb_https_backend
-    server nginx ${https_host}:${https_port} send-proxy-v2
-EOF_HAPROXY_HTTPS
-        fi
-        if [[ -n $reality_host && -n $reality_port ]]; then
-            cat <<EOF_HAPROXY_REALITY
-
-backend sb_reality_backend
-    server reality ${reality_host}:${reality_port}
-EOF_HAPROXY_REALITY
-        fi
-    } > "$output"
+_sni_router_install_haproxy() {
+    log_error '未安装 HAProxy；请重新运行脚本以完成依赖安装。'
+    return 1
 }
-
-local_sni_router_apply() {
-    local_sni_router_init_state || return 1
-    if ! local_sni_router_state_has_routes; then
-        if grep -Fxq -- "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF" 2>/dev/null; then
-            local was_active=no was_enabled=no
-            if systemctl is-active --quiet haproxy; then was_active=yes; fi
-            if systemctl is-enabled --quiet haproxy; then was_enabled=yes; fi
-            if ! systemctl disable --now haproxy; then
-                log_error '无法停用 HAProxy，路由操作失败。'
-                if [[ $was_enabled == yes ]]; then systemctl enable haproxy || log_error '无法恢复 HAProxy 开机启动。'; fi
-                if [[ $was_active == yes ]]; then systemctl start haproxy || log_error '无法恢复 HAProxy 服务。'; fi
-                return 1
-            fi
-        fi
-        return 0
-    fi
-    local_sni_router_prepare_haproxy || return 1
-
-    local new_conf old_conf had_old=no action=start
-    new_conf=$(mktemp) || return 1
-    if ! local_sni_router_generate_haproxy_config "$new_conf" || ! haproxy -c -f "$new_conf"; then
-        log_error 'HAProxy 配置验证失败，未安装新配置。'
-        rm -f -- "$new_conf"
-        return 1
-    fi
-    if systemctl is-active --quiet haproxy; then
-        action=reload
-        if cmp -s "$new_conf" "$SNI_ROUTER_HAPROXY_CONF"; then
-            rm -f -- "$new_conf"
-            return 0
-        fi
-    fi
-    old_conf=$(mktemp "${SNI_ROUTER_HAPROXY_CONF}.rollback.XXXXXX") || { rm -f -- "$new_conf"; return 1; }
-    if [[ -f $SNI_ROUTER_HAPROXY_CONF ]]; then
-        cp -a -- "$SNI_ROUTER_HAPROXY_CONF" "$old_conf" || { rm -f -- "$new_conf" "$old_conf"; return 1; }
-        had_old=yes
-    fi
-    if ! install -m 640 "$new_conf" "${SNI_ROUTER_HAPROXY_CONF}.new" ||
-       ! mv -- "${SNI_ROUTER_HAPROXY_CONF}.new" "$SNI_ROUTER_HAPROXY_CONF"; then
-        rm -f -- "$new_conf" "$old_conf" "${SNI_ROUTER_HAPROXY_CONF}.new"
-        return 1
-    fi
-    rm -f -- "$new_conf"
-
-    if ! systemctl "$action" haproxy; then
-        log_error 'HAProxy 加载失败，正在恢复上一份配置。'
-        local config_restored=yes
-        if [[ $had_old == yes ]]; then
-            if ! mv -- "$old_conf" "$SNI_ROUTER_HAPROXY_CONF"; then
-                log_error "无法恢复 HAProxy 配置，备份保留在 $old_conf"
-                config_restored=no
-            fi
-        else
-            rm -f -- "$old_conf"
-            if ! rm -f -- "$SNI_ROUTER_HAPROXY_CONF"; then
-                log_error "无法移除失败的 HAProxy 配置: $SNI_ROUTER_HAPROXY_CONF"
-                config_restored=no
-            fi
-        fi
-        if [[ $action == reload && $had_old == yes && $config_restored == yes ]]; then
-            if systemctl restart haproxy; then return 1; fi
-            log_error '恢复旧配置后 HAProxy 重启失败，将停止服务。'
-        fi
-        systemctl stop haproxy || log_error '无法停止 HAProxy，请检查当前运行配置。'
-        return 1
-    fi
-    rm -f -- "$old_conf"
-    systemctl enable haproxy >/dev/null 2>&1 || true
+_sni_router_prepare() {
+    _sni_router_require_systemd || return 1
+    _sni_router_prepare_routes
 }
-
-# 调用方持有路由锁。apply 自行恢复 HAProxy 配置及服务，这里只恢复路由状态。
-local_sni_router_update_state() {
-    local backup tmp
-    backup=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.rollback.XXXXXX") || return 1
-    tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || { rm -f -- "$backup"; return 1; }
-    if ! cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" ||
-       ! jq "$@" "$SNI_ROUTER_STATE_FILE" > "$tmp" ||
-       ! mv -- "$tmp" "$SNI_ROUTER_STATE_FILE"; then
-        rm -f -- "$backup" "$tmp"
-        return 1
-    fi
-    if ! local_sni_router_apply; then
-        mv -- "$backup" "$SNI_ROUTER_STATE_FILE" || log_error "无法恢复 SNI 状态，备份保留在 $backup"
-        return 1
-    fi
-    rm -f -- "$backup"
-}
-
-local_sni_router_register_https() (
-    local owner=$1 sni=${2,,} backend_port=$3
-    is_valid_dns_name "$sni" || { log_error "HTTPS SNI 格式无效: $sni"; return 1; }
-    local_sni_router_validate_port "$backend_port" || { log_error 'HTTPS 后端端口无效。'; return 1; }
-    local_sni_router_lock || return 1
-    local_sni_router_init_state || return 1
-
-    local existing_owner existing_port reality_sni
-    existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
-    if [[ -n $existing_owner && $existing_owner != "$owner" ]]; then
-        log_error "SNI ${sni} 已由 ${existing_owner} 登记。"
-        return 1
-    fi
-    reality_sni=$(jq -r '.reality.sni // empty' "$SNI_ROUTER_STATE_FILE")
-    if [[ -n $reality_sni && ${reality_sni,,} == "$sni" ]]; then
-        log_error "HTTPS SNI ${sni} 与 Reality SNI 相同；两者必须使用不同域名。"
-        return 1
-    fi
-    existing_port=$(jq -r '.https_backend.port // empty' "$SNI_ROUTER_STATE_FILE")
-    if [[ -n $existing_port && $existing_port != "$backend_port" ]]; then
-        log_error "现有 HTTPS 后端为 127.0.0.1:${existing_port}，拒绝混用 ${backend_port}。"
-        return 1
-    fi
-
-    local_sni_router_update_state --arg owner "$owner" --arg sni "$sni" --argjson port "$backend_port" \
-        '.https_backend={host:"127.0.0.1",port:$port} | .https_routes[$sni]={owner:$owner}'
-)
-
-local_sni_router_remove_https() (
-    local owner=$1 sni=${2,,}
-    local_sni_router_lock || return 1
-    local_sni_router_init_state || return 1
-
-    local existing_owner
-    existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
-    [[ -n $existing_owner ]] || return 0
-    if [[ -n $owner && $owner != "$existing_owner" ]]; then
-        log_error "SNI ${sni} 属于 ${existing_owner}，拒绝由 ${owner} 删除。"
-        return 1
-    fi
-
-    local_sni_router_update_state --arg sni "$sni" \
-        'del(.https_routes[$sni]) | if (.https_routes|length)==0 then .https_backend=null else . end'
-)
-
-local_sni_router_status() {
-    local_sni_router_init_state || return 1
-    echo "SNI_ROUTER_API_VERSION=${SNI_ROUTER_API_VERSION}"
-    jq -r '
-        . as $root |
-        "public=:" + (.public_port|tostring),
-        (if .reality then "reality=" + .reality.sni + " -> " + .reality.backend_host + ":" + (.reality.backend_port|tostring) else "reality=未登记" end),
-        (if (.https_routes|length)>0 then (.https_routes|to_entries[]|"https="+.key+" -> "+$root.https_backend.host+":"+($root.https_backend.port|tostring)+" ("+.value.owner+")") else "https=未登记" end)
-    ' "$SNI_ROUTER_STATE_FILE"
-    if has_systemd && systemctl is-active haproxy >/dev/null 2>&1; then
-        echo 'haproxy=active'
-    else
-        echo 'haproxy=inactive'
-    fi
-}
-
-local_sni_router_check() {
-    local_sni_router_init_state || return 1
-    if local_sni_router_state_has_routes; then
-        command -v haproxy >/dev/null 2>&1 || { log_error '未安装 HAProxy。'; return 1; }
-        local tmp status
-        tmp=$(mktemp) || return 1
-        local_sni_router_generate_haproxy_config "$tmp" || { rm -f "$tmp"; return 1; }
-        if haproxy -c -f "$tmp"; then
-            status=0
-        else
-            status=$?
-        fi
-        rm -f "$tmp"
-        return "$status"
-    fi
-    log_info 'SNI 路由尚未登记任何后端。'
-}
-
-local_sni_router_call() (
-    local action=${1:-status}
-    shift || true
-    if [[ $action != api-version ]]; then _config_write_lock || return 1; fi
-    case $action in
-        api-version) printf '%s\n' "$SNI_ROUTER_API_VERSION" ;;
-        status) local_sni_router_status ;;
-        check) local_sni_router_check ;;
-        prepare)
-            has_systemd || { log_error 'HAProxy SNI 分流当前仅支持 systemd。'; return 1; }
-            local_sni_router_init_state || return 1
-            if local_sni_router_state_has_routes; then
-                local_sni_router_apply
-            else
-                log_info '未检测到 sb.sh，将由 nginxproxy 初始化 HAProxy SNI 分流。'
-            fi
-            ;;
-        register-https)
-            [[ $# -eq 3 ]] || { log_error '内部错误：register-https 参数数量无效。'; return 2; }
-            local_sni_router_register_https "$1" "$2" "$3"
-            ;;
-        remove-https)
-            [[ $# -eq 2 ]] || { log_error '内部错误：remove-https 参数数量无效。'; return 2; }
-            local_sni_router_remove_https "$1" "$2"
-            ;;
-        *)
-            log_error "nginxproxy 内置 SNI 路由器不支持操作: $action"
-            return 2
-            ;;
-    esac
-)
 
 sni_router_call() {
     local api
     if [[ -x $SNI_ROUTER_BIN ]]; then
-        api=$($SNI_ROUTER_BIN sni-router api-version 2>/dev/null || true)
+        api=$("$SNI_ROUTER_BIN" sni-router api-version 2>/dev/null || true)
         if [[ $api != "$SNI_ROUTER_API_VERSION" ]]; then
             log_error "sb SNI 路由接口不兼容（需要 ${SNI_ROUTER_API_VERSION}，实际 ${api:-不可用}）。"
             return 1
         fi
-        $SNI_ROUTER_BIN sni-router "$@"
+        "$SNI_ROUTER_BIN" sni-router "$@"
     else
-        local_sni_router_call "$@"
+        local sni_router_standalone=yes
+        _sni_router_cli "$@"
     fi
 }
 
 prepare_sni_router() {
-    local status route
+    local status route found=no
     sni_router_call prepare || return 1
     status=$(sni_router_call status) || return 1
     while IFS= read -r route; do
-        case "$route" in
+        case "${route,,}" in
             "reality=${you_domain,,} -> "*|"tls=${you_domain,,} -> "*)
                 log_error "域名 ${you_domain,,} 已被 Reality/TLS 节点使用，请为反代选择不同子域名。"
                 return 1
                 ;;
             "https=${you_domain,,} -> "*)
-                if [[ $route != "https=${you_domain,,} -> ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT} (${SNI_ROUTER_OWNER})" ]]; then
+                if [[ ${route#* -> } != "${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT} (${SNI_ROUTER_OWNER})" ]]; then
                     log_error "该域名已有不同的 HTTPS 路由，拒绝覆盖: $route"
                     return 1
                 fi
+                found=yes
                 ;;
         esac
     done <<<"$status"
-    if grep -Fqx "https=${you_domain,,} -> ${SNI_ROUTER_BACKEND_HOST}:${SNI_ROUTER_BACKEND_PORT} (${SNI_ROUTER_OWNER})" <<<"$status"; then
+    if [[ $found == yes ]]; then
         sni_route_preexisting=yes
     fi
 }
@@ -1168,15 +695,7 @@ get_resolver_host() {
     fi
 }
 
-is_valid_ipv4() {
-    local address=$1 octet
-    local -a octets=()
-    [[ $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    IFS='.' read -r -a octets <<<"$address"
-    for octet in "${octets[@]}"; do
-        (( 10#$octet <= 255 )) || return 1
-    done
-}
+is_valid_ipv4() { _proxyall_valid_ipv4 "$@"; }
 
 is_valid_ipv6() {
     local address=$1 left='' right='' part remainder
@@ -3516,10 +3035,7 @@ main_menu() {
                 pause_for_menu
                 ;;
             5)
-                if update_script && [[ $script_update_performed == yes ]]; then
-                    log_info '正在重新载入新版脚本...'
-                    exec "$QUICK_COMMAND_PATH"
-                fi
+                update_script || true
                 pause_for_menu
                 ;;
             6)
@@ -4052,12 +3568,9 @@ main() {
     fi
 
     if [[ $install_command_only == yes ]]; then
-        if ! install_quick_command; then
-            exit 1
-        fi
-        exit 0
+        install_quick_command || return 1
+        return 0
     fi
-    ensure_quick_command
     if [[ -f $SNI_ROUTER_BIN ]] && grep -Fqx '# SB_MANAGER_MANAGED_COMMAND=1' "$SNI_ROUTER_BIN" && \
        grep -q '^_configure_runtime_log_rotation()' "$SNI_ROUTER_BIN"; then
         bash "$SNI_ROUTER_BIN" setup-maintenance || log_warn '自动日志维护设置失败，请运行 sb setup-maintenance 重试。'

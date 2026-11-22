@@ -12,7 +12,8 @@ PINS = {
     'advanced_relay.sh': {'PARSER_SHA256': 'parser.sh'},
     'sb.sh': {'PARSER_SHA256': 'parser.sh', 'ADVANCED_RELAY_SHA256': 'advanced_relay.sh'},
     'proxyall': {'PARSER_SHA256': 'parser.sh', 'RELAY_SHA256': 'advanced_relay.sh',
-                 'SB_SHA256': 'sb.sh', 'DEPLOY_SHA256': 'deploy.sh'},
+                 'SB_SHA256': 'sb.sh', 'DEPLOY_SHA256': 'deploy.sh',
+                 'COMMON_SHA256': 'lib/common.sh', 'SNI_ROUTER_SHA256': 'lib/sni_router.sh'},
 }
 
 

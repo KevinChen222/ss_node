@@ -9,6 +9,17 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+BUNDLE_FILES = ('sb.sh', 'deploy.sh', 'proxyall', 'lib/common.sh', 'lib/sni_router.sh')
+
+
+def copy_files(source, target, names):
+    for name in names:
+        path = target / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copyfile(source / name, path)
+        path.chmod(0o644)
+
+
 HARNESS = r'''
 source "$REPO/proxyall"
 # Model trusted system ancestors around the temporary fixture.
@@ -54,15 +65,36 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('proxyall --install', result.stdout)
 
     def test_bundle_hashes(self):
-        self.shell('pa_validate_bundle "$REPO"')
+        copy_files(REPO, self.root, BUNDLE_FILES)
+        self.shell('pa_validate_bundle "$WORK"')
         subprocess.run([sys.executable, REPO / 'tools/component_pins.py'], check=True)
+
+    def test_bundle_rejects_untrusted_library_sources(self):
+        copy_files(REPO, self.root, BUNDLE_FILES)
+        lib = self.root / 'lib'
+        for name in ('common.sh', 'sni_router.sh'):
+            with self.subTest(name=name):
+                path = lib / name
+                original = path.read_bytes()
+                path.write_bytes(original + b'\n# changed\n')
+                self.shell('pa_validate_bundle "$WORK"', ok=False)
+                path.write_bytes(original)
+                path.chmod(0o666)
+                self.shell('pa_validate_bundle "$WORK"', ok=False)
+                path.unlink()
+                path.symlink_to(REPO / 'lib' / name)
+                self.shell('pa_validate_bundle "$WORK"', ok=False)
+                path.unlink()
+                path.write_bytes(original)
+        lib.rename(self.root / 'saved-lib')
+        lib.symlink_to(self.root / 'saved-lib')
+        self.shell('pa_validate_bundle "$WORK"', ok=False)
 
     def test_refresh_transitive_component_pins(self):
         tool = self.root / 'tools/component_pins.py'
         tool.parent.mkdir()
         shutil.copyfile(REPO / 'tools/component_pins.py', tool)
-        for name in ('sb.sh', 'deploy.sh', 'advanced_relay.sh', 'parser.sh', 'proxyall'):
-            shutil.copyfile(REPO / name, self.root / name)
+        copy_files(REPO, self.root, (*BUNDLE_FILES, 'advanced_relay.sh', 'parser.sh'))
         with (self.root / 'parser.sh').open('a') as parser:
             parser.write('\n# fixture\n')
         cmd = [sys.executable, tool]
@@ -72,13 +104,23 @@ class InstallerTests(unittest.TestCase):
         subprocess.run(cmd + ['--write'], check=True, capture_output=True)
         subprocess.run(cmd, check=True)
         self.shell('pa_validate_bundle "$WORK"')
+        for name in ('lib/common.sh', 'lib/sni_router.sh'):
+            with (self.root / name).open('a') as library:
+                library.write('\n# fixture\n')
+            check = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(check.returncode, 1)
+            self.assertEqual(check.stdout.splitlines(), ['proxyall'])
+            subprocess.run(cmd + ['--write'], check=True, capture_output=True)
+            self.shell('pa_validate_bundle "$WORK"')
 
     def test_unmarked_scripts_recognized_without_execution(self):
         for name, marker in (('sb.sh', '# SB_MANAGER_MANAGED_COMMAND=1'),
                              ('deploy.sh', '# NGINXPROXY_MANAGED_COMMAND=1')):
-            text = (REPO / name).read_text().replace(marker + '\n', '')
+            text = subprocess.check_output(['git', 'show', f'52431e5:{name}'], cwd=REPO, text=True)
+            text = text.replace(marker + '\n', '')
             target = self.root / name
             target.write_text('touch "$WORK/executed"\n' + text)
+            target.chmod(0o644)
             self.shell(f'pa_known_target "$WORK/{name}" {name}')
             self.assertFalse((self.root / 'executed').exists())
             target.write_text(text.replace('_main_menu()', '_other_menu()') if name == 'sb.sh'
@@ -91,7 +133,7 @@ class InstallerTests(unittest.TestCase):
         target = self.root / 'custom'
         target.write_text('#!/bin/bash\necho custom\n')
         (self.root / 'link').symlink_to(target)
-        for name in ('sb.sh', 'deploy.sh', 'parser.sh', 'advanced_relay.sh'):
+        for name in ('sb.sh', 'deploy.sh', 'parser.sh', 'advanced_relay.sh', *BUNDLE_FILES[-2:]):
             self.shell(f'pa_known_target "$WORK/custom" {name}', ok=False)
             self.shell(f'pa_known_target "$WORK/link" {name}', ok=False)
 
@@ -119,6 +161,23 @@ test "$(cat "$WORK/physical/local/bin/sb")" = replacement
         self.shell('pa_safe_directory "$WORK/local/bin"', ok=False)
         physical.write_text('file')
         self.shell('pa_safe_directory "$WORK/local/bin"', ok=False)
+
+    def test_untrusted_plain_parent_and_state_slots_rejected(self):
+        state = self.root / 'state'
+        state.mkdir(mode=0o700)
+        (state / '.managed').write_text('# PROXYALL_MANAGED_COMMAND=1\n')
+        (state / '.managed').chmod(0o600)
+        user_file = self.root / 'user-data'
+        user_file.write_text('user data')
+        for name in ('manager.lock', 'commit', '.managed'):
+            slot = state / name
+            slot.unlink(missing_ok=True)
+            slot.symlink_to(user_file)
+            self.shell('PA_STATE="$WORK/state"; pa_prepare_state', ok=False)
+            self.assertEqual(user_file.read_text(), 'user data')
+            slot.unlink()
+        state.chmod(0o777)
+        self.shell('pa_safe_directory "$WORK/state/ordinary/missing"', ok=False)
 
     def test_indirect_symlink_checks_each_target_directory(self):
         self.shell(r'''

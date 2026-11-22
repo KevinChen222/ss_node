@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import unittest
 
+from installer import BUNDLE_FILES, copy_files
+
 REPO = Path(__file__).resolve().parents[1]
 LIMIT = 150 * 1024 * 1024
 LOGROTATE = shutil.which('logrotate')
@@ -261,41 +263,55 @@ backup_file "$WORK/site.conf"
 
     def bundle_install(self, fail=False):
         self.write('proxyall/backup.old/sb.sh', 'old snapshot')
+        target = self.root / 'bundle-target'
+        stage = self.root / 'bundle-stage'
+        copy_files(REPO, target, BUNDLE_FILES)
+        copy_files(REPO, stage, BUNDLE_FILES)
         self.write('bundle-stage/sb.sh', '#!/bin/bash\n[ "$1" = setup-maintenance ]\n')
         self.write('bundle-stage/commit', 'new commit\n')
-        self.write('bundle-target/sb', 'previous script')
+        self.write('proxyall/commit', 'previous commit\n').chmod(0o600)
+        for directory in ('proxyall', 'proxyall/backup.old'):
+            (self.root / directory).chmod(0o700)
         return self.run_shell(r'''
 source "$REPO/proxyall"
+# The test root is private, although its system temp parent permits writes.
+stat() {
+    if [ "$1" = -Lc ] && [ "$4" = "${WORK%/*}" ]; then
+        printf '0 755\n'
+    else
+        command stat "$@"
+    fi
+}
 PA_STATE="$WORK/proxyall"
 PA_STAGE="$WORK/bundle-stage"
-PA_FILES=(sb.sh)
-PA_TARGETS=("$WORK/bundle-target/sb")
-pa_known_target() { return 0; }
+PA_TARGETS=()
+for file in "${PA_FILES[@]}"; do PA_TARGETS+=("$WORK/bundle-target/$file"); done
 ''' + (r'''
-eval "$(declare -f pa_atomic_install | sed '1s/pa_atomic_install/_test_atomic_install/')"
-pa_atomic_install() {
-    [[ "$1" != "$PA_STAGE/"* ]] || return 1
-    _test_atomic_install "$@"
+mv() {
+    if [ "${!#}" = "$PA_STATE/commit" ] && grep -Fqx 'new commit' "${@: -2:1}"; then
+        return 1
+    fi
+    command mv "$@"
 }
-''' if fail else '') + r'''
-if pa_install_bundle; then
-    [ "''' + ('1' if fail else '0') + r'''" = 0 ]
-else
-    pa_rollback
-    [ "''' + ('1' if fail else '0') + r'''" = 1 ]
-fi
-''')
+if pa_install_bundle; then exit 42; fi
+pa_rollback
+''' if fail else 'pa_install_bundle'))
 
     def test_bundle_prunes_only_after_successful_install(self):
         self.bundle_install()
         snapshots = list((self.root / 'proxyall').glob('backup.*'))
         self.assertEqual(len(snapshots), 1)
-        self.assertEqual((snapshots[0] / 'sb.sh').read_text(), 'previous script')
+        for name in BUNDLE_FILES:
+            self.assertEqual((snapshots[0] / name).read_bytes(), (REPO / name).read_bytes())
+        self.assertEqual((snapshots[0] / 'commit').read_text(), 'previous commit\n')
+        self.assertEqual((self.root / 'proxyall/commit').read_text(), 'new commit\n')
 
     def test_bundle_failure_preserves_existing_snapshots_and_script(self):
         self.bundle_install(fail=True)
         self.assertEqual((self.root / 'proxyall/backup.old/sb.sh').read_text(), 'old snapshot')
-        self.assertEqual((self.root / 'bundle-target/sb').read_text(), 'previous script')
+        for name in BUNDLE_FILES:
+            self.assertEqual((self.root / 'bundle-target' / name).read_bytes(), (REPO / name).read_bytes())
+        self.assertEqual((self.root / 'proxyall/commit').read_text(), 'previous commit\n')
 
 
 if __name__ == '__main__':
