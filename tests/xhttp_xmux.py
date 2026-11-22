@@ -28,6 +28,9 @@ _check_port_conflict() { return 1; }
 _sni_router_allocate_backend_port() { echo 10080; }
 _new_node_tag() { echo xhttp-in-test; }
 _xhttp_snapshot_nginx() { return 0; }
+_sb_backup_nginx_file() { return 0; }
+_sb_reload_or_start_nginx() { return 0; }
+nginx() { [ "$1" = -T ]; }
 _install_managed_nginx_config() { cp -- "$1" "$2"; }
 _atomic_modify_json() {
     jq "$2" "$1" > "$1.tmp" && mv -- "$1.tmp" "$1"
@@ -40,7 +43,8 @@ _get_proxy_field() {
     jq -r --arg name "$1" '.proxies[] | select(.name == $name) | '"$2" "$CLASH_YAML_FILE"
 }
 _atomic_modify_yaml() {
-    _atomic_modify_json "$1" "${2//env\(PROXY_NAME\)/env.PROXY_NAME}"
+    local filter="${2//strenv\(PROXY_NAME\)/env.PROXY_NAME}"
+    _atomic_modify_json "$1" "${filter//env\(PROXY_NAME\)/env.PROXY_NAME}"
 }
 case "$ACTION" in
     add) _add_vless_xhttp_tls_impl ;;

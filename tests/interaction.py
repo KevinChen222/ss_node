@@ -70,7 +70,8 @@ class Interaction(unittest.TestCase):
         self.files = {
             'config.json': {'inbounds': []},
             'metadata.json': {'test': {'core': 'xray', 'name': 'Test', 'clientName': 'Test',
-                                     'publicPort': 443, 'backendPort': 10443, 'type': 'vless-xhttp-reality'}},
+                                     'publicPort': 443, 'backendPort': 10443, 'type': 'vless-xhttp-reality',
+                                     'nginxConfig': str(self.root / 'test.xhttp.conf')}},
             'xray.json': {'inbounds': [{'tag': 'test', 'port': 10443,
                                       'streamSettings': {'security':'reality','network':'xhttp'}}]},
             'clash.yaml': {'proxies': [{'name': 'Test', 'port': 443}]},
@@ -83,7 +84,7 @@ class Interaction(unittest.TestCase):
         return {name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_mode)
                 for name in self.files for p in [self.root / name]}
 
-    def run_shell(self, action, data='', variant='', unchanged=True):
+    def run_shell(self, action, data='', variant='', unchanged=True, lock=False):
         before = self.snapshot()
         result = subprocess.run(['bash', '-c', HARNESS], input=data, text=True, capture_output=True,
                                 timeout=10, env=dict(os.environ, REPO=str(REPO), WORK=str(self.root),
@@ -92,6 +93,7 @@ class Interaction(unittest.TestCase):
             self.assertEqual(self.snapshot(), before, result.stdout + result.stderr)
             self.assertFalse((self.root / 'effects').exists(), result.stdout + result.stderr)
             self.assertNotIn('正在恢复', result.stdout + result.stderr)
+        self.assertEqual((self.root / 'lock').exists(), lock, result.stdout + result.stderr)
         self.assertFalse(list(self.root.glob('.node-op.*')), result.stderr)
         return result
 
@@ -150,7 +152,7 @@ class Interaction(unittest.TestCase):
             self.assertEqual(self.run_shell('vision', '127.0.0.1\nn\nn\ny\n'+suffix).returncode, 2)
 
     def test_menu_back_and_update_declined(self):
-        for data in ('0\n', '6\n0\n0\n', '6\nn\n0\n', '6\n\n0\n'):
+        for data in ('0\n', '6\n0\n0\n', '6\nn\n0\n', '6\n\n0\n', '1\n0\n0\n', '3\n0\n0\n'):
             self.assertEqual(self.run_shell('main-menu', data).returncode, 0)
         result = self.run_shell('add-menu', '5\n0\n0\n')
         self.assertEqual(result.returncode, 0)
@@ -168,12 +170,13 @@ class Interaction(unittest.TestCase):
             self.assertEqual(self.run_shell('native', '', variant).returncode, 1)
 
     def test_candidate_failure_and_noop_preserve_original_files(self):
-        self.assertEqual(self.run_shell('failed').returncode, 1)
+        self.assertEqual(self.run_shell('failed', lock=True).returncode, 1)
+        (self.root / 'lock').unlink()
         self.assertEqual(self.run_shell('noop').returncode, 0)
         self.assertEqual(self.run_shell('interrupt').returncode, 130)
 
     def test_real_publish_failure_still_rolls_back(self):
-        result = self.run_shell('restart-failed', unchanged=False)
+        result = self.run_shell('restart-failed', unchanged=False, lock=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn('正在恢复', result.stderr + result.stdout)
         for name, data in self.files.items():

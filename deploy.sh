@@ -61,7 +61,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
 
-SCRIPT_VERSION='2026.11.17-local21'
+SCRIPT_VERSION='2026.11.22-local22'
 SCRIPT_DOWNLOAD_URL='https://raw.githubusercontent.com/KevinChen222/ss_node/main/deploy.sh'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
@@ -475,7 +475,7 @@ local_sni_router_lock() {
     }
     mkdir -p "$(dirname "$SNI_ROUTER_LOCK_FILE")" || return 1
     _config_write_lock || return 1
-    exec 9>"$SNI_ROUTER_LOCK_FILE"
+    exec 9>"$SNI_ROUTER_LOCK_FILE" || return 1
     flock -x -w 30 9 || { log_error 'SNI 路由正被其他进程修改，请稍后重试。'; return 1; }
 }
 
@@ -483,25 +483,36 @@ local_sni_router_init_state() {
     mkdir -p "$SNI_ROUTER_STATE_DIR" || return 1
     chmod 700 "$SNI_ROUTER_STATE_DIR" 2>/dev/null || true
     if [[ ! -e $SNI_ROUTER_STATE_FILE ]]; then
+        if [[ -L $SNI_ROUTER_STATE_FILE ]] || grep -Fxq -- "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF" 2>/dev/null; then
+            log_error "SNI 路由状态丢失，拒绝重新初始化: $SNI_ROUTER_STATE_FILE"
+            return 1
+        fi
         local tmp
         tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXXXXXX") || return 1
         if ! jq -n --argjson version "$SNI_ROUTER_API_VERSION" --argjson port "$SNI_ROUTER_PUBLIC_PORT" \
-            '{version:$version,public_port:$port,reality:null,https_backend:null,https_routes:{}}' > "$tmp"; then
-            rm -f "$tmp"
+            '{version:$version,public_port:$port,reality:null,https_backend:null,https_routes:{}}' > "$tmp" ||
+           ! mv -- "$tmp" "$SNI_ROUTER_STATE_FILE"; then
+            rm -f -- "$tmp"
             return 1
         fi
-        chmod 600 "$tmp"
-        mv "$tmp" "$SNI_ROUTER_STATE_FILE"
     fi
-    # 独立兜底渲染器不支持 sb 的额外 TLS 路由，不能重写后使它们消失。
-    if jq -e '(.tls_routes // {} | length) > 0' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
-        log_error '存在由 sb 管理的 TLS SNI 路由。请先恢复 /usr/local/bin/sb，再管理反代。'
+    if ! jq -se --argjson version "$SNI_ROUTER_API_VERSION" '
+        def port: type == "number" and . >= 1 and . <= 65535 and . == floor;
+        def sni: type == "string" and test("^[a-z0-9][a-z0-9.-]*\\z"; "i") and contains(".");
+        length == 1 and (.[0] |
+            .version == $version and (.public_port | port) and
+            (.reality | . == null or (.backend_host == "127.0.0.1" and (.backend_port | port) and (.sni | sni))) and
+            (.https_routes | type == "object" and all(keys[]; sni)) and
+            ((.https_routes | length) == 0 or
+                (.https_backend | .host == "127.0.0.1" and (.port | port))) and
+            (.tls_routes | . == null or type == "object"))
+    ' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+        log_error "SNI 路由状态损坏或版本不兼容: $SNI_ROUTER_STATE_FILE"
         return 1
     fi
-    if ! jq -e --argjson version "$SNI_ROUTER_API_VERSION" \
-        '.version == $version and (.https_routes | type == "object")' \
-        "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
-        log_error "SNI 路由状态版本不兼容: $SNI_ROUTER_STATE_FILE"
+    # 独立兜底渲染器不支持 sb 的额外 TLS 路由，不能重写后使它们消失。
+    if ! jq -e '.tls_routes == null or .tls_routes == {}' "$SNI_ROUTER_STATE_FILE" >/dev/null 2>&1; then
+        log_error '存在由 sb 管理的 TLS SNI 路由。请先恢复 /usr/local/bin/sb，再管理反代。'
         return 1
     fi
 }
@@ -512,7 +523,7 @@ local_sni_router_state_has_routes() {
 }
 
 local_sni_router_validate_port() {
-    [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && [[ $1 -le 65535 ]]
 }
 
 local_sni_router_prepare_haproxy() {
@@ -524,7 +535,7 @@ local_sni_router_prepare_haproxy() {
 
     mkdir -p "$(dirname "$SNI_ROUTER_HAPROXY_CONF")" "$SNI_ROUTER_HAPROXY_BACKUP_DIR" || return 1
     chmod 700 "$SNI_ROUTER_HAPROXY_BACKUP_DIR" 2>/dev/null || true
-    if [[ -f $SNI_ROUTER_HAPROXY_CONF ]] && ! grep -Fq "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF"; then
+    if [[ -f $SNI_ROUTER_HAPROXY_CONF ]] && ! grep -Fxq -- "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF"; then
         if grep -Eq '^[[:space:]]*(frontend|listen)[[:space:]]' "$SNI_ROUTER_HAPROXY_CONF"; then
             log_error "检测到非 sb.sh/nginxproxy 管理的 HAProxy 前端，拒绝覆盖: $SNI_ROUTER_HAPROXY_CONF"
             log_error '请先手动整合现有 HAProxy 配置。'
@@ -532,7 +543,6 @@ local_sni_router_prepare_haproxy() {
         fi
         cp -a -- "$SNI_ROUTER_HAPROXY_CONF" \
             "${SNI_ROUTER_HAPROXY_BACKUP_DIR}/haproxy.cfg.$(date +%Y%m%d_%H%M%S).$$" || return 1
-        systemctl stop haproxy >/dev/null 2>&1 || true
     fi
 }
 
@@ -627,59 +637,89 @@ EOF_HAPROXY_REALITY
 local_sni_router_apply() {
     local_sni_router_init_state || return 1
     if ! local_sni_router_state_has_routes; then
-        if [[ -f $SNI_ROUTER_HAPROXY_CONF ]] && grep -Fq "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF"; then
-            systemctl disable --now haproxy >/dev/null 2>&1 || true
+        if grep -Fxq -- "$SNI_ROUTER_MARKER" "$SNI_ROUTER_HAPROXY_CONF" 2>/dev/null; then
+            local was_active=no was_enabled=no
+            if systemctl is-active --quiet haproxy; then was_active=yes; fi
+            if systemctl is-enabled --quiet haproxy; then was_enabled=yes; fi
+            if ! systemctl disable --now haproxy; then
+                log_error '无法停用 HAProxy，路由操作失败。'
+                if [[ $was_enabled == yes ]]; then systemctl enable haproxy || log_error '无法恢复 HAProxy 开机启动。'; fi
+                if [[ $was_active == yes ]]; then systemctl start haproxy || log_error '无法恢复 HAProxy 服务。'; fi
+                return 1
+            fi
         fi
         return 0
     fi
     local_sni_router_prepare_haproxy || return 1
 
-    local new_conf old_conf had_old=no apply_status=0
+    local new_conf old_conf had_old=no action=start
     new_conf=$(mktemp) || return 1
-    old_conf=$(mktemp) || { rm -f "$new_conf"; return 1; }
-    local_sni_router_generate_haproxy_config "$new_conf" || { rm -f "$new_conf" "$old_conf"; return 1; }
-    if ! haproxy -c -f "$new_conf"; then
+    if ! local_sni_router_generate_haproxy_config "$new_conf" || ! haproxy -c -f "$new_conf"; then
         log_error 'HAProxy 配置验证失败，未安装新配置。'
-        rm -f "$new_conf" "$old_conf"
+        rm -f -- "$new_conf"
         return 1
     fi
-    if cmp -s "$new_conf" "$SNI_ROUTER_HAPROXY_CONF" && systemctl is-active --quiet haproxy; then
-        rm -f "$new_conf" "$old_conf"
-        return 0
+    if systemctl is-active --quiet haproxy; then
+        action=reload
+        if cmp -s "$new_conf" "$SNI_ROUTER_HAPROXY_CONF"; then
+            rm -f -- "$new_conf"
+            return 0
+        fi
     fi
+    old_conf=$(mktemp "${SNI_ROUTER_HAPROXY_CONF}.rollback.XXXXXX") || { rm -f -- "$new_conf"; return 1; }
     if [[ -f $SNI_ROUTER_HAPROXY_CONF ]]; then
-        cp -a -- "$SNI_ROUTER_HAPROXY_CONF" "$old_conf" || { rm -f "$new_conf" "$old_conf"; return 1; }
+        cp -a -- "$SNI_ROUTER_HAPROXY_CONF" "$old_conf" || { rm -f -- "$new_conf" "$old_conf"; return 1; }
         had_old=yes
     fi
-    install -m 640 "$new_conf" "${SNI_ROUTER_HAPROXY_CONF}.new" || { rm -f "$new_conf" "$old_conf"; return 1; }
-    mv "${SNI_ROUTER_HAPROXY_CONF}.new" "$SNI_ROUTER_HAPROXY_CONF" || { rm -f "$new_conf" "$old_conf"; return 1; }
-    rm -f "$new_conf"
-
-    systemctl enable haproxy >/dev/null 2>&1 || true
-    if systemctl is-active haproxy >/dev/null 2>&1; then
-        systemctl reload haproxy || apply_status=$?
-    else
-        systemctl start haproxy || apply_status=$?
-    fi
-    if (( apply_status != 0 )); then
-        log_error 'HAProxy 加载失败，正在恢复上一份配置。'
-        if [[ $had_old == yes ]]; then
-            cp -a -- "$old_conf" "$SNI_ROUTER_HAPROXY_CONF"
-            systemctl restart haproxy >/dev/null 2>&1 || true
-        else
-            rm -f "$SNI_ROUTER_HAPROXY_CONF"
-            systemctl stop haproxy >/dev/null 2>&1 || true
-        fi
-        rm -f "$old_conf"
+    if ! install -m 640 "$new_conf" "${SNI_ROUTER_HAPROXY_CONF}.new" ||
+       ! mv -- "${SNI_ROUTER_HAPROXY_CONF}.new" "$SNI_ROUTER_HAPROXY_CONF"; then
+        rm -f -- "$new_conf" "$old_conf" "${SNI_ROUTER_HAPROXY_CONF}.new"
         return 1
     fi
-    rm -f "$old_conf"
+    rm -f -- "$new_conf"
+
+    if ! systemctl "$action" haproxy; then
+        log_error 'HAProxy 加载失败，正在恢复上一份配置。'
+        local config_restored=yes
+        if [[ $had_old == yes ]]; then
+            if ! mv -- "$old_conf" "$SNI_ROUTER_HAPROXY_CONF"; then
+                log_error "无法恢复 HAProxy 配置，备份保留在 $old_conf"
+                config_restored=no
+            fi
+        else
+            rm -f -- "$old_conf"
+            if ! rm -f -- "$SNI_ROUTER_HAPROXY_CONF"; then
+                log_error "无法移除失败的 HAProxy 配置: $SNI_ROUTER_HAPROXY_CONF"
+                config_restored=no
+            fi
+        fi
+        if [[ $action == reload && $had_old == yes && $config_restored == yes ]]; then
+            if systemctl restart haproxy; then return 1; fi
+            log_error '恢复旧配置后 HAProxy 重启失败，将停止服务。'
+        fi
+        systemctl stop haproxy || log_error '无法停止 HAProxy，请检查当前运行配置。'
+        return 1
+    fi
+    rm -f -- "$old_conf"
+    systemctl enable haproxy >/dev/null 2>&1 || true
 }
 
-local_sni_router_restore_state() {
-    local backup=$1
-    cp -a -- "$backup" "$SNI_ROUTER_STATE_FILE"
-    local_sni_router_apply >/dev/null 2>&1 || true
+# 调用方持有路由锁。apply 自行恢复 HAProxy 配置及服务，这里只恢复路由状态。
+local_sni_router_update_state() {
+    local backup tmp
+    backup=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.rollback.XXXXXX") || return 1
+    tmp=$(mktemp "${SNI_ROUTER_STATE_DIR}/state.XXXXXX") || { rm -f -- "$backup"; return 1; }
+    if ! cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" ||
+       ! jq "$@" "$SNI_ROUTER_STATE_FILE" > "$tmp" ||
+       ! mv -- "$tmp" "$SNI_ROUTER_STATE_FILE"; then
+        rm -f -- "$backup" "$tmp"
+        return 1
+    fi
+    if ! local_sni_router_apply; then
+        mv -- "$backup" "$SNI_ROUTER_STATE_FILE" || log_error "无法恢复 SNI 状态，备份保留在 $backup"
+        return 1
+    fi
+    rm -f -- "$backup"
 }
 
 local_sni_router_register_https() (
@@ -689,14 +729,14 @@ local_sni_router_register_https() (
     local_sni_router_lock || return 1
     local_sni_router_init_state || return 1
 
-    local existing_owner existing_port reality_sni backup tmp
+    local existing_owner existing_port reality_sni
     existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
     if [[ -n $existing_owner && $existing_owner != "$owner" ]]; then
         log_error "SNI ${sni} 已由 ${existing_owner} 登记。"
         return 1
     fi
     reality_sni=$(jq -r '.reality.sni // empty' "$SNI_ROUTER_STATE_FILE")
-    if [[ -n $reality_sni && $reality_sni == "$sni" ]]; then
+    if [[ -n $reality_sni && ${reality_sni,,} == "$sni" ]]; then
         log_error "HTTPS SNI ${sni} 与 Reality SNI 相同；两者必须使用不同域名。"
         return 1
     fi
@@ -706,25 +746,8 @@ local_sni_router_register_https() (
         return 1
     fi
 
-    backup=$(mktemp) || return 1
-    tmp=$(mktemp) || { rm -f "$backup"; return 1; }
-    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
-    if ! jq --arg owner "$owner" --arg sni "$sni" --argjson port "$backend_port" \
-        '.https_backend={host:"127.0.0.1",port:$port} | .https_routes[$sni]={owner:$owner}' \
-        "$SNI_ROUTER_STATE_FILE" > "$tmp"; then
-        rm -f "$backup" "$tmp"
-        return 1
-    fi
-    if ! chmod 600 "$tmp" || ! mv "$tmp" "$SNI_ROUTER_STATE_FILE"; then
-        rm -f "$backup" "$tmp"
-        return 1
-    fi
-    if ! local_sni_router_apply; then
-        local_sni_router_restore_state "$backup"
-        rm -f "$backup"
-        return 1
-    fi
-    rm -f "$backup"
+    local_sni_router_update_state --arg owner "$owner" --arg sni "$sni" --argjson port "$backend_port" \
+        '.https_backend={host:"127.0.0.1",port:$port} | .https_routes[$sni]={owner:$owner}'
 )
 
 local_sni_router_remove_https() (
@@ -732,7 +755,7 @@ local_sni_router_remove_https() (
     local_sni_router_lock || return 1
     local_sni_router_init_state || return 1
 
-    local existing_owner backup tmp
+    local existing_owner
     existing_owner=$(jq -r --arg sni "$sni" '.https_routes[$sni].owner // empty' "$SNI_ROUTER_STATE_FILE")
     [[ -n $existing_owner ]] || return 0
     if [[ -n $owner && $owner != "$existing_owner" ]]; then
@@ -740,25 +763,8 @@ local_sni_router_remove_https() (
         return 1
     fi
 
-    backup=$(mktemp) || return 1
-    tmp=$(mktemp) || { rm -f "$backup"; return 1; }
-    cp -a -- "$SNI_ROUTER_STATE_FILE" "$backup" || { rm -f "$backup" "$tmp"; return 1; }
-    if ! jq --arg sni "$sni" \
-        'del(.https_routes[$sni]) | if (.https_routes|length)==0 then .https_backend=null else . end' \
-        "$SNI_ROUTER_STATE_FILE" > "$tmp"; then
-        rm -f "$backup" "$tmp"
-        return 1
-    fi
-    if ! chmod 600 "$tmp" || ! mv "$tmp" "$SNI_ROUTER_STATE_FILE"; then
-        rm -f "$backup" "$tmp"
-        return 1
-    fi
-    if ! local_sni_router_apply; then
-        local_sni_router_restore_state "$backup"
-        rm -f "$backup"
-        return 1
-    fi
-    rm -f "$backup"
+    local_sni_router_update_state --arg sni "$sni" \
+        'del(.https_routes[$sni]) | if (.https_routes|length)==0 then .https_backend=null else . end'
 )
 
 local_sni_router_status() {
@@ -795,9 +801,10 @@ local_sni_router_check() {
     log_info 'SNI 路由尚未登记任何后端。'
 }
 
-local_sni_router_call() {
+local_sni_router_call() (
     local action=${1:-status}
     shift || true
+    if [[ $action != api-version ]]; then _config_write_lock || return 1; fi
     case $action in
         api-version) printf '%s\n' "$SNI_ROUTER_API_VERSION" ;;
         status) local_sni_router_status ;;
@@ -824,7 +831,7 @@ local_sni_router_call() {
             return 2
             ;;
     esac
-}
+)
 
 sni_router_call() {
     local api

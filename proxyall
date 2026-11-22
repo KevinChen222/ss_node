@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 安装同一提交的 Xray 管理器、Nginx 反代与统一入口。
-PROXYALL_VERSION="2.0.7"
-SB_SHA256="843339d24734c9e07f135cc5b1c8d7de9dfc650e81c2062b57a44518f4fb550f"
-DEPLOY_SHA256="d22a50c29bf357d195ccba6145243e0fdb76817161daea10d7a0a82d8ab0bd99"
-RELAY_SHA256="06e84dc58baaae4678f6d171683041869820798d6330a33a8358ebb0f63a175e"
+PROXYALL_VERSION="2.0.8"
+SB_SHA256="1e4f00cfa91992d1bdc829007584e705f168ed819b95a65a7d873a8d79294b2d"
+DEPLOY_SHA256="722809a510d3ef1fa2aac0acacc9bc441d862bd3bac4f04a5cbeeeb5c216f316"
+RELAY_SHA256="aeaf92390b3b7b2dd04b91a2c81b4f68d18b11776b0f6aaa620dcbc9a684b238"
 PARSER_SHA256="1facb8460e60c399ae259df5f01bd8bc3f95856f588ea748e68c7810aa13eb65"
 
 umask 077
@@ -453,7 +453,7 @@ main() {
     esac
     [ "$EUID" = 0 ] || { pa_error '请用 root 或 sudo -H bash proxyall 运行。'; return 1; }
     [ "$(uname -s)" = Linux ] || { pa_error '此脚本用于 Linux VPS。'; return 1; }
-    # 只读入口不触发依赖安装、脚本更新或会话状态目录初始化。
+    # 查看证书无需安装下载依赖；续期和归档由 nginxproxy 持配置写锁并复核证书引用。
     if [ "$action" = --certificates ]; then
         pa_run /usr/local/bin/nginxproxy --certificates
         return $?

@@ -179,7 +179,15 @@ case "$ACTION" in
         metadata = self.fixture.json('metadata.json')
         metadata[tag].update(frontedBy='haproxy', routerRole='reality-default')
         (self.root/'metadata.json').write_text(json.dumps(metadata))
-        state = {'version':1,'reality':{'owner':'sb-xhttp','tag':tag,'sni':'xhttp.test','backend_host':'127.0.0.1','backend_port':ib['port']},'https_routes':{'emby.test':{'owner':'emby'}},'https_backend':{'host':'127.0.0.1','port':8444},'tls_routes':{}}
+        state = {
+            'version': 1,
+            'public_port': 443,
+            'reality': {'owner': 'sb-xhttp', 'tag': tag, 'sni': 'xhttp.test',
+                        'backend_host': '127.0.0.1', 'backend_port': ib['port']},
+            'https_routes': {'emby.test': {'owner': 'nginx-proxy'}},
+            'https_backend': {'host': '127.0.0.1', 'port': 8444},
+            'tls_routes': {},
+        }
         (self.root/'router').mkdir(exist_ok=True)
         (self.root/'router/state.json').write_text(json.dumps(state))
         (self.root/'relay.json').write_text(json.dumps({'protocol':'freedom','settings':{'finalRules':[{'action':'allow','ip':['127.0.0.1/32']}]}}))
@@ -190,12 +198,15 @@ case "$ACTION" in
         self.assertEqual(self.fixture.json('xray.json')['routing'], routing)
         self.assertEqual(self.fixture.json('xray.json')['outbounds'], outbounds)
         changed = self.fixture.json('router/state.json')
-        self.assertEqual(changed['reality']['sni'], 'new.test')
+        self.assertEqual(changed['reality'], {**state['reality'], 'sni': 'new.test'})
+        self.assertEqual(changed['public_port'], state['public_port'])
         self.assertEqual(changed['https_routes'], state['https_routes'])
+        self.assertEqual(changed['https_backend'], state['https_backend'])
         before = self.fixture.json('metadata.json')
         result = self.edit('sni', 'y\ny\n1\nemby.test\ny\n', check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.fixture.json('metadata.json'), before)
+        self.assertEqual(self.fixture.json('router/state.json'), changed)
         self.traffic()
 
     def test_reality_repairs_missing_certificate_for_same_domain(self):

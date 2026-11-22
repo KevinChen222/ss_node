@@ -26,7 +26,7 @@ _config_write_lock() {
 umask 077
 
 # 核心环境定义
-SCRIPT_VERSION="16-kevin.17"
+SCRIPT_VERSION="16-kevin.18"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
@@ -1283,7 +1283,7 @@ _add_node_to_relay_yaml() {
     
     # 使用环境变量避免名称中特殊字符问题
     export PROXY_NAME="$proxy_name"
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies += [env(PROXY_NAME)] | .proxies |= unique)' || return 1
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies += [strenv(PROXY_NAME)] | .proxies |= unique)' || return 1
     
     _info "已添加节点到 YAML 配置: ${proxy_name}"
 }
@@ -1302,8 +1302,8 @@ _remove_node_from_relay_yaml() {
     
     # 删除节点 - 使用环境变量避免特殊字符问题
     export PROXY_NAME="$proxy_name"
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" 'del(.proxies[] | select(.name == env(PROXY_NAME)))' || return 1
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' || return 1
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" 'del(.proxies[] | select(.name == strenv(PROXY_NAME)))' || return 1
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies |= del(.[] | select(. == strenv(PROXY_NAME))))' || return 1
     
     _info "已从 YAML 配置中删除节点: ${proxy_name}"
 }
@@ -2941,9 +2941,9 @@ _modify_relay_port_locked() {
         export NEW_RELAY_NAME="$new_node_name"
         export NEW_RELAY_PORT="$new_port"
         
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(OLD_RELAY_NAME)) | .name) = env(NEW_RELAY_NAME)' || return 1
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' || return 1
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)' || return 1
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME)) | .name) = strenv(NEW_RELAY_NAME)' || return 1
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == strenv(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' || return 1
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == strenv(OLD_RELAY_NAME))) = strenv(NEW_RELAY_NAME)' || return 1
     fi
 
     if [ -n "$current_hop_info" ]; then

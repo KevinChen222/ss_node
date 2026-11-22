@@ -67,7 +67,14 @@ case "$ACTION" in
         INIT_SYSTEM=systemd
         SERVICE_FILE="$WORK/legacy.service"
         systemctl() { if [ "$1" = show ]; then echo "$SERVICE_FILE"; else echo "$*" >> "$WORK/service.calls"; fi; }
-        _sni_router_apply() { [ "${FAIL_APPLY:-0}" != 1 ]; }
+        _sni_router_apply() {
+            _sni_router_generate_haproxy_config "$WORK/haproxy.pending" || return 1
+            if [ "${FAIL_APPLY:-0}" = 1 ] && [ ! -e "$WORK/apply.failed" ]; then
+                touch "$WORK/apply.failed"
+                return 1
+            fi
+            mv "$WORK/haproxy.pending" "$WORK/haproxy.cfg"
+        }
         _retire_legacy_service ;;
     vision) BATCH_MODE=true BATCH_PORT="$PORT" BATCH_SNI=xhttp.test BATCH_IP=127.0.0.1 BATCH_REALITY_HANDSHAKE_SERVER=127.0.0.1 BATCH_REALITY_HANDSHAKE_PORT="$ORIGIN" BATCH_VISION_PROFILE="$PROFILE" _node_operation _add_vless_reality_impl ;;
     native) _node_operation _xray_native_add ;;
@@ -189,24 +196,61 @@ http {{
         return json.loads(subprocess.check_output(['node', str(REPO / 'tests/substore_link.mjs')], input=link, text=True))
 
     def test_retire_preserves_https_and_xray(self):
-        router=self.root/'router'; router.mkdir()
-        state={'version':1,'public_port':443,'reality':{'owner':'advanced-relay','tag':'old'},
-               'https_routes':{'emby.test':{'owner':'nginx-proxy'}},
-               'tls_routes':{'xray.test':{'owner':'sb-xray'},'old.test':{'owner':'sb'}}}
-        (router/'state.json').write_text(json.dumps(state))
-        (self.root/'.managed_sing_box').touch()
-        (self.root/'legacy.service').write_text(f'ExecStart={self.root}/no-sing-box run -c {self.root}/config.json -c {self.root}/relay.json\n')
-        (self.root/'relay.json').write_text('{"inbounds":[]}')
-        before=self.snapshot()
-        self.assertNotEqual(self.run_shell('retire','RETIRE\n',FAIL_APPLY='1',check=False).returncode,0)
-        self.assertEqual(before,self.snapshot())
-        self.assertEqual(self.json('router/state.json'),state)
-        self.run_shell('retire','RETIRE\n')
-        self.assertFalse((self.root/'config.json').exists())
-        self.assertFalse((self.root/'relay.json').exists())
+        router = self.root / 'router'
+        router.mkdir()
+        xray_route = {'owner': 'sb-xray', 'tag': 'existing-xray',
+                      'backend_host': '127.0.0.1', 'backend_port': 10444}
+        state = {
+            'version': 1, 'public_port': 443,
+            'reality': {'owner': 'advanced-relay', 'tag': 'old-reality', 'sni': 'reality.test',
+                        'backend_host': '127.0.0.1', 'backend_port': 10443},
+            'https_backend': {'host': '127.0.0.1', 'port': 8444},
+            'https_routes': {'emby.test': {'owner': 'nginx-proxy'}},
+            'tls_routes': {'xhttp.test': xray_route,
+                           'old.test': {'owner': 'sb', 'tag': 'old-tls',
+                                        'backend_host': '127.0.0.1', 'backend_port': 10445}},
+        }
+        (router / 'state.json').write_text(json.dumps(state))
+        cert_dir = self.root / 'certs/xhttp.test'
+        uuid = '80c7a55c-8951-423f-a420-2af7d59d19e6'
+        inbound = {'tag': xray_route['tag'], 'listen': xray_route['backend_host'],
+                   'port': xray_route['backend_port'], 'protocol': 'vless',
+                   'settings': {'clients': [{'id': uuid}], 'decryption': 'none'},
+                   'streamSettings': {'network': 'raw', 'security': 'tls', 'tlsSettings': {
+                       'certificates': [{'certificateFile': str(cert_dir / 'cert'),
+                                         'keyFile': str(cert_dir / 'key')}]}}}
+        (self.root / 'xray.json').write_text(json.dumps({'inbounds': [inbound],
+                                                         'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}))
+        meta = {'core': 'xray', 'type': 'native-vless', 'name': 'Existing', 'clientName': 'Existing',
+                'server_name': 'xhttp.test', 'publicPort': 443, 'backendPort': inbound['port'],
+                'frontedBy': 'haproxy', 'routerRole': 'tls-sni',
+                'share_link': f'vless://{uuid}@xhttp.test:443?encryption=none&security=tls&sni=xhttp.test&type=tcp#Existing'}
+        (self.root / 'metadata.json').write_text(json.dumps({inbound['tag']: meta}))
+        (self.root / 'clash.yaml').write_text(json.dumps({'proxies': [
+            {'type': 'vless', 'name': 'Existing', 'server': 'xhttp.test', 'port': 443,
+             'uuid': uuid, 'network': 'tcp', 'tls': True, 'servername': 'xhttp.test'}]}))
+        (self.root / '.managed_sing_box').touch()
+        (self.root / 'legacy.service').write_text(f'ExecStart={self.root}/no-sing-box run -c {self.root}/config.json -c {self.root}/relay.json\n')
+        (self.root / 'relay.json').write_text('{"inbounds":[]}')
+        before = self.snapshot()
+        failure = self.run_shell('retire', 'RETIRE\n', FAIL_APPLY='1', check=False)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertTrue((self.root / 'apply.failed').exists(), failure.stdout + failure.stderr)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.json('router/state.json'), state)
+        self.assertIn('server reality 127.0.0.1:10443', (self.root / 'haproxy.cfg').read_text())
+        self.run_shell('retire', 'RETIRE\n')
+        self.assertFalse((self.root / 'config.json').exists())
+        self.assertFalse((self.root / 'relay.json').exists())
         self.assertTrue(any(self.root.glob('retired.*/config.json')))
-        self.assertEqual(self.json('router/state.json'),dict(state,reality=None,tls_routes={'xray.test':{'owner':'sb-xray'}}))
-        self.assertNotIn('proxyall-xray',(self.root/'service.calls').read_text())
+        self.assertEqual(self.snapshot(), {k: v for k, v in before.items() if k != 'config.json'})
+        self.assertEqual(self.json('router/state.json'), dict(state, reality=None, tls_routes={'xhttp.test': xray_route}))
+        haproxy = (self.root / 'haproxy.cfg').read_text()
+        self.assertIn('emby.test', haproxy)
+        self.assertIn('xhttp.test', haproxy)
+        self.assertNotIn('old.test', haproxy)
+        self.assertNotIn('sb_reality_backend', haproxy)
+        self.assertNotIn('proxyall-xray', (self.root / 'service.calls').read_text())
 
     def check_udp(self, mixed):
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as origin, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as client, socket.create_connection(('127.0.0.1',mixed),timeout=4) as tcp:
