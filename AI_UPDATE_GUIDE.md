@@ -1,8 +1,12 @@
 # ProxyAll AI 维护指南
 
-## 工作目录与组件
+## 每次开始工作前
 
-从 `ss_node/` 仓库根目录运行 Git 和测试命令。开始维护前用 `git rev-parse --show-toplevel` 确认目录，用 `git fetch origin` 和 `git status -sb` 核对当前分支与 GitHub 主线。
+1. 运行 `git rev-parse --show-toplevel`，核对仓库的绝对路径。本机默认维护 `/mnt/shared/codex/proxyall/ss_node`。即使两个副本的提交号相同，也要确认当前目录是本次任务指定的副本。
+2. 用 `git remote get-url origin` 确认远端是 GitHub 的 `KevinChen222/ss_node`，再运行 `git fetch origin`。成功后用 `git rev-parse HEAD origin/main` 比较本地和 GitHub 主线的完整提交号。
+3. 运行 `git status --short --branch` 检查分支及已暂存、未暂存和未跟踪的文件。日常主线维护应从正确目录、`main` 分支和相同提交开始。有差异时，先用 `git log --left-right --oneline HEAD...origin/main` 和 `git diff HEAD` 查清本地工作，保留现有改动，确认本次基线后再编辑。
+
+## 组件
 
 `proxyall` 从同一提交下载三个脚本，校验后安装为 `proxyall`、`sb` 和 `nginxproxy`。`sb.sh` 管理 Xray 节点、出站和分享链接，`deploy.sh` 管理 Nginx、Emby 反代和证书。旧菜单的 `_advanced_features` 按固定哈希加载 `advanced_relay.sh` 和 `parser.sh`。`archive/` 存放独立历史工具，仅在明确维护归档工具时读取。
 
