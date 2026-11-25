@@ -32,8 +32,11 @@ class EncryptionTests(unittest.TestCase):
         (root/'xray.json').write_text('{"inbounds":[]}')
         (root/'router.json').write_text('{"reality":null}')
         harness = REALITY_HARNESS if reality else HARNESS
-        harness = harness.replace('server_ip=203.0.113.1', 'server_ip=203.0.113.1\nXRAY_BIN="$TEST_XRAY"')
-        harness = harness.replace('case "$ACTION" in', 'case "$ACTION" in\n    view) _xray_list_links subscription ;;\n    outbound) read -r link; _xray_link_outbound "$link" ;;')
+        harness = harness.replace(
+            'server_ip=203.0.113.1',
+            'server_ip=203.0.113.1\nCONFIG_FILE="$WORK/config.json"\nARGO_METADATA_FILE="$WORK/argo.json"\nXRAY_BIN="$TEST_XRAY"\n_find_proxy_name() { echo "XHTTP test"; }',
+        )
+        harness = harness.replace('case "$ACTION" in', 'case "$ACTION" in\n    view) _view_nodes <<< y ;;')
         (root/'harness').write_text(harness)
 
     def test_profiles_survive_exports_and_port_changes(self):
@@ -68,11 +71,9 @@ class EncryptionTests(unittest.TestCase):
                             self.assertNotIn('support-x25519mlkem768', q)
                         if choice != '3':
                             self.assertNotIn(server['settings']['decryption'].rsplit('.', 1)[1], link)
-                        viewed = self.shell(root, 'view').stdout.strip().splitlines()
-                        self.assertEqual(viewed[0], link)
-                        self.assertEqual(base64.b64decode(viewed[-1]).decode().strip(), link)
-                        outbound = json.loads(self.shell(root, 'outbound', link+'\n').stdout)
-                        self.assertEqual(outbound['settings']['vnext'][0]['users'][0]['encryption'], enc)
+                        viewed = self.shell(root, 'view').stdout
+                        self.assertIn(link, viewed)
+                        self.assertIn(base64.b64encode((link + '\n').encode()).decode(), viewed)
                         if os.environ.get('TEST_SUBSTORE'):
                             exported = json.loads(subprocess.check_output(['node', str(REPO/'tests/substore_link.mjs')], input=link, text=True))
                             saved = json.loads((root/'client.json').read_text())['proxies'][0]

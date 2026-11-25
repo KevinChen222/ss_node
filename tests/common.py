@@ -3,8 +3,10 @@
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -146,6 +148,114 @@ cmp /tmp/repo/deploy.sh /usr/local/bin/nginxproxy
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('# Managed by proxyall log maintenance', result.stdout)
         self.assertIn('bash /usr/local/bin/sb cleanup-logs', result.stdout)
+
+    def test_daemon_start_under_write_lock_does_not_inherit_lock_fds(self):
+        cases = [
+            ('sb-direct-nginx', r'''
+source "$REPO/sb.sh"
+command() {
+    if [ "${1:-}" = -v ] && [[ "${2:-}" == systemctl || "${2:-}" == rc-service ]]; then return 1; fi
+    builtin command "$@"
+}
+_sb_nginx_running() { return 1; }
+nginx() {
+    if [ "${1:-}" = -t ]; then return 0; fi
+    sleep 30 >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$WORK/daemon.pid"
+}
+_sb_reload_or_start_nginx
+'''),
+            ('deploy-direct-nginx', r'''
+source "$REPO/deploy.sh"
+trap - ERR INT TERM
+has_systemd() { return 1; }
+command() {
+    if [ "${1:-}" = -v ] && [[ "${2:-}" == systemctl || "${2:-}" == rc-service || "${2:-}" == service ]]; then return 1; fi
+    builtin command "$@"
+}
+nginx_is_running() { return 1; }
+nginx() {
+    if [ "${1:-}" = -t ]; then return 0; fi
+    sleep 30 >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$WORK/daemon.pid"
+}
+reload_or_start_nginx
+'''),
+            ('sni-router-apply', r'''
+source "$REPO/sb.sh"
+SNI_ROUTER_STATE_DIR="$WORK/router"
+SNI_ROUTER_STATE_FILE="$WORK/router/state.json"
+SNI_ROUTER_LOCK_FILE="$WORK/router.lock"
+SNI_ROUTER_HAPROXY_CONF="$WORK/haproxy.cfg"
+SNI_ROUTER_HAPROXY_BACKUP_DIR="$WORK/router-backup"
+mkdir -p "$SNI_ROUTER_STATE_DIR" "$SNI_ROUTER_HAPROXY_BACKUP_DIR"
+printf '{"version":1,"public_port":443,"reality":null,"https_backend":{"host":"127.0.0.1","port":8444},"https_routes":{"emby.test":{"owner":"nginx-proxy"}},"tls_routes":{}}\n' > "$SNI_ROUTER_STATE_FILE"
+_sni_router_require_systemd() { return 0; }
+haproxy() { return 0; }
+systemctl() {
+    case "$1" in
+        is-active) return 1 ;;
+        enable|reload|restart)
+            sleep 30 >/dev/null 2>&1 &
+            printf '%s\n' "$!" > "$WORK/daemon.pid"
+            return 0 ;;
+        *) return 0 ;;
+    esac
+}
+_sni_router_apply
+'''),
+        ]
+        for label, snippet in cases:
+            with self.subTest(case=label):
+                case_dir = self.work / label
+                case_dir.mkdir()
+                pid_file = case_dir / 'daemon.pid'
+                write_lock = case_dir / 'write.lock'
+                router_lock = case_dir / 'router.lock'
+                script = (
+                    'export PROXYALL_WRITE_LOCK_FILE="$WORK/write.lock"\n'
+                    'source "$REPO/lib/common.sh"\n'
+                    '_config_write_lock\n'
+                    'exec 9>"$WORK/router.lock"\n'
+                    'flock -x 9\n'
+                    + snippet
+                )
+                result = subprocess.run(
+                    ['bash', '-eu', '-o', 'pipefail', '-c', script],
+                    cwd=case_dir, env=dict(os.environ, REPO=str(REPO), WORK=str(case_dir)),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                pid = int(pid_file.read_text().strip())
+
+                def cleanup_pid(target=pid):
+                    try:
+                        os.kill(target, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+                self.addCleanup(cleanup_pid)
+                os.kill(pid, 0)
+                self.assertFalse(Path(f'/proc/{pid}/fd/8').exists(), f'{label} daemon inherited FD 8')
+                self.assertFalse(Path(f'/proc/{pid}/fd/9').exists(), f'{label} daemon inherited FD 9')
+
+                # Subsequent lock acquisitions must succeed immediately without hitting the 30s timeout.
+                start = time.monotonic()
+                relock = subprocess.run(
+                    ['bash', '-eu', '-o', 'pipefail', '-c', r'''
+export PROXYALL_WRITE_LOCK_FILE="$WORK/write.lock"
+source "$REPO/lib/common.sh"
+flock -n "$WORK/write.lock" true
+flock -n "$WORK/router.lock" true
+_config_write_lock
+'''],
+                    cwd=case_dir, env=dict(os.environ, REPO=str(REPO), WORK=str(case_dir)),
+                    capture_output=True, text=True, timeout=5,
+                )
+                elapsed = time.monotonic() - start
+                self.assertEqual(relock.returncode, 0, relock.stdout + relock.stderr)
+                self.assertLess(elapsed, 3.0)
+                cleanup_pid()
 
 
 if __name__ == '__main__':

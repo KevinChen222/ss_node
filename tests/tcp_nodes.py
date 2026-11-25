@@ -29,7 +29,7 @@ ARGO_METADATA_FILE="$WORK/argo.json"
 SINGBOX_BIN="${TEST_SINGBOX:-$WORK/core}"
 YQ_BINARY="${TEST_YQ:-}"
 server_ip="${TEST_ADDRESS:-127.0.0.1}"
-BATCH_MODE=true
+BATCH_MODE="${TEST_BATCH_MODE:-true}"
 BATCH_PORT="${TEST_PORT:-10001}"
 BATCH_SS_VARIANT="${VARIANT:-3}"
 _assert_node_name_free() { return 0; }
@@ -94,7 +94,11 @@ else:
 
     def generate(self, kind='ss', variant=3, **extra):
         self.reset()
-        return self.run_shell(kind, 'localhost\n' if variant == 5 else '', VARIANT=str(variant), **extra)
+        if kind == 'ss' and variant == 5:
+            port = extra.get('TEST_PORT', '10001')
+            answers = f'5\n\n{port}\n\nlocalhost\n'
+            return self.run_shell(kind, answers, VARIANT=str(variant), TEST_BATCH_MODE='false', **extra)
+        return self.run_shell(kind, '', VARIANT=str(variant), **extra)
 
 
 class GenerationTests(NodeFixture):
@@ -113,6 +117,8 @@ class GenerationTests(NodeFixture):
                 self.assertEqual(proxy['password'], inbound['password'])
                 if variant == 5:
                     self.assertEqual(proxy['plugin'], 'shadow-tls')
+                    self.assertEqual(proxy['plugin-opts']['host'], 'localhost')
+                    self.assertEqual(config['inbounds'][0]['handshake']['server'], 'localhost')
                     self.assertEqual(config['inbounds'][0]['detour'], inbound['tag'])
 
     def test_plain_vless_has_no_tls_or_reality(self):
@@ -263,14 +269,17 @@ class TrafficTests(NodeFixture):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.start([TOOLS['singbox'], 'run', '-c', str(self.root/'config.json')], inbound, 'server')
+        expected = self.read('client.yaml')['proxies'][0]
+        self.assertEqual(expected['fingerprint'], query['pcs'][0])
         for valid in (True, False):
             with self.subTest(valid=valid):
                 pin = query['pcs'][0] if valid else '00' * 32
                 proxy = json.loads(subprocess.check_output(['node', str(REPO/'tests/substore_link.mjs')],
                     input=link.replace(query['pcs'][0], pin), text=True))
-                expected = self.read('client.yaml')['proxies'][0]
                 for key, value in expected.items():
-                    if key in ('idle-session-timeout', 'idle-session-check-interval', 'min-idle-session'):
+                    if key == 'fingerprint':
+                        self.assertEqual(proxy[key], pin, key)
+                    elif key in ('idle-session-timeout', 'idle-session-check-interval', 'min-idle-session'):
                         self.assertEqual(int(proxy[key]), value, key)
                     else:
                         self.assertEqual(proxy[key], value, key)
@@ -370,6 +379,7 @@ class TrafficTests(NodeFixture):
             self.addCleanup(fallback.shutdown)
             threading.Thread(target=fallback.serve_forever, daemon=True).start()
             config = self.read('config.json')
+            self.assertEqual(config['inbounds'][0]['handshake']['server'], 'localhost')
             config['inbounds'][0]['handshake']['server_port'] = fallback.server_port
             (self.root / 'config.json').write_text(json.dumps(config))
             client_env = dict(os.environ, SSL_CERT_FILE=str(cert))

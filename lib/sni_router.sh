@@ -208,10 +208,10 @@ _sni_router_apply() {
             local was_active=no was_enabled=no
             if systemctl is-active --quiet haproxy; then was_active=yes; fi
             if systemctl is-enabled --quiet haproxy; then was_enabled=yes; fi
-            if ! systemctl disable --now haproxy; then
+            if ! systemctl disable --now haproxy 8>&- 9>&-; then
                 _sni_router_error "无法停用 HAProxy，路由操作失败。"
-                if [ "$was_enabled" = yes ]; then systemctl enable haproxy || _sni_router_error "无法恢复 HAProxy 开机启动。"; fi
-                if [ "$was_active" = yes ]; then systemctl start haproxy || _sni_router_error "无法恢复 HAProxy 服务。"; fi
+                if [ "$was_enabled" = yes ]; then systemctl enable haproxy 8>&- 9>&- || _sni_router_error "无法恢复 HAProxy 开机启动。"; fi
+                if [ "$was_active" = yes ]; then systemctl start haproxy 8>&- 9>&- || _sni_router_error "无法恢复 HAProxy 服务。"; fi
                 return 1
             fi
         fi
@@ -245,7 +245,7 @@ _sni_router_apply() {
     fi
     rm -f -- "$new_conf"
 
-    if ! systemctl "$action" haproxy; then
+    if ! systemctl "$action" haproxy 8>&- 9>&-; then
         _sni_router_error "HAProxy 加载失败，正在恢复上一份配置。"
         local config_restored=yes
         if [ "$had_old" = yes ]; then
@@ -261,14 +261,14 @@ _sni_router_apply() {
             fi
         fi
         if [ "$action" = reload ] && [ "$had_old" = yes ] && [ "$config_restored" = yes ]; then
-            if systemctl restart haproxy; then return 1; fi
+            if systemctl restart haproxy 8>&- 9>&-; then return 1; fi
             _sni_router_error "恢复旧配置后 HAProxy 重启失败，将停止服务。"
         fi
-        systemctl stop haproxy || _sni_router_error "无法停止 HAProxy，请检查当前运行配置。"
+        systemctl stop haproxy 8>&- 9>&- || _sni_router_error "无法停止 HAProxy，请检查当前运行配置。"
         return 1
     fi
     rm -f -- "$old_conf"
-    systemctl enable haproxy >/dev/null 2>&1 || true
+    systemctl enable haproxy >/dev/null 2>&1 8>&- 9>&- || true
 }
 
 # 调用方持有路由锁。apply 自行恢复 HAProxy 配置及服务，这里只恢复路由状态。

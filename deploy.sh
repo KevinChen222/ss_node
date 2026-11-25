@@ -82,8 +82,8 @@ ACME_ARCHIVE_URL="https://github.com/acmesh-official/acme.sh/archive/refs/tags/$
 # These commands are persisted by acme.sh and therefore must be standalone:
 # cron renewals cannot call functions defined only in this deployment script.
 ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl stop nginx; elif command -v service >/dev/null 2>&1 && service nginx stop; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s quit; i=0; while kill -0 "$(cat /run/nginx.pid)" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done; ! kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; fi'
-ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx; fi'
-ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx; elif command -v service >/dev/null 2>&1 && service nginx start; then :; else nginx; fi'
+ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx 8>&- 9>&-; elif command -v service >/dev/null 2>&1 && service nginx start 8>&- 9>&-; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx 8>&- 9>&-; fi'
+ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload 8>&- 9>&-; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx 8>&- 9>&-; elif command -v service >/dev/null 2>&1 && service nginx start 8>&- 9>&-; then :; else nginx 8>&- 9>&-; fi'
 
 SCRIPT_VERSION='2026.11.22-local23'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
@@ -448,13 +448,13 @@ nginx_is_running() {
 
 start_nginx() {
     if has_systemd; then
-        systemctl start nginx
+        systemctl start nginx 8>&- 9>&-
         return
     fi
-    if command -v service >/dev/null 2>&1 && service nginx start; then
+    if command -v service >/dev/null 2>&1 && service nginx start 8>&- 9>&-; then
         return
     fi
-    nginx
+    nginx 8>&- 9>&-
 }
 
 ensure_cron_service() {
@@ -462,7 +462,7 @@ ensure_cron_service() {
     if has_systemd; then
         for cron_service in cron crond; do
             if systemctl cat "${cron_service}.service" >/dev/null 2>&1; then
-                if ! systemctl enable --now "${cron_service}.service" >/dev/null 2>&1; then
+                if ! systemctl enable --now "${cron_service}.service" >/dev/null 2>&1 8>&- 9>&-; then
                     log_warn "无法启用 ${cron_service}.service；证书自动续期任务可能不会执行。"
                 fi
                 return 0
@@ -472,7 +472,7 @@ ensure_cron_service() {
         for cron_service in dcron crond cron; do
             if [[ -x /etc/init.d/$cron_service ]]; then
                 rc-update add "$cron_service" default >/dev/null 2>&1 || true
-                rc-service "$cron_service" start >/dev/null 2>&1 || \
+                rc-service "$cron_service" start >/dev/null 2>&1 8>&- 9>&- || \
                     log_warn "无法启动 ${cron_service}；证书自动续期任务可能不会执行。"
                 return 0
             fi
@@ -483,7 +483,7 @@ ensure_cron_service() {
 
 reload_or_start_nginx() {
     if nginx_is_running; then
-        nginx -s reload
+        nginx -s reload 8>&- 9>&-
     else
         start_nginx
     fi
@@ -3401,7 +3401,7 @@ cm_restore_invalid_pair() {
     log_warn '部署文件缺失或不匹配，已从本次备份恢复证书及私钥。'
     refs=$(cm_references "$index")
     if [[ $refs == *'Nginx:'* ]] && nginx_is_running; then
-        nginx -t && nginx -s reload || { log_error '文件已恢复，但 Nginx 重载失败，请检查服务。'; return 1; }
+        nginx -t && nginx -s reload 8>&- 9>&- || { log_error '文件已恢复，但 Nginx 重载失败，请检查服务。'; return 1; }
     fi
 }
 

@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
@@ -35,7 +36,6 @@ XRAY_CONFIG_FILE="$WORK/xray.json"
 XRAY_PID_FILE="$WORK/xray.pid"
 XRAY_LOG_FILE="$WORK/xray.log"
 XRAY_BIN="$TEST_XRAY"
-XRAY_ONLY=true
 SINGBOX_BIN="$WORK/no-sing-box"
 YQ_BINARY="$TEST_YQ"
 PID_FILE="$WORK/singbox.pid"
@@ -63,26 +63,17 @@ _sni_router_require_systemd() { return 0; }
 _sni_router_prepare() { _node_tx_begin && _sni_router_init_state; }
 _sni_router_apply() { return 0; }
 case "$ACTION" in
-    retire)
-        INIT_SYSTEM=systemd
-        SERVICE_FILE="$WORK/legacy.service"
-        systemctl() { if [ "$1" = show ]; then echo "$SERVICE_FILE"; else echo "$*" >> "$WORK/service.calls"; fi; }
-        _sni_router_apply() {
-            _sni_router_generate_haproxy_config "$WORK/haproxy.pending" || return 1
-            if [ "${FAIL_APPLY:-0}" = 1 ] && [ ! -e "$WORK/apply.failed" ]; then
-                touch "$WORK/apply.failed"
-                return 1
-            fi
-            mv "$WORK/haproxy.pending" "$WORK/haproxy.cfg"
-        }
-        _retire_legacy_service ;;
-    vision) BATCH_MODE=true BATCH_PORT="$PORT" BATCH_SNI=xhttp.test BATCH_IP=127.0.0.1 BATCH_REALITY_HANDSHAKE_SERVER=127.0.0.1 BATCH_REALITY_HANDSHAKE_PORT="$ORIGIN" BATCH_VISION_PROFILE="$PROFILE" _node_operation _add_vless_reality_impl ;;
-    native) _node_operation _xray_native_add ;;
-    relay) _node_operation _xray_manage_node relay ;;
     add) _add_vless_xhttp_tls ;;
-    view) _xray_list_links ;;
-    delete) _node_operation _xray_manage_node delete ;;
-    modify) _node_operation _xray_manage_node port ;;
+    add-reality)
+        _select_reality_sni() {
+            SELECTED_REALITY_SNI="${REALITY_SNI:-vision.test}"
+            SELECTED_REALITY_HANDSHAKE_SERVER=127.0.0.1
+            SELECTED_REALITY_HANDSHAKE_PORT="$ORIGIN"
+        }
+        _node_operation _add_vless_xhttp_reality_impl ;;
+    view) _view_nodes <<< n ;;
+    delete) _node_operation _delete_node_impl ;;
+    modify) _node_operation _modify_port_impl ;;
     stop) _xray_service stop ;;
     haproxy) _sni_router_generate_haproxy_config "$WORK/haproxy.raw" ;;
     render) _xhttp_nginx_config xhttp.test /test/ 10080 443 true ;;
@@ -195,63 +186,6 @@ http {{
     def exported(self, link):
         return json.loads(subprocess.check_output(['node', str(REPO / 'tests/substore_link.mjs')], input=link, text=True))
 
-    def test_retire_preserves_https_and_xray(self):
-        router = self.root / 'router'
-        router.mkdir()
-        xray_route = {'owner': 'sb-xray', 'tag': 'existing-xray',
-                      'backend_host': '127.0.0.1', 'backend_port': 10444}
-        state = {
-            'version': 1, 'public_port': 443,
-            'reality': {'owner': 'advanced-relay', 'tag': 'old-reality', 'sni': 'reality.test',
-                        'backend_host': '127.0.0.1', 'backend_port': 10443},
-            'https_backend': {'host': '127.0.0.1', 'port': 8444},
-            'https_routes': {'emby.test': {'owner': 'nginx-proxy'}},
-            'tls_routes': {'xhttp.test': xray_route,
-                           'old.test': {'owner': 'sb', 'tag': 'old-tls',
-                                        'backend_host': '127.0.0.1', 'backend_port': 10445}},
-        }
-        (router / 'state.json').write_text(json.dumps(state))
-        cert_dir = self.root / 'certs/xhttp.test'
-        uuid = '80c7a55c-8951-423f-a420-2af7d59d19e6'
-        inbound = {'tag': xray_route['tag'], 'listen': xray_route['backend_host'],
-                   'port': xray_route['backend_port'], 'protocol': 'vless',
-                   'settings': {'clients': [{'id': uuid}], 'decryption': 'none'},
-                   'streamSettings': {'network': 'raw', 'security': 'tls', 'tlsSettings': {
-                       'certificates': [{'certificateFile': str(cert_dir / 'cert'),
-                                         'keyFile': str(cert_dir / 'key')}]}}}
-        (self.root / 'xray.json').write_text(json.dumps({'inbounds': [inbound],
-                                                         'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}))
-        meta = {'core': 'xray', 'type': 'native-vless', 'name': 'Existing', 'clientName': 'Existing',
-                'server_name': 'xhttp.test', 'publicPort': 443, 'backendPort': inbound['port'],
-                'frontedBy': 'haproxy', 'routerRole': 'tls-sni',
-                'share_link': f'vless://{uuid}@xhttp.test:443?encryption=none&security=tls&sni=xhttp.test&type=tcp#Existing'}
-        (self.root / 'metadata.json').write_text(json.dumps({inbound['tag']: meta}))
-        (self.root / 'clash.yaml').write_text(json.dumps({'proxies': [
-            {'type': 'vless', 'name': 'Existing', 'server': 'xhttp.test', 'port': 443,
-             'uuid': uuid, 'network': 'tcp', 'tls': True, 'servername': 'xhttp.test'}]}))
-        (self.root / '.managed_sing_box').touch()
-        (self.root / 'legacy.service').write_text(f'ExecStart={self.root}/no-sing-box run -c {self.root}/config.json -c {self.root}/relay.json\n')
-        (self.root / 'relay.json').write_text('{"inbounds":[]}')
-        before = self.snapshot()
-        failure = self.run_shell('retire', 'RETIRE\n', FAIL_APPLY='1', check=False)
-        self.assertNotEqual(failure.returncode, 0)
-        self.assertTrue((self.root / 'apply.failed').exists(), failure.stdout + failure.stderr)
-        self.assertEqual(before, self.snapshot())
-        self.assertEqual(self.json('router/state.json'), state)
-        self.assertIn('server reality 127.0.0.1:10443', (self.root / 'haproxy.cfg').read_text())
-        self.run_shell('retire', 'RETIRE\n')
-        self.assertFalse((self.root / 'config.json').exists())
-        self.assertFalse((self.root / 'relay.json').exists())
-        self.assertTrue(any(self.root.glob('retired.*/config.json')))
-        self.assertEqual(self.snapshot(), {k: v for k, v in before.items() if k != 'config.json'})
-        self.assertEqual(self.json('router/state.json'), dict(state, reality=None, tls_routes={'xhttp.test': xray_route}))
-        haproxy = (self.root / 'haproxy.cfg').read_text()
-        self.assertIn('emby.test', haproxy)
-        self.assertIn('xhttp.test', haproxy)
-        self.assertNotIn('old.test', haproxy)
-        self.assertNotIn('sb_reality_backend', haproxy)
-        self.assertNotIn('proxyall-xray', (self.root / 'service.calls').read_text())
-
     def check_udp(self, mixed):
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as origin, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as client, socket.create_connection(('127.0.0.1',mixed),timeout=4) as tcp:
             origin.settimeout(5); client.settimeout(5)
@@ -267,86 +201,6 @@ http {{
             self.assertEqual(payload,b'udp-test')
             origin.sendto(b'udp-ok',address)
             self.assertEqual(client.recv(256),header+b'udp-ok')
-
-    @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE for exported Vision traffic')
-    def test_vision_profiles_from_empty_install(self):
-        for filename in ('config.json', 'metadata.json', 'clash.yaml'):
-            (self.root/filename).unlink()
-        origin = port()
-        self.start(['openssl','s_server','-accept',f'127.0.0.1:{origin}','-tls1_3','-alpn','h2','-www',
-                    '-cert',str(self.root/'certs/xhttp.test/cert'),'-key',str(self.root/'certs/xhttp.test/key')], origin)
-        for profile in ('none','x25519','mlkem768'):
-            with self.subTest(profile=profile):
-                public = port()
-                self.run_shell('vision', PORT=str(public), ORIGIN=str(origin), PROFILE=profile)
-                meta = next(m for m in self.json('metadata.json').values() if m['publicPort']==public)
-                client = self.exported(meta['share_link'])
-                expected = json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))['proxies']
-                for key, value in next(p for p in expected if p['port']==public).items():
-                    self.assertEqual(client.get(key), value, key)
-                mixed=port()
-                cfg=self.root/f'{profile}.json'
-                cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[client],'rules':['MATCH,'+client['name']]}))
-                home=self.root/profile; home.mkdir()
-                self.start([TOOLS['mihomo'],'-d',str(home),'-f',str(cfg)],mixed)
-                res=subprocess.run(['curl','-fsS','--noproxy','','-x',f'http://127.0.0.1:{mixed}','--max-time','5',f'http://127.0.0.1:{self.webport}'],capture_output=True)
-                self.assertEqual(res.stdout,b'website',(res.stderr,(self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1600:],(self.root/'xray.log').read_text()[-800:]))
-                self.check_udp(mixed)
-        self.assertFalse((self.root/'config.json').exists())
-        self.assertFalse((self.root/'relay.json').exists())
-        nodes = self.json('metadata.json')
-        inlet = next(tag for tag, node in nodes.items() if node['publicPort'] == public)
-        selection = list(nodes).index(inlet) + 1
-        for variant, protocol in ((2, 'shadowsocks'), (1, 'vless')):
-            with self.subTest(landing=protocol):
-                landing_port = port()
-                self.run_shell('native', f'{variant}\n127.0.0.1\n{landing_port}\nlanding-{protocol}\n' + ('\n' if variant == 1 else ''))
-                landing, meta = next((tag, node) for tag, node in self.json('metadata.json').items()
-                                     if node['publicPort'] == landing_port)
-                self.run_shell('relay', f"{selection}\n{meta['share_link']}\n")
-                # Start a fresh client after the server restart for each landing handshake.
-                mixed = port()
-                cfg = self.root/f'relay-{protocol}.json'
-                cfg.write_text(json.dumps({'mixed-port': mixed, 'proxies': [client],
-                                           'rules': ['MATCH,' + client['name']]}))
-                self.start([TOOLS['mihomo'], '-d', str(self.root/f'client-{protocol}'), '-f', str(cfg)], mixed)
-                response = subprocess.run(['curl', '-fsS', '--max-time', '5', '--noproxy', '',
-                                           '-x', f'http://127.0.0.1:{mixed}',
-                                           f'http://127.0.0.1:{self.webport}/'], capture_output=True)
-                self.assertEqual(response.stdout, b'website', (response.stderr, (self.root/'xray.log').read_text()[-2500:],
-                                                               (self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1000:]))
-                self.check_udp(mixed)
-                log = (self.root/'xray.log').read_text()
-                for transport in ('tcp', 'udp'):
-                    self.assertRegex(log, rf'accepted {transport}:.*\[{landing} >> direct\]')
-
-    @unittest.skipUnless(os.environ.get('TEST_SUBSTORE'), 'set TEST_SUBSTORE for native exports')
-    def test_native_exports_and_relay(self):
-        for variant in (1,2):
-            with self.subTest(variant=variant):
-                public=port()
-                self.run_shell('native',f'{variant}\n127.0.0.1\n{public}\nnode{variant}\n' + ('\n' if variant == 1 else ''))
-                meta=next(m for m in self.json('metadata.json').values() if m['publicPort']==public)
-                proxy=self.exported(meta['share_link'])
-                saved=json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))
-                for key,value in next(p for p in saved['proxies'] if p['port']==public).items():
-                    self.assertEqual(proxy.get(key),value,key)
-                mixed=port()
-                cfg=self.root/f'native{variant}.json'
-                cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[proxy],'rules':['MATCH,'+proxy['name']]}))
-                home=self.root/f'home{variant}'; home.mkdir()
-                self.start([TOOLS['mihomo'],'-d',str(home),'-f',str(cfg)],mixed,dict(os.environ,SSL_CERT_FILE=str(self.root/'certs/xhttp.test/cert')))
-                cmd=['curl','-fsS','--max-time','5','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.webport}/']
-                res=subprocess.run(cmd,capture_output=True)
-                self.assertEqual(res.stdout,b'website',(res.stderr,(self.root/f'proc-{len(self.procs)-1}.log').read_text()[-1600:],(self.root/'xray.log').read_text()[-800:]))
-                self.check_udp(mixed)
-                if variant==1:
-                    ob=self.root/'out.json'
-                    ob.write_text('{"protocol":"blackhole"}')
-                    self.run_shell('relay',f'1\n{ob}\n')
-                    self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
-                    self.run_shell('relay','1\ndirect\n')
-                    self.assertEqual(subprocess.run(cmd,capture_output=True).stdout,b'website')
 
     def test_real_mihomo_h2_upload_download_and_lifecycle(self):
         self.add()
@@ -476,10 +330,8 @@ server {{
         origin=port()
         self.start(['openssl','s_server','-accept',f'127.0.0.1:{origin}','-tls1_3','-alpn','h2','-www',
                     '-cert',str(self.root/'certs/xhttp.test/cert'),'-key',str(self.root/'certs/xhttp.test/key')],origin)
-        # The same HAProxy has an HTTPS vhost and a default Reality backend.
-        harness=self.root/'harness.sh'
-        harness.write_text(HARNESS.replace('BATCH_SNI=xhttp.test','BATCH_SNI=vision.test'))
-        self.run_shell('vision',PORT=str(frontend),ORIGIN=str(origin),PROFILE='x25519')
+        # The same HAProxy has an HTTPS vhost (Emby + XHTTP TLS) and a default XHTTP Reality backend.
+        self.run_shell('add-reality', f'\n{frontend}\ny\n/real/\nShared Reality\n1\n2\n', ORIGIN=str(origin), REALITY_SNI='vision.test')
         self.run_shell('haproxy')
         raw = (self.root / 'haproxy.raw').read_text()
         config = '\n'.join(line for line in raw.splitlines() if not line.strip().startswith(('user ', 'group ', 'stats socket ')))
@@ -494,18 +346,20 @@ server {{
                              capture_output=True, timeout=5)
         self.assertIn('ALPN protocol: h2', tls.stdout)
         self.assertIn('CN = xhttp.test', tls.stdout)
-        def get_vision():
-            m=next(m for m in self.json('metadata.json').values() if m['type']=='vless-vision-reality')
-            if os.environ.get('TEST_SUBSTORE'): p=self.exported(m['share_link'])
-            else: p=next(p for p in json.loads(subprocess.check_output([TOOLS['yq'],'-o=json',str(self.root/'clash.yaml')]))['proxies'] if p['name']==m['name'])
-            mixed=port(); home=self.root/str(mixed); home.mkdir()
-            cfg=home/'client.json'; cfg.write_text(json.dumps({'mixed-port':mixed,'proxies':[p],'rules':['MATCH,'+p['name']]}))
-            self.start([TOOLS['mihomo'],'-d',str(home),'-f',str(cfg)],mixed)
-            self.assertEqual(subprocess.check_output(['curl','-fsS','--max-time','5','--noproxy','','-x',f'http://127.0.0.1:{mixed}',f'http://127.0.0.1:{self.webport}/']),b'website')
-        get_vision()
-        before=self.json('metadata.json')
-        self.run_shell('modify',f'2\n{port()}\n')
-        get_vision()
+        def get_reality():
+            m = next(m for m in self.json('metadata.json').values() if m['type'] == 'vless-xhttp-reality')
+            if os.environ.get('TEST_SUBSTORE'):
+                p = self.exported(m['share_link'])
+            else:
+                p = next(p for p in json.loads(subprocess.check_output([TOOLS['yq'], '-o=json', str(self.root / 'clash.yaml')]))['proxies'] if p['name'] == m['name'])
+            mixed = port(); home = self.root / str(mixed); home.mkdir()
+            cfg = home / 'client.json'; cfg.write_text(json.dumps({'mixed-port': mixed, 'proxies': [p], 'rules': ['MATCH,' + p['name']]}))
+            self.start([TOOLS['mihomo'], '-d', str(home), '-f', str(cfg)], mixed)
+            self.assertEqual(subprocess.check_output(['curl', '-fsS', '--max-time', '5', '--noproxy', '', '-x', f'http://127.0.0.1:{mixed}', f'http://127.0.0.1:{self.webport}/']), b'website')
+        get_reality()
+        before = self.json('metadata.json')
+        self.run_shell('modify', f'2\n{port()}\n')
+        get_reality()
         first=next(iter(before))
         self.assertEqual(before[first],self.json('metadata.json')[first])
         self.run_shell('delete','2\ny\n')
@@ -516,8 +370,19 @@ server {{
         self.assertTrue((self.root / 'conf.d/emby.conf').exists())
 
     def test_shared_listener_render(self):
+        version_out = subprocess.run([TOOLS['nginx'], '-v'], capture_output=True, text=True, check=True)
+        match = re.search(r'nginx/(\d+(?:\.\d+)*)', version_out.stderr + version_out.stdout)
+        self.assertIsNotNone(match, version_out.stderr + version_out.stdout)
+        version = tuple(int(part) for part in match.group(1).split('.'))
         rendered = self.run_shell('render').stdout
-        self.assertIn('listen 127.0.0.1:8444 ssl proxy_protocol http2;', rendered)
+        if version >= (1, 25, 1):
+            self.assertRegex(rendered, r'(?m)^\s*listen 127\.0\.0\.1:8444 ssl proxy_protocol;\s*$')
+            self.assertRegex(rendered, r'(?m)^\s*http2 on;\s*$')
+            self.assertNotIn('listen 127.0.0.1:8444 ssl proxy_protocol http2;', rendered)
+        else:
+            self.assertRegex(rendered, r'(?m)^\s*listen 127\.0\.0\.1:8444 ssl proxy_protocol http2;\s*$')
+            self.assertNotIn('http2 on;', rendered)
+        self.assertIn('location ^~ /test/ {', rendered)
         self.assertIn('grpc_pass grpc://127.0.0.1:10080;', rendered)
 
 

@@ -38,7 +38,7 @@ logrotate() { "$TEST_LOGROTATE" -s "$WORK/logrotate.status" "$@"; }
 crontab() {
     case "$1" in
         -l) [ ! -f "$WORK/crontab" ] || cat "$WORK/crontab" ;;
-        -) cat > "$WORK/crontab" ;;
+        -) cat > "$WORK/crontab.tmp" && mv -f "$WORK/crontab.tmp" "$WORK/crontab" ;;
         *) return 1 ;;
     esac
 }
@@ -312,6 +312,195 @@ pa_rollback
         for name in BUNDLE_FILES:
             self.assertEqual((self.root / 'bundle-target' / name).read_bytes(), (REPO / name).read_bytes())
         self.assertEqual((self.root / 'proxyall/commit').read_text(), 'previous commit\n')
+
+
+class ServiceAndUninstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='proxyall-service-test-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for directory in ('sing-box', 'bin', 'logs', 'systemd', 'logrotate.d', 'maintenance'):
+            (self.root / directory).mkdir(parents=True, exist_ok=True)
+
+    def write(self, rel, content='data', mode=None):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        if mode is not None:
+            path.chmod(mode)
+        return path
+
+    def run_shell(self, body, stdin_text='', expected_rc=0):
+        preamble = r'''
+source "$REPO/sb.sh"
+SINGBOX_DIR="$WORK/sing-box"
+CONFIG_FILE="$SINGBOX_DIR/config.json"
+METADATA_FILE="$SINGBOX_DIR/metadata.json"
+CLASH_YAML_FILE="$SINGBOX_DIR/clash.yaml"
+XRAY_CONFIG_FILE="$SINGBOX_DIR/xray.json"
+SINGBOX_BIN="$WORK/bin/sing-box"
+XRAY_BIN="$WORK/bin/xray"
+YQ_BINARY="$WORK/bin/yq"
+CLOUDFLARED_BIN="$WORK/bin/cloudflared"
+REALITL_SCANNER_DIR="$WORK/scanner"
+REALITL_SCANNER_BIN="$WORK/scanner/RealiTLScanner"
+REALITL_SCANNER_MARKER="$WORK/scanner/.managed"
+GO_TOOLCHAIN_DIR="$WORK/go-toolchain"
+GO_TOOLCHAIN_MARKER="$WORK/go-toolchain/.managed"
+SELF_SCRIPT_PATH="$WORK/bin/sb"
+SERVICE_FILE="$WORK/systemd/sing-box.service"
+SYSTEMD_UNIT_DIR="$WORK/systemd"
+LOGROTATE_DIR="$WORK/logrotate.d"
+MAINTENANCE_DIR="$WORK/maintenance"
+LOG_FILE="$WORK/logs/sing-box.log"
+XRAY_LOG_FILE="$SINGBOX_DIR/xray.log"
+ARGO_LOG_FILE="$WORK/logs/argo.log"
+SNI_ROUTER_STATE_FILE="$WORK/router/state.json"
+PROXYALL_WRITE_LOCK_FILE="$WORK/write.lock"
+rm() {
+    local -a filtered=()
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            /usr/local/bin/sb) continue ;;
+            -*) filtered+=("$arg") ;;
+            "$WORK"/*|"$WORK") filtered+=("$arg") ;;
+            *) echo "refusing rm outside WORK: $arg" >&2; return 1 ;;
+        esac
+    done
+    local has_path=0
+    for arg in "${filtered[@]}"; do
+        [[ "$arg" == -* ]] || has_path=1
+    done
+    [ "$has_path" = 0 ] || command rm "${filtered[@]}"
+}
+crontab() {
+    case "$1" in
+        -l) [ ! -f "$WORK/crontab" ] || cat "$WORK/crontab" ;;
+        -) cat > "$WORK/crontab.tmp" && mv -f "$WORK/crontab.tmp" "$WORK/crontab" ;;
+        *) return 1 ;;
+    esac
+}
+systemctl() {
+    printf '%s\n' "$*" >> "$WORK/systemctl.calls"
+    return 0
+}
+_remove_time_sync() { :; }
+_remove_nftables_rules() { :; }
+_disable_argo_watchdog() { :; }
+_stop_all_argo_tunnels() { :; }
+'''
+        result = subprocess.run(
+            ['bash', '-c', preamble + '\n' + body],
+            input=stdin_text, text=True, capture_output=True, timeout=20,
+            env=dict(os.environ, REPO=str(REPO), WORK=str(self.root)),
+        )
+        self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+        return result
+
+    def test_mixed_status_reports_active_xray_when_singbox_stopped(self):
+        self.write('bin/sing-box', '#!/usr/bin/env bash\nexit 0\n', mode=0o700)
+        self.write('bin/xray', '#!/usr/bin/env bash\nexit 0\n', mode=0o700)
+
+        active = self.run_shell(r'''
+_manage_singbox_service_impl() { echo "Sing-box: inactive"; return 3; }
+_xray_service() { echo "Xray: active"; return 0; }
+_xray_running() { return 0; }
+_manage_service status
+''', expected_rc=0)
+        self.assertIn('Sing-box: inactive', active.stdout)
+        self.assertIn('Xray: active', active.stdout)
+
+        both_stopped = self.run_shell(r'''
+_manage_singbox_service_impl() { echo "Sing-box: inactive"; return 3; }
+_xray_service() { echo "Xray: inactive"; return 3; }
+_xray_running() { return 1; }
+_manage_service status
+''', expected_rc=3)
+        self.assertIn('Sing-box: inactive', both_stopped.stdout)
+        self.assertIn('Xray: inactive', both_stopped.stdout)
+
+    def test_uninstall_cleans_restart_timers_and_log_dropins_including_xray_only(self):
+        # Case 1: Full dual-core install with restart timer, log drop-ins, logrotate policy, and crontab.
+        self.write('bin/sing-box', '#!/usr/bin/env bash\nexit 0\n', mode=0o700)
+        self.write('bin/xray', '#!/usr/bin/env bash\nexit 0\n', mode=0o700)
+        self.write('bin/sb', '#!/usr/bin/env bash\nexit 0\n', mode=0o700)
+        self.write('sing-box/.managed_sing_box', '')
+        self.write('sing-box/.managed_xray', '')
+        self.write('sing-box/config.json', '{"inbounds":[],"outbounds":[]}')
+        self.write('sing-box/metadata.json', '{}')
+        self.write('sing-box/xray.log', 'xray-log')
+        self.write('logs/sing-box.log', 'sb-log')
+        self.write('systemd/sing-box.service', '[Service]\nExecStart=/bin/true\n')
+        self.write('systemd/proxyall-xray.service', '[Service]\nExecStart=/bin/true\n')
+        self.write('systemd/sing-box-restart.timer', '[Timer]\nOnCalendar=daily\n')
+        self.write('systemd/sing-box-restart.service', '[Service]\nExecStart=/bin/true\n')
+        for unit in ('sing-box', 'proxyall-xray'):
+            self.write(
+                f'systemd/{unit}.service.d/90-proxyall-logging.conf',
+                '# Managed by proxyall log maintenance\n[Service]\nStandardOutput=append:/tmp/x.log\n',
+            )
+        self.write('logrotate.d/proxyall', '# Managed by proxyall log maintenance\n')
+        self.write('crontab', '0 1 * * * keep-me\n*/15 * * * * bash /usr/local/bin/sb cleanup-logs # sing-box-log-cleanup\n')
+
+        self.run_shell(r'''
+INIT_SYSTEM=systemd
+_xray_service() { return 0; }
+_manage_singbox_service_impl() { return 0; }
+_uninstall_locked
+''', stdin_text='y\n', expected_rc=0)
+
+        for gone in (
+            'sing-box', 'bin/sing-box', 'bin/xray', 'bin/sb',
+            'logs/sing-box.log',
+            'systemd/sing-box.service', 'systemd/proxyall-xray.service',
+            'systemd/sing-box-restart.timer', 'systemd/sing-box-restart.service',
+            'systemd/sing-box.service.d/90-proxyall-logging.conf',
+            'systemd/sing-box.service.d',
+            'systemd/proxyall-xray.service.d/90-proxyall-logging.conf',
+            'systemd/proxyall-xray.service.d',
+            'logrotate.d/proxyall',
+        ):
+            self.assertFalse((self.root / gone).exists(), f'expected {gone} to be removed')
+        crontab_after = (self.root / 'crontab').read_text()
+        self.assertIn('0 1 * * * keep-me', crontab_after)
+        self.assertNotIn('# sing-box-log-cleanup', crontab_after)
+        calls = (self.root / 'systemctl.calls').read_text()
+        self.assertIn('disable proxyall-xray', calls)
+        self.assertIn('daemon-reload', calls)
+        if Path('/run/systemd/system').is_dir():
+            self.assertIn('disable --now sing-box-restart.timer', calls)
+
+        # Case 2: Xray-only installation (installed via [18] with no nodes / no xray.json / no sing-box).
+        (self.root / 'systemctl.calls').unlink(missing_ok=True)
+        (self.root / 'sing-box').mkdir(exist_ok=True)
+        self.write('bin/xray', '#!/usr/bin/env bash\nexit 0\n', mode=0o700)
+        self.write('sing-box/.managed_xray', '')
+        self.write('systemd/proxyall-xray.service', '[Service]\nExecStart=/bin/true\n')
+        self.write(
+            'systemd/proxyall-xray.service.d/90-proxyall-logging.conf',
+            '# Managed by proxyall log maintenance\n[Service]\nStandardOutput=append:/tmp/xray.log\n',
+        )
+        custom = self.write('systemd/sing-box.service.d/90-proxyall-logging.conf', '# custom user drop-in\n')
+
+        self.run_shell(r'''
+INIT_SYSTEM=systemd
+_xray_service() { return 0; }
+_uninstall_locked
+''', stdin_text='y\n', expected_rc=0)
+
+        for gone in (
+            'bin/xray', 'sing-box',
+            'systemd/proxyall-xray.service',
+            'systemd/proxyall-xray.service.d/90-proxyall-logging.conf',
+            'systemd/proxyall-xray.service.d',
+        ):
+            self.assertFalse((self.root / gone).exists(), f'expected {gone} to be removed in xray-only uninstall')
+        # Unmanaged custom drop-ins must be preserved.
+        self.assertEqual(custom.read_text(), '# custom user drop-in\n')
+        calls2 = (self.root / 'systemctl.calls').read_text()
+        self.assertIn('disable proxyall-xray', calls2)
+        self.assertIn('daemon-reload', calls2)
 
 
 if __name__ == '__main__':

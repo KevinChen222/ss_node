@@ -46,13 +46,13 @@ class NodeEdit(unittest.TestCase):
         self.fixture.env['HTTP_PORT'] = str(xhttp.port())
         harness = xhttp.HARNESS.replace('case "$ACTION" in', EXTRA + '''
 case "$ACTION" in
-    edit-menu) _xray_manage_node edit ;;
+    edit-menu) _edit_node_menu ;;
     edit)
         tag=$(jq -r 'keys[0]' "$METADATA_FILE")
         meta=$(jq -c --arg t "$tag" '.[$t]' "$METADATA_FILE")
         _node_operation _xray_edit_field "$tag" "$FIELD" "$meta" ;;
     reality) _node_operation _add_vless_xhttp_reality_impl ;;
-    subscribe) _xray_list_links subscription ;;
+    subscribe) _view_nodes <<< y ;;
 ''')
         (self.root/'harness.sh').write_text(harness)
 
@@ -77,9 +77,9 @@ case "$ACTION" in
                     self.assertTrue(value)  # Trojan's TLS is implicit in Sub-Store's export.
                     continue
                 self.assertEqual(exported.get(key), value, key)
-        lines = self.fixture.run_shell('subscribe').stdout.strip().splitlines()
-        self.assertIn(meta['share_link'], lines)
-        self.assertIn(meta['share_link'], base64.b64decode(lines[-1]).decode())
+        out = self.fixture.run_shell('subscribe').stdout
+        self.assertIn(meta['share_link'], out)
+        self.assertIn(base64.b64encode((meta['share_link'] + '\n').encode()).decode(), out)
         return client
 
     def traffic(self):
@@ -157,7 +157,7 @@ case "$ACTION" in
                     self.assertFalse(list(self.root.glob('.node-op.*')))
         self.assertNotIn('issue ', (self.root/'prepare.calls').read_text())
         result = self.fixture.run_shell('edit-menu', '1\n5\n0\n0\n0\n', check=False)
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
 
     def test_certificate_and_restart_failures_restore_configuration(self):
@@ -171,7 +171,7 @@ case "$ACTION" in
             self.assertFalse((self.root/'certs/failed.test/cert').exists())
         self.traffic()
 
-    def test_shared_reality_router_and_relay_survive_edit(self):
+    def test_shared_reality_router_survives_edit(self):
         self.reality()
         # Isolated HAProxy state; the existing listener stays on its loopback test port.
         tag = next(iter(self.fixture.json('metadata.json')))
@@ -190,13 +190,7 @@ case "$ACTION" in
         }
         (self.root/'router').mkdir(exist_ok=True)
         (self.root/'router/state.json').write_text(json.dumps(state))
-        (self.root/'relay.json').write_text(json.dumps({'protocol':'freedom','settings':{'finalRules':[{'action':'allow','ip':['127.0.0.1/32']}]}}))
-        self.fixture.run_shell('relay', f'1\n{self.root}/relay.json\n')
-        routing = self.fixture.json('xray.json')['routing']
-        outbounds = self.fixture.json('xray.json')['outbounds']
         self.edit('sni', 'y\ny\n1\nnew.test\ny\n')
-        self.assertEqual(self.fixture.json('xray.json')['routing'], routing)
-        self.assertEqual(self.fixture.json('xray.json')['outbounds'], outbounds)
         changed = self.fixture.json('router/state.json')
         self.assertEqual(changed['reality'], {**state['reality'], 'sni': 'new.test'})
         self.assertEqual(changed['public_port'], state['public_port'])
@@ -225,61 +219,6 @@ case "$ACTION" in
         (self.root/'certs/xhttp.test/cert').unlink()
         self.edit('sni', '\ny\n')
         self.assertIn('issue xhttp.test', (self.root/'prepare.calls').read_text())
-        self.traffic()
-
-    def test_native_name_and_address(self):
-        for variant in (1, 2):
-            with self.subTest(variant=variant):
-                self.fixture.run_shell('native', f'{variant}\n127.0.0.1\n{xhttp.port()}\nNative\n'+('\n' if variant == 1 else ''))
-                self.edit('name', 'Renamed\ny\n')
-                self.edit('server', '::1\ny\n')
-                self.assert_export()
-                self.fixture.run_shell('delete', '1\ny\n')
-
-    def test_ss2022_key_and_link_lifecycle(self):
-        self.fixture.run_shell('native', f'2\n127.0.0.1\n{xhttp.port()}\nSS2022\n')
-        method = '2022-blake3-aes-256-gcm'
-        meta, inbound, client = self.data()
-        password = client['password']
-        self.assertEqual(len(base64.b64decode(password, validate=True)), 32)
-        self.assertEqual(client['cipher'], method)
-        self.assertEqual(inbound['settings']['method'], method)
-        self.assertEqual(inbound['settings']['password'], password)
-        for changed in (False, True):
-            if changed:
-                self.edit('port', f'{xhttp.port()}\ny\n')
-                self.edit('name', 'SS 中文\ny\n')
-                self.edit('server', '::1\ny\n')
-            meta, inbound, client = self.data()
-            uri = urlsplit(meta['share_link'])
-            self.assertEqual(uri.username, method)
-            self.assertEqual(unquote(uri.password), password)
-            self.assertEqual(client['password'], password)
-            self.assertEqual(inbound['settings']['password'], password)
-            mixed = self.traffic()
-            self.fixture.check_udp(mixed)
-        # Both SIP022 plaintext userinfo and older SIP002 Base64 userinfo import losslessly.
-        special = base64.b64encode(bytes([251,255])*16).decode()
-        for auth in (method+':'+quote(special, safe=''),
-                     base64.urlsafe_b64encode((method+':'+special).encode()).decode().rstrip('=')):
-            link = f'ss://{auth}@127.0.0.1:12345?udp=1#test'
-            exported = self.fixture.exported(link)
-            self.assertEqual(exported['cipher'], method)
-            self.assertEqual(exported['password'], special)
-            outbound = json.loads(subprocess.check_output(['bash','-c','source "$REPO/sb.sh"; _xray_link_outbound "$LINK"'],
-                                 env=dict(self.fixture.env, LINK=link)))
-            self.assertEqual(outbound['settings']['servers'][0]['method'], method)
-            self.assertEqual(outbound['settings']['servers'][0]['password'], special)
-        self.fixture.run_shell('delete', '1\ny\n')
-        self.assertEqual(self.fixture.json('metadata.json'), {})
-
-    def test_vision_enc_and_sni(self):
-        # Prepare a local Reality origin through the same creation flow.
-        self.reality()
-        self.fixture.run_shell('delete', '1\ny\n')
-        self.fixture.run_shell('vision', PORT=str(self.fixture.public), ORIGIN=self.fixture.env['ORIGIN_PORT'], PROFILE='none')
-        self.edit('enc', '1\ny\n')
-        self.edit('sni', 'y\ny\n1\nvision.test\ny\n')
         self.traffic()
 
 

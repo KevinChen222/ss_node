@@ -1,5 +1,16 @@
 # 修改記錄
 
+## 22-singbox.1 — Sing-box 主核心與 Xray XHTTP 雙核心架構
+
+版本：`proxyall 2.2.0`、`sb.sh 22-singbox.1`、`deploy.sh 2026.11.22-local23`。
+
+- 恢復 `sing-box` 作為主服務核心，管理 VLESS Vision + Reality、AnyTLS / Any-Reality、Hysteria2、TUICv5、Shadowsocks、WS / gRPC、裸 VLESS TCP、SOCKS5、Argo 及中轉；保留 `20-kevin.44` 的 OpenSSL 域名匹配校驗與完整 AnyTLS 分享連結修正。
+- 保留獨立 `Xray` 備用核心與最新兩種 XHTTP 節點實現（VLESS XHTTP + TLS / H2、VLESS XHTTP + Reality），包含可選 VLESS ENC（預設 ML-KEM-768、X25519 或關閉）、XMUX 並發數、端口與全參數編輯、原域名證書修復及 Nginx / HAProxy 預檢。
+- 雙核心節點操作統一採用輸入後延遲取鎖、快照衝突核對、取消與無變更零副作用返回、`strenv()` YAML 字串名稱安全，以及 `lib/common.sh`、`lib/sni_router.sh` 共用 443 SNI 路由與五檔原子套件更新。
+- 修正 Vision / Any-Reality 直連與共享 443 雙向切換的 `jq` 變數展開錯誤；所有直接啟動或重載守護進程處統一關閉鎖文件描述符（`8>&- 9>&-`），避免 Nginx 等進程繼承配置寫鎖。
+- 批量建立節點改為單次 `_node_operation` 原子事務（單次校驗、單次重啟、任一失敗全量回滾），避免觸發 systemd 啟動限速或遺留部分節點；自簽 AnyTLS 原生 `clash.yaml` 同步寫入葉證書 `fingerprint`。
+- 兼容從 `2.1.0` 就地升級保留的歷史 Xray 原生節點（完整連結檢視、改端口、單刪、全刪與核心卸載）；修正混合核心狀態查詢在 `sing-box` 停止時漏報運行中 `Xray` 的問題，卸載時同步清理定時重啟 timer、受管日誌 drop-in 與 logrotate 設定。
+
 ## 21-xray.10 — 共用 SNI 路由與兩階段更新
 
 - `sb` 與 `nginxproxy` 共用 `lib/sni_router.sh` 讀寫路由狀態並套用 HAProxy 配置，`lib/common.sh` 統一配置寫鎖。從反代入口登記或移除 HTTPS 路由時保留已有的 Reality 及獨立 TLS 路由。
