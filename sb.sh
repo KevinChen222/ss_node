@@ -67,7 +67,7 @@ unset -f _proxyall_trusted_lib_path _proxyall_check_libraries
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="22-singbox.1"
+export SCRIPT_VERSION="22-singbox.2"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -8725,8 +8725,18 @@ _switch_reality_public_port() {
         return 1
     fi
     rm -f "$config_backup" "$metadata_backup" "$yaml_backup"
+    if [ -n "$new_link" ] && [ -n "${NODE_TX_DIR:-}" ]; then
+        printf '\n%b═══════════════════ 分享链接 ═══════════════════%b\n%b%s%b\n%b═════════════════════════════════════════════════%b\n' \
+            "$YELLOW" "$NC" "$CYAN" "$new_link" "$NC" "$YELLOW" "$NC" >> "$NODE_TX_DIR/share-links"
+    fi
     _success "Reality 公网端口已切换: ${old_public} -> ${new_public}（实际监听 ${target_listen}:${target_port}）"
     return 0
+}
+
+_pause_for_enter() {
+    local prompt="${1:-按回车键继续...}" _pause_dummy=""
+    echo ""
+    read -r -p "$prompt" _pause_dummy || return 0
 }
 
 _edit_node_menu() {
@@ -8800,7 +8810,13 @@ _edit_node_menu() {
         if [ "$selected_core" = "xray" ] && [[ "$selected_meta_type" == "vless-xhttp" || "$selected_meta_type" == "vless-xhttp-reality" ]]; then
             _xray_edit_node_menu "$selected_tag" || true
         else
-            _node_operation _modify_port_impl "$selected_tag" || true
+            local before_fp after_fp edit_status=0
+            before_fp=$(_node_fingerprint "$CONFIG_FILE" "$METADATA_FILE" "$CLASH_YAML_FILE" "$XRAY_CONFIG_FILE" "$SNI_ROUTER_STATE_FILE" 2>/dev/null || true)
+            _node_operation _modify_port_impl "$selected_tag" || edit_status=$?
+            after_fp=$(_node_fingerprint "$CONFIG_FILE" "$METADATA_FILE" "$CLASH_YAML_FILE" "$XRAY_CONFIG_FILE" "$SNI_ROUTER_STATE_FILE" 2>/dev/null || true)
+            if [ "$edit_status" -eq 0 ] && [ "$before_fp" != "$after_fp" ]; then
+                _pause_for_enter "端口修改完成，按回车键返回..."
+            fi
         fi
     done
 }
@@ -9057,6 +9073,10 @@ _modify_port_impl() {
                 fi
                 _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
                 _info "分享链接已同步更新。"
+                if [ -n "${NODE_TX_DIR:-}" ]; then
+                    printf '\n%b═══════════════════ 分享链接 ═══════════════════%b\n%b%s%b\n%b═════════════════════════════════════════════════%b\n' \
+                        "$YELLOW" "$NC" "$CYAN" "$new_link" "$NC" "$YELLOW" "$NC" >> "$NODE_TX_DIR/share-links"
+                fi
             fi
             local current_meta_name
             current_meta_name=$(jq -r ".\"$tag_to_modify\".name // \"\"" "$METADATA_FILE")
@@ -9512,7 +9532,7 @@ _main_menu() {
         read -r -p "  请输入选项 [0-18]: " choice || return 0
  
         case $choice in
-            1) _show_add_node_menu ;;
+            1) _show_add_node_menu; continue ;;
             2) _require_singbox && _argo_menu ;;
             3) _require_any_core && _view_nodes ;;
             4) _require_any_core && _delete_node ;;
@@ -9537,7 +9557,7 @@ _main_menu() {
             *) _error "无效输入，请重试。" ;;
         esac
         echo
-        read -n 1 -s -r -p "按任意键返回主菜单..." || return 0
+        read -r -p "按回车键返回主菜单..." _ || return 0
     done
 }
 
@@ -9785,11 +9805,11 @@ _batch_create_nodes() {
 _batch_create_nodes_impl() {
     local input_str="$1" NODE_UI=true NODE_PENDING_ORIGIN=''
     if [ -z "$input_str" ]; then
-        _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9)"
+        _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9；输入 0 返回)"
         _warn "注：批量部署不支持含有 CDN 的协议 (2, 3, 4)"
-        read -r -p "协议列表: " input_str || return 1
+        _node_read -r -p "协议列表: " input_str || return $?
     fi
-    [ -z "$input_str" ] && return 1
+    [ -z "$input_str" ] && return 2
 
     # 1. 解析协议列表
     local proto_ids=$(echo "$input_str" | tr ',' ' ' | xargs)
@@ -10033,10 +10053,16 @@ _show_add_node_menu() {
 
         read -r -p "  请输入选项 [0-13]: " choice || return 0
 
+        local op_status=0
         # 如果输入包含逗号或空格，自动进入批量处理模式
         if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
-            _require_singbox && _batch_create_nodes "$choice"
-            return
+            _require_singbox && _batch_create_nodes "$choice" || op_status=$?
+            if [ "$op_status" -eq 0 ]; then
+                _pause_for_enter "批量创建完成，按回车键返回主菜单..."
+            elif [ "$op_status" -eq 1 ]; then
+                _pause_for_enter "按回车键返回主菜单..."
+            fi
+            return "$op_status"
         fi
 
         if [[ "$choice" =~ ^([1-9]|10|12|13)$ ]]; then
@@ -10045,21 +10071,33 @@ _show_add_node_menu() {
 
         case "$choice" in
             0) return 0 ;;
-            1) _require_singbox && _add_vless_reality ;;
-            2) _require_singbox && _add_vless_ws_tls ;;
-            3) _require_singbox && _add_trojan_ws_tls ;;
-            4) _require_singbox && _add_vless_grpc_tls ;;
-            5) _require_singbox && _add_anytls ;;
-            6) _require_singbox && _add_hysteria2 ;;
-            7) _require_singbox && _add_tuic ;;
-            8) _require_singbox && _add_shadowsocks_menu ;;
-            9) _require_singbox && _add_vless_tcp ;;
-            10) _require_singbox && _add_socks ;;
-            11) _require_singbox && _batch_create_nodes; return ;;
-            12) _add_vless_xhttp_tls ;;
-            13) _add_vless_xhttp_reality ;;
+            1) _require_singbox && _add_vless_reality || op_status=$? ;;
+            2) _require_singbox && _add_vless_ws_tls || op_status=$? ;;
+            3) _require_singbox && _add_trojan_ws_tls || op_status=$? ;;
+            4) _require_singbox && _add_vless_grpc_tls || op_status=$? ;;
+            5) _require_singbox && _add_anytls || op_status=$? ;;
+            6) _require_singbox && _add_hysteria2 || op_status=$? ;;
+            7) _require_singbox && _add_tuic || op_status=$? ;;
+            8) _require_singbox && _add_shadowsocks_menu || op_status=$? ;;
+            9) _require_singbox && _add_vless_tcp || op_status=$? ;;
+            10) _require_singbox && _add_socks || op_status=$? ;;
+            11)
+                _require_singbox && _batch_create_nodes || op_status=$?
+                if [ "$op_status" -eq 0 ]; then
+                    _pause_for_enter "批量创建完成，按回车键返回主菜单..."
+                elif [ "$op_status" -eq 1 ]; then
+                    _pause_for_enter "按回车键返回主菜单..."
+                fi
+                return "$op_status" ;;
+            12) _add_vless_xhttp_tls || op_status=$? ;;
+            13) _add_vless_xhttp_reality || op_status=$? ;;
             *) _error "无效输入，请重试。"; continue ;;
         esac
+        if [ "$op_status" -eq 0 ]; then
+            _pause_for_enter "节点创建完成，按回车键返回..."
+        elif [ "$op_status" -eq 1 ]; then
+            _pause_for_enter "按回车键返回..."
+        fi
     done
 }
 
@@ -10214,9 +10252,15 @@ _xray_edit_node_menu() {
             4) field=sni ;; 5) field=enc ;; 6) field=path ;; 7) field=concurrency ;;
         esac
         [ -n "$field" ] || { _error '无效选择。'; continue; }
+        local before_fp after_fp
+        before_fp=$(_node_fingerprint "$CONFIG_FILE" "$METADATA_FILE" "$CLASH_YAML_FILE" "$XRAY_CONFIG_FILE" "$SNI_ROUTER_STATE_FILE" 2>/dev/null || true)
         status=0
         _node_operation _xray_edit_field "$tag" "$field" "$meta" || status=$?
-        if [ "$status" = 0 ]; then _info '可继续修改其他参数；客户端请使用最新分享链接。'; fi
+        after_fp=$(_node_fingerprint "$CONFIG_FILE" "$METADATA_FILE" "$CLASH_YAML_FILE" "$XRAY_CONFIG_FILE" "$SNI_ROUTER_STATE_FILE" 2>/dev/null || true)
+        if [ "$status" = 0 ] && [ "$before_fp" != "$after_fp" ]; then
+            _info '可继续修改其他参数；客户端请使用最新分享链接。'
+            _pause_for_enter "按回车键继续..."
+        fi
     done
 }
 

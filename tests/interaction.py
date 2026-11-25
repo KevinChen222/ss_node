@@ -56,6 +56,18 @@ case "$ACTION" in
         _add_vless_xhttp_tls() { printf 'xhttp-tls\n' >> "$WORK/dispatch"; }
         _add_vless_xhttp_reality() { printf 'xhttp-reality\n' >> "$WORK/dispatch"; }
         _show_add_node_menu ;;
+    add-pause)
+        _add_vless_reality() {
+            printf 'vision\n' >> "$WORK/dispatch"
+            [ "${VARIANT:-0}" = 0 ] && printf 'vless://created-link\n'
+            return "${VARIANT:-0}"
+        }
+        _add_anytls() { printf 'anytls\n' >> "$WORK/dispatch"; }
+        _batch_create_nodes() {
+            printf 'batch\n' >> "$WORK/dispatch"
+            return "${VARIANT:-0}"
+        }
+        _show_add_node_menu ;;
     main-menu) _main_menu ;;
     failed)
         change() { _atomic_modify_json "$METADATA_FILE" '.foo={}' && return 1; }
@@ -215,7 +227,7 @@ class Interaction(unittest.TestCase):
             self.assertIn('Xray', result.stdout)
 
     def test_add_menu_groups_singbox_primary_and_xray_xhttp(self):
-        result = self.run_shell('add-dispatch', '1\n5\n12\n13\n0\n')
+        result = self.run_shell('add-dispatch', '1\n\n5\n\n12\n\n13\n\n0\n')
         self.assertEqual(result.returncode, 0)
         self.assertEqual((self.root / 'dispatch').read_text().splitlines(),
                          ['vision', 'anytls', 'xhttp-tls', 'xhttp-reality'])
@@ -225,6 +237,36 @@ class Interaction(unittest.TestCase):
         self.assertIn('Xray 备用核心协议 (XHTTP)', result.stdout)
         self.assertIn('VLESS (XHTTP + TLS / H2)', result.stdout)
         self.assertIn('VLESS (XHTTP + Reality)', result.stdout)
+
+    def test_add_menu_pauses_after_create_but_not_on_cancel_or_eof(self):
+        # Successful creation consumes the Enter pause before reading the next menu choice.
+        result = self.run_shell('add-pause', '1\n5\n0\n', variant='0')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((self.root / 'dispatch').read_text().splitlines(), ['vision'])
+        self.assertIn('vless://created-link', result.stdout)
+        (self.root / 'dispatch').unlink()
+
+        # EOF immediately after successful creation exits cleanly without hanging or erroring.
+        eof_result = self.run_shell('add-pause', '1\n', variant='0')
+        self.assertEqual(eof_result.returncode, 0)
+        self.assertEqual((self.root / 'dispatch').read_text().splitlines(), ['vision'])
+        (self.root / 'dispatch').unlink()
+
+        # Canceled creation (status 2 from 0/EOF) does NOT pause; next line is read as menu choice.
+        cancel_result = self.run_shell('add-pause', '1\n5\n\n0\n', variant='2')
+        self.assertEqual(cancel_result.returncode, 0)
+        self.assertEqual((self.root / 'dispatch').read_text().splitlines(), ['vision', 'anytls'])
+        (self.root / 'dispatch').unlink()
+
+        # Batch creation pauses on success and returns cleanly on cancel/EOF.
+        batch_ok = self.run_shell('add-pause', '11\n\n', variant='0')
+        self.assertEqual(batch_ok.returncode, 0)
+        self.assertEqual((self.root / 'dispatch').read_text().splitlines(), ['batch'])
+        (self.root / 'dispatch').unlink()
+
+        batch_cancel = self.run_shell('add-pause', '11\n', variant='2')
+        self.assertEqual(batch_cancel.returncode, 2)
+        self.assertEqual((self.root / 'dispatch').read_text().splitlines(), ['batch'])
 
     def test_candidate_failure_and_noop_preserve_original_files(self):
         self.assertEqual(self.run_shell('failed', lock=True).returncode, 1)
