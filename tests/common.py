@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Cover the shared entry bootstrap and the real first-stage maintenance call."""
+"""Cover the shared entry bootstrap, module loading and the staged maintenance calls."""
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -40,6 +41,33 @@ for bad in 256.1.2.3 0.0.0 0001.2.3.4 1.2.3.4.5; do
     if "$2" "$bad"; then exit 1; fi
 done
 ''', entry, validator)
+
+    def test_bootstrap_block_is_identical_in_both_entries(self):
+        pattern = re.compile(r'^# >>> proxyall bootstrap\n.*?^# <<< proxyall bootstrap\n', re.M | re.S)
+        blocks = [pattern.search((REPO / name).read_text()) for name in ('sb.sh', 'deploy.sh')]
+        self.assertTrue(all(blocks))
+        self.assertEqual(blocks[0].group(0), blocks[1].group(0))
+
+    def test_function_ownership_and_bundle_lists(self):
+        result = subprocess.run(['python3', REPO / 'tools/check_functions.py'],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_modules_keep_maintenance_and_gate_features(self):
+        lib = self.work / 'lib'
+        lib.mkdir()
+        for name in ('common.sh', 'sni_router.sh'):
+            shutil.copyfile(REPO / 'lib' / name, lib / name)
+        shutil.copyfile(REPO / 'sb.sh', self.work / 'sb.sh')
+        result = self.shell(r'''
+source ./sb.sh
+[[ $SB_MODULES_READY == false ]]
+declare -F _setup_log_cleanup _cleanup_runtime_logs _cleanup_config_backups _pkg_install >/dev/null
+if declare -F _node_operation >/dev/null; then exit 1; fi
+if _sb_require_modules; then exit 1; fi
+if _advanced_features; then exit 1; fi
+''')
+        self.assertIn('proxyall --update', result.stderr)
 
     def test_incomplete_checkout_returns_before_loading_either_library(self):
         (self.work / 'lib').mkdir()
@@ -105,12 +133,21 @@ printf '%s\n' "$1" > "$PA_STAGE/commit"
 test ! -e /usr/local/lib/proxyall/common.sh
 test ! -e /usr/local/lib/proxyall/sni_router.sh
 test ! -d /run/systemd/system
-pa_install_bundle
+pa_install_bundle 2>/tmp/install.err
 cmp /tmp/repo/sb.sh /usr/local/bin/sb
+grep -Fq '日志维护将在下一次 proxyall 更新补齐配套库后设置' /tmp/install.err
+test ! -e "$PROXYALL_LOGROTATE_DIR/proxyall"
+if crontab -l 2>/dev/null | grep -Fq sing-box-log-cleanup; then exit 1; fi
+
+# The second update installs every library; maintenance then runs for real.
+install -d -m 755 /usr/local/lib/proxyall
+install -m 644 /tmp/repo/lib/*.sh /usr/local/lib/proxyall/
+PROXYALL_MANAGED=1 bash /usr/local/bin/sb setup-maintenance
 test -f "$PROXYALL_WRITE_LOCK_FILE"
 grep -Fx '# Managed by proxyall log maintenance' "$PROXYALL_LOGROTATE_DIR/proxyall"
 crontab -l | grep -Fx '*/15 * * * * bash /usr/local/bin/sb cleanup-logs >/dev/null 2>&1 # sing-box-log-cleanup'
 pgrep -a -x cron
+rm -rf /usr/local/lib/proxyall
 
 # Installed commands ignore a marked library tree in cwd or the environment.
 mkdir lib /usr/local/bin/lib
@@ -134,6 +171,14 @@ cp /tmp/repo/lib/common.sh /usr/local/lib/proxyall/
 must_refuse env PROXYALL_MANAGED=1 bash /usr/local/bin/sb setup-maintenance
 [[ ! -e /tmp/blocked && ! -e $PROXYALL_WRITE_LOCK_FILE ]]
 cp /tmp/repo/lib/sni_router.sh /usr/local/lib/proxyall/
+# Entry and shared libraries only: maintenance works, node features ask for the second update.
+PROXYALL_MANAGED=1 bash /usr/local/bin/sb setup-maintenance
+must_refuse_update() {
+    if "$@" >/tmp/stdout 2>/tmp/stderr; then return 1; fi
+    grep -Fq 'proxyall --update' /tmp/stderr
+}
+must_refuse_update bash /usr/local/bin/sb sni-router api-version
+cp /tmp/repo/lib/*.sh /usr/local/lib/proxyall/
 chmod g+w /usr/local/lib/proxyall/common.sh
 must_refuse bash /usr/local/bin/sb sni-router api-version
 must_refuse bash /usr/local/bin/nginxproxy --version

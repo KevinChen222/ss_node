@@ -1,1188 +1,39 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# PROXYALL_LIB=relay.sh
+# sing-box 中转模块：落地 Token、中转导入（Token / 第三方链接）、中转链路管理、端口转发与规则集分流。
+# 由 sb 在子 shell 中加载（主菜单 17，以及 sb pf-dns-refresh 定时任务），依赖 sb 已加载的公共库与功能模块。
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    printf '%s\n' '中转模块由 sb 加载：请运行 sb，在主菜单选择 17。' >&2
+    exit 2
+fi
+if ! declare -F _node_operation >/dev/null || ! declare -F _select_reality_sni >/dev/null; then
+    printf '%s\n' '中转模块需要 sb 的公共库与功能模块，请通过 sb 主菜单 17 进入。' >&2
+    return 1
+fi
 
-# 所有组件固定先取配置写锁，再取 SNI/端口转发资源锁。
-_config_write_lock() {
-    local lock_file="${PROXYALL_WRITE_LOCK_FILE:-/run/lock/proxyall-config.lock}"
-    if [ "${PROXYALL_WRITE_LOCK_HELD:-}" = "$lock_file" ] && [ /dev/fd/8 -ef "$lock_file" ]; then
-        return 0
-    fi
-    if ! command -v flock >/dev/null 2>&1; then
-        if declare -F _pkg_install >/dev/null; then _pkg_install util-linux || return 1
-        elif command -v apk >/dev/null 2>&1; then apk add --no-cache util-linux || return 1
-        elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y util-linux || return 1
-        else echo '请先安装 util-linux（flock）；拒绝无锁修改配置。' >&2; return 1; fi
-        command -v flock >/dev/null 2>&1 || return 1
-    fi
-    mkdir -p "$(dirname "$lock_file")" || return 1
-    exec 8>"$lock_file" || return 1
-    flock -x -w 30 8 || { echo '配置正被其他管理进程修改，请稍后重试。' >&2; return 1; }
-    export PROXYALL_WRITE_LOCK_HELD="$lock_file"
-}
-
-# PROXYALL_COMPONENT=advanced_relay.sh
-
-# 中转配置、节点凭据与私钥默认仅允许 root 读取。
-umask 077
-
-# 核心环境定义
-SCRIPT_VERSION="16-kevin.18"
-SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_BIN="/usr/local/bin/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/KevinChen222/ss_node/main"
-DEFAULT_SNI="www.icloud.com"
-DEFAULT_REALITY_SNI="www.amd.com"
 DEFAULT_FINGERPRINT="firefox"
-REALITY_LOCAL_ORIGIN_HOST="127.0.0.1"
-REALITY_LOCAL_ORIGIN_PORT=8443
-SNI_ROUTER_API_VERSION=1
-SNI_ROUTER_PUBLIC_PORT=443
-SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT=2443
-PARSER_SHA256="1facb8460e60c399ae259df5f01bd8bc3f95856f588ea748e68c7810aa13eb65"
-REALITL_SCANNER_VERSION="v0.2.3"
-REALITL_SCANNER_RELEASE_BASE="https://github.com/XTLS/RealiTLScanner/releases/download/${REALITL_SCANNER_VERSION}"
-REALITL_SCANNER_AMD64_SHA256="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
-REALITL_SCANNER_ARM64_SHA256="27bdd3e53d4391c66c8df3391d3c3fb5eb2dc356125f2fb33ac58fcaaf8f88b3"
-REALITL_SCANNER_DIR="/usr/local/lib/singbox-lite"
-REALITL_SCANNER_BIN="${REALITL_SCANNER_DIR}/RealiTLScanner"
-REALITL_SCANNER_MARKER="${REALITL_SCANNER_DIR}/RealiTLScanner.release"
-REALITY_SNI_MAX_SCAN_TARGETS=512
-# 基于 3x-ui 当前内置 Reality 扫描种子；www.cloudflare.com 因既有非 Cloudflare 规则省略。
-REALITY_SNI_SEED_DOMAINS=(
-    "www.microsoft.com"
-    "www.amazon.com"
-    "aws.amazon.com"
-    "www.samsung.com"
-    "www.nvidia.com"
-    "www.amd.com"
-    "www.intel.com"
-    "www.sony.com"
-    "dl.google.com"
-)
-GREATFIRE_API_BASE="https://zh.greatfire.org"
-
-# [整合方案] 检测父进程导出的工具函数
-# 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# 核心工具函数
-_url_encode() {
-    # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
-    printf '%s' "$1" | jq -sRr @uri
-}
-
-if ! declare -f _cert_sha256_hex >/dev/null 2>&1; then
-    _cert_sha256_hex() {
-        local cert_path="$1"
-        [ -f "$cert_path" ] || return 1
-        openssl x509 -in "$cert_path" -noout -fingerprint -sha256 2>/dev/null | \
-            awk -F= 'NR==1 { gsub(":", "", $2); print tolower($2) }'
-    }
-fi
-
-# 打印消息函数 (强制重定向到 stderr，防止干扰变量捕获)
-if ! declare -f _info >/dev/null; then
-    _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
-    _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
-    _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
-    _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
-fi
-
-# --- 全局变量 ---
-# 工具路径
-YQ_BINARY="/usr/local/bin/yq"
-
-# 配置文件路径
 MAIN_CONFIG_FILE="${SINGBOX_DIR}/config.json"
 MAIN_METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 RELAY_AUX_DIR="${SINGBOX_DIR}"
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
 RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
 
-# yq 应由 sb.sh 通过校验后安装；中转脚本不再下载未校验的 latest 二进制。
-_install_yq() {
-    [ -x "$YQ_BINARY" ] && return 0
-    _error "未找到受信任的 yq: $YQ_BINARY"
-    _warn "请先运行同仓库中的 sb.sh 安装/修复运行环境。"
-    return 1
-}
-
+# 共享 443 路由与 sb 节点使用同一个 sni_router 库和锁顺序（先配置写锁，再路由锁）。
 _sni_router_call() {
-    if [ ! -x /usr/local/bin/sb ]; then
-        _error "未找到 /usr/local/bin/sb，无法使用 HAProxy 443 共享入口。"
-        return 1
-    fi
-    local api
-    api=$(/usr/local/bin/sb sni-router api-version 2>/dev/null) || return 1
-    if [ "$api" != "$SNI_ROUTER_API_VERSION" ]; then
-        _error "sb.sh 的 SNI 路由接口版本不兼容（需要 ${SNI_ROUTER_API_VERSION}，实际 ${api:-unknown}）。"
-        return 1
-    fi
-    /usr/local/bin/sb sni-router "$@"
+    _sni_router_cli "$@"
 }
 
 _sni_router_allocate_backend() {
     _sni_router_call allocate-backend "$SNI_ROUTER_DEFAULT_REALITY_BACKEND_PORT"
 }
 
-# 核心环境检测 (与主脚本 singbox.sh 保持一致)
-_detect_init_system() {
-    if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
-        INIT_SYSTEM="openrc"
-    elif command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        INIT_SYSTEM="systemd"
-    else
-        INIT_SYSTEM="direct"
-    fi
-}
-[ -z "$INIT_SYSTEM" ] && _detect_init_system
-
-# 公网 IP 获取 (带全局缓存)
-server_ip=""
-_get_public_ip() {
-    [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-    local ip=$(timeout 5 curl -fsS4 --max-time 2 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS4 --max-time 2 https://ipinfo.io/ip 2>/dev/null)
-    [ -z "$ip" ] && ip=$(timeout 5 curl -fsS6 --max-time 2 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS6 --max-time 2 https://ipinfo.io/ip 2>/dev/null)
-    ip=$(printf '%s' "$ip" | tr -d '\r\n ')
-    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && [[ ! "$ip" =~ ^[0-9A-Fa-f:]+$ ]]; then
-        _error "无法获取有效的公网 IP。"
-        return 1
-    fi
-    server_ip="$ip"
-    echo "$ip"
+# 中转配置只改 sing-box：重启 sing-box 并加载 config.json + relay.json，不重启 Xray。
+_relay_service() {
+    _manage_singbox_service_impl "$@"
 }
 
-# Reality SNI 与握手目标必须分开保存：扫描结果是“证书域名 + 邻居 IP”。
-REALITY_SNI_SCAN_DONE=false
-REALITY_SNI_DOMAINS=()
-REALITY_SNI_LATENCIES=()
-REALITY_SNI_TARGETS=()
-REALITY_SNI_CHINA_STATUSES=()
-SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
-SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
-SELECTED_REALITY_HANDSHAKE_PORT=443
-REALITY_PROBE_ERROR=""
-REALITY_PROBE_LATENCY=""
-REALITY_PROBE_HTTP_STATUS=""
-REALITY_CHINA_CHECK_ENABLED=false
-GREATFIRE_RESULT_CODE=2
-GREATFIRE_RESULT_LABEL="未验证"
-GREATFIRE_RESULT_LAST_TESTED=""
-GREATFIRE_CACHE_DOMAINS=()
-GREATFIRE_CACHE_CODES=()
-GREATFIRE_CACHE_LABELS=()
-GREATFIRE_CACHE_LAST_TESTED=()
-
-_is_valid_ipv4() {
-    local ip="$1" a b c d
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    IFS='.' read -r a b c d <<< "$ip"
-    for a in "$a" "$b" "$c" "$d"; do
-        [ "$((10#$a))" -le 255 ] 2>/dev/null || return 1
-    done
-}
-
-_ipv4_to_int() {
-    local a b c d
-    _is_valid_ipv4 "$1" || return 1
-    IFS='.' read -r a b c d <<< "$1"
-    printf '%u\n' "$(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))"
-}
-
-_ipv4_in_cidr() {
-    local ip_int network_int prefix mask
-    ip_int=$(_ipv4_to_int "$1") || return 1
-    network_int=$(_ipv4_to_int "${2%/*}") || return 1
-    prefix="${2#*/}"
-    [ "$prefix" -ge 0 ] 2>/dev/null && [ "$prefix" -le 32 ] 2>/dev/null || return 1
-    if [ "$prefix" -eq 0 ]; then
-        mask=0
-    else
-        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
-    fi
-    [ $((ip_int & mask)) -eq $((network_int & mask)) ]
-}
-
-_is_cloudflare_ipv4() {
-    local ip="$1" cidr
-    local ranges=(
-        "173.245.48.0/20" "103.21.244.0/22" "103.22.200.0/22" "103.31.4.0/22"
-        "141.101.64.0/18" "108.162.192.0/18" "190.93.240.0/20" "188.114.96.0/20"
-        "197.234.240.0/22" "198.41.128.0/17" "162.158.0.0/15" "104.16.0.0/13"
-        "104.24.0.0/14" "172.64.0.0/13" "131.0.72.0/22"
-    )
-    for cidr in "${ranges[@]}"; do
-        _ipv4_in_cidr "$ip" "$cidr" && return 0
-    done
-    return 1
-}
-
-_target_uses_cloudflare() {
-    local target="$1" ip
-    if _is_valid_ipv4 "$target"; then
-        _is_cloudflare_ipv4 "$target"
-        return
-    fi
-    while read -r ip; do
-        [ -z "$ip" ] && continue
-        _is_cloudflare_ipv4 "$ip" && return 0
-    done < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
-    return 1
-}
-
-_is_valid_reality_domain() {
-    local domain="${1,,}" label
-    local labels=()
-    [ "${#domain}" -le 253 ] || return 1
-    [[ "$domain" == *.* ]] || return 1
-    [[ "$domain" != *..* && "$domain" != .* && "$domain" != *. && "$domain" != *"*"* ]] || return 1
-    IFS='.' read -r -a labels <<< "$domain"
-    for label in "${labels[@]}"; do
-        [ "${#label}" -ge 1 ] && [ "${#label}" -le 63 ] || return 1
-        [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
-    done
-    return 0
-}
-
-_realitlscanner_release_spec() {
-    case "$(uname -m)" in
-        x86_64|amd64)
-            printf '%s\t%s\n' "RealiTLScanner-linux-amd64" "$REALITL_SCANNER_AMD64_SHA256"
-            ;;
-        aarch64|arm64)
-            printf '%s\t%s\n' "RealiTLScanner-linux-arm64" "$REALITL_SCANNER_ARM64_SHA256"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-_install_realitlscanner() {
-    local spec asset_name expected_sha expected_marker temp_dir candidate actual_sha
-    spec=$(_realitlscanner_release_spec) || {
-        _error "RealiTLScanner ${REALITL_SCANNER_VERSION} 未提供当前架构 $(uname -m) 的官方 Linux 二进制。"
-        _warn "为避免临时安装 Go 与本地编译，已中止扫描器安装。"
-        return 1
-    }
-    IFS=$'\t' read -r asset_name expected_sha <<< "$spec"
-    expected_marker="${REALITL_SCANNER_VERSION}:${asset_name}:${expected_sha}"
-    if [ -x "$REALITL_SCANNER_BIN" ] && [ -r "$REALITL_SCANNER_MARKER" ] && \
-       [ "$(tr -d '\r\n ' < "$REALITL_SCANNER_MARKER")" = "$expected_marker" ]; then
-        return 0
-    fi
-
-    if ! command -v sha256sum >/dev/null 2>&1 || \
-       { ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; }; then
-        _error "缺少 sha256sum 或下载工具，请先运行同仓库的 sb.sh 修复依赖。"
-        return 1
-    fi
-    temp_dir=$(mktemp -d /tmp/sb-realitlscanner.XXXXXX) || {
-        _error "无法创建 RealiTLScanner 临时目录。"
-        return 1
-    }
-    candidate="${temp_dir}/${asset_name}"
-    _info "正在下载并校验 XTLS/RealiTLScanner ${REALITL_SCANNER_VERSION} (${asset_name})..."
-    if command -v curl >/dev/null 2>&1; then
-        if ! curl -fL --connect-timeout 10 --max-time 180 \
-            "${REALITL_SCANNER_RELEASE_BASE}/${asset_name}" -o "$candidate"; then
-            rm -f "$candidate"
-        fi
-    fi
-    if [ ! -s "$candidate" ] && command -v wget >/dev/null 2>&1; then
-        wget -qO "$candidate" "${REALITL_SCANNER_RELEASE_BASE}/${asset_name}" || true
-    fi
-    actual_sha=$(sha256sum "$candidate" 2>/dev/null | awk '{print $1}')
-    if [ ! -s "$candidate" ] || [ "$actual_sha" != "$expected_sha" ]; then
-        [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-        _error "RealiTLScanner 下载失败或 SHA-256 校验不匹配，已拒绝安装。"
-        return 1
-    fi
-    chmod 700 "$candidate"
-    if ! mkdir -p "$REALITL_SCANNER_DIR" || ! install -m 700 "$candidate" "$REALITL_SCANNER_BIN"; then
-        [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-        _error "无法将 RealiTLScanner 安装到 ${REALITL_SCANNER_BIN}。"
-        return 1
-    fi
-    if ! printf '%s\n' "$expected_marker" > "$REALITL_SCANNER_MARKER" || \
-       ! chmod 600 "$REALITL_SCANNER_MARKER" || \
-       ! mkdir -p "$SINGBOX_DIR" || ! touch "${SINGBOX_DIR}/.managed_realitlscanner"; then
-        [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-        _error "无法写入 RealiTLScanner 安装校验标记。"
-        return 1
-    fi
-    rm -f "${REALITL_SCANNER_DIR}/RealiTLScanner.commit"
-    [[ "$temp_dir" == /tmp/sb-realitlscanner.* ]] && rm -rf -- "$temp_dir"
-    _success "RealiTLScanner ${REALITL_SCANNER_VERSION} 官方二进制已安装并通过固定 SHA-256 校验。"
-}
-
-_prepare_local_reality_origin() {
-    local domain="$1"
-    if [ ! -x /usr/local/bin/sb ]; then
-        _error "找不到 /usr/local/bin/sb，无法安全配置自有证书与本机 Nginx 源站。"
-        _warn "请先安装/更新同仓库的 sb.sh。"
-        return 1
-    fi
-    bash /usr/local/bin/sb install-reality-origin "$domain"
-}
-
-_probe_reality_target() {
-    local target="$1" sni="$2" target_port="${3:-443}" connect_target curl_result curl_headers curl_meta appconnect
-    local tls_output
-    REALITY_PROBE_ERROR=""
-    REALITY_PROBE_LATENCY=""
-    REALITY_PROBE_HTTP_STATUS=""
-
-    _target_uses_cloudflare "$target" && {
-        REALITY_PROBE_ERROR="目标 IP 属于 Cloudflare 公开网段"
-        return 1
-    }
-    [[ "$target_port" =~ ^[0-9]+$ ]] && [ "$target_port" -ge 1 ] && [ "$target_port" -le 65535 ] || {
-        REALITY_PROBE_ERROR="目标端口无效"
-        return 1
-    }
-    connect_target="${target}:${target_port}"
-    [[ "$target" == *:* ]] && connect_target="[${target}]:${target_port}"
-    tls_output=$(timeout 7 openssl s_client -connect "$connect_target" -servername "$sni" \
-        -verify_hostname "$sni" -verify_return_error -tls1_3 -alpn h2 </dev/null 2>&1 | \
-        LC_ALL=C tr -d '\000') || true
-    printf '%s' "$tls_output" | grep -q 'TLSv1.3' || {
-        REALITY_PROBE_ERROR="未协商 TLS 1.3"
-        return 1
-    }
-    printf '%s' "$tls_output" | grep -q 'ALPN protocol: h2' || {
-        REALITY_PROBE_ERROR="未协商 HTTP/2 (h2)"
-        return 1
-    }
-    printf '%s' "$tls_output" | grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' || {
-        REALITY_PROBE_ERROR="证书与 SNI 不匹配或证书链无效"
-        return 1
-    }
-
-    local curl_args=(-sS -I --noproxy '*' --connect-timeout 4 --max-time 8)
-    _is_valid_ipv4 "$target" && curl_args+=(--resolve "${sni}:${target_port}:${target}")
-    curl_result=$(curl "${curl_args[@]}" -w $'\nSB_REALITY:%{http_code}\t%{time_appconnect}' \
-        "https://${sni}:${target_port}/" 2>/dev/null) || {
-        REALITY_PROBE_ERROR="HTTPS 请求失败"
-        return 1
-    }
-    curl_meta=$(printf '%s\n' "$curl_result" | awk -F: '/^SB_REALITY:/{v=$2} END{print v}')
-    curl_headers=$(printf '%s\n' "$curl_result" | sed '/^SB_REALITY:/d')
-    IFS=$'\t' read -r REALITY_PROBE_HTTP_STATUS appconnect <<< "$curl_meta"
-    [[ "$REALITY_PROBE_HTTP_STATUS" =~ ^3[0-9][0-9]$ ]] && {
-        REALITY_PROBE_ERROR="根路径返回 HTTP ${REALITY_PROBE_HTTP_STATUS} 跳转"
-        return 1
-    }
-    [[ "$REALITY_PROBE_HTTP_STATUS" =~ ^[245][0-9][0-9]$ ]] || {
-        REALITY_PROBE_ERROR="无法确认根路径 HTTP 状态"
-        return 1
-    }
-    printf '%s\n' "$curl_headers" | grep -qi '^server:[[:space:]]*cloudflare' && {
-        REALITY_PROBE_ERROR="HTTP 响应由 Cloudflare 提供"
-        return 1
-    }
-    REALITY_PROBE_LATENCY=$(awk -v t="$appconnect" 'BEGIN { printf "%.0f", t * 1000 }')
-    [[ "$REALITY_PROBE_LATENCY" =~ ^[0-9]+$ ]] || REALITY_PROBE_LATENCY=99999
-    return 0
-}
-
-# GreatFire 的判定来自中国大陆探针与境外对照点；它只能提供风险证据，不能保证
-# 所有省份、运营商和时刻都可达。返回值：0=未发现屏蔽，1=已知高风险，2=无结论。
-_greatfire_fetch_verdict() {
-    local domain="$1" response headline stale conclusions last_tested
-    GREATFIRE_RESULT_CODE=2
-    GREATFIRE_RESULT_LABEL="无大陆侧数据"
-    GREATFIRE_RESULT_LAST_TESTED=""
-
-    response=$(curl -fsS --connect-timeout 5 --max-time 12 --retry 1 --retry-delay 1 \
-        -H 'Accept: application/json' \
-        -H "User-Agent: singbox-lite/${SCRIPT_VERSION} gfw-check" \
-        "${GREATFIRE_API_BASE}/api/url/https/${domain}" 2>/dev/null) || return 2
-    jq -e 'type == "object" and (.headline | type == "string")' \
-        >/dev/null 2>&1 <<< "$response" || return 2
-
-    headline=$(jq -r '.headline' <<< "$response")
-    stale=$(jq -r '.stale // false' <<< "$response")
-    conclusions=$(jq -r '.conclusions // 0' <<< "$response")
-    last_tested=$(jq -r '.last_tested // empty' <<< "$response")
-    if [[ "$last_tested" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]; then
-        GREATFIRE_RESULT_LAST_TESTED="${last_tested%%T*}"
-    fi
-
-    if [ "$stale" = "true" ]; then
-        GREATFIRE_RESULT_LABEL="数据过期"
-        return 2
-    fi
-    case "$headline" in
-        "not blocked")
-            if [[ "$conclusions" =~ ^[0-9]+$ ]] && [ "$conclusions" -gt 0 ]; then
-                GREATFIRE_RESULT_CODE=0
-                GREATFIRE_RESULT_LABEL="历史未屏蔽${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
-                return 0
-            fi
-            GREATFIRE_RESULT_LABEL="数据不足"
-            return 2
-            ;;
-        blocked)
-            GREATFIRE_RESULT_CODE=1
-            GREATFIRE_RESULT_LABEL="已知被屏蔽${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
-            return 1
-            ;;
-        intermittent)
-            GREATFIRE_RESULT_CODE=1
-            GREATFIRE_RESULT_LABEL="存在间歇性干扰${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
-            return 1
-            ;;
-        redirected)
-            GREATFIRE_RESULT_CODE=1
-            GREATFIRE_RESULT_LABEL="大陆侧重定向${GREATFIRE_RESULT_LAST_TESTED:+(${GREATFIRE_RESULT_LAST_TESTED})}"
-            return 1
-            ;;
-        unresolvable)
-            GREATFIRE_RESULT_CODE=1
-            GREATFIRE_RESULT_LABEL="公共 DNS 无法解析"
-            return 1
-            ;;
-        *)
-            GREATFIRE_RESULT_LABEL="数据不足"
-            return 2
-            ;;
-    esac
-}
-
-_greatfire_cached_verdict() {
-    local domain="$1" i result
-    for i in "${!GREATFIRE_CACHE_DOMAINS[@]}"; do
-        if [ "${GREATFIRE_CACHE_DOMAINS[$i]}" = "$domain" ]; then
-            GREATFIRE_RESULT_CODE="${GREATFIRE_CACHE_CODES[$i]}"
-            GREATFIRE_RESULT_LABEL="${GREATFIRE_CACHE_LABELS[$i]}"
-            GREATFIRE_RESULT_LAST_TESTED="${GREATFIRE_CACHE_LAST_TESTED[$i]}"
-            return "$GREATFIRE_RESULT_CODE"
-        fi
-    done
-
-    _greatfire_fetch_verdict "$domain"
-    result=$?
-    GREATFIRE_CACHE_DOMAINS+=("$domain")
-    GREATFIRE_CACHE_CODES+=("$result")
-    GREATFIRE_CACHE_LABELS+=("$GREATFIRE_RESULT_LABEL")
-    GREATFIRE_CACHE_LAST_TESTED+=("$GREATFIRE_RESULT_LAST_TESTED")
-    return "$result"
-}
-
-_greatfire_live_verify() {
-    local domain="$1" payload response state triggered started elapsed last_state="" failures=0
-    payload=$(jq -cn --arg url "https://${domain}" '{url:$url}') || return 2
-    started=$(date +%s)
-    _info "正在请求 GreatFire 中国大陆探针实测 ${domain}；通常需要几十秒，最长等待 150 秒..."
-
-    while true; do
-        elapsed=$(( $(date +%s) - started ))
-        [ "$elapsed" -lt 150 ] || {
-            GREATFIRE_RESULT_CODE=2
-            GREATFIRE_RESULT_LABEL="大陆探针等待超时"
-            return 2
-        }
-        response=$(curl -fsS --connect-timeout 5 --max-time 15 \
-            -H 'Accept: application/json' -H 'Content-Type: application/json' \
-            -H "User-Agent: singbox-lite/${SCRIPT_VERSION} gfw-check" \
-            -X POST --data "$payload" "${GREATFIRE_API_BASE}/api/test-now" 2>/dev/null) || {
-            failures=$((failures + 1))
-            if [ "$failures" -ge 3 ]; then
-                GREATFIRE_RESULT_CODE=2
-                GREATFIRE_RESULT_LABEL="大陆探针接口不可用"
-                return 2
-            fi
-            sleep 2
-            continue
-        }
-        failures=0
-        jq -e 'type == "object"' >/dev/null 2>&1 <<< "$response" || {
-            GREATFIRE_RESULT_CODE=2
-            GREATFIRE_RESULT_LABEL="大陆探针返回格式异常"
-            return 2
-        }
-        triggered=$(jq -r '.triggered // false' <<< "$response")
-        state=$(jq -r '.state // "error"' <<< "$response")
-        if [ "$triggered" != "true" ] || [ "$state" = "error" ]; then
-            GREATFIRE_RESULT_CODE=2
-            GREATFIRE_RESULT_LABEL="大陆探针拒绝或无法执行测试"
-            return 2
-        fi
-        if [ "$state" != "$last_state" ]; then
-            case "$state" in
-                waiting_backend) _info "大陆探针任务已提交，正在等待后端..." ;;
-                waiting_cn) _info "境外对照已响应，正在等待中国大陆探针..." ;;
-                partial) _info "已收到部分大陆探针结果，继续等待..." ;;
-            esac
-            last_state="$state"
-        fi
-        case "$state" in
-            done)
-                sleep 1
-                _greatfire_fetch_verdict "$domain"
-                return $?
-                ;;
-            timeout)
-                GREATFIRE_RESULT_CODE=2
-                GREATFIRE_RESULT_LABEL="大陆探针测试超时"
-                return 2
-                ;;
-        esac
-        sleep 2
-    done
-}
-
-_confirm_reality_china_reachability() {
-    local domain="$1" result force_unverified
-    if [ "$REALITY_CHINA_CHECK_ENABLED" != "true" ]; then
-        _warn "${domain} 尚未从中国大陆网络验证；境外 TLS/H2 成功不能证明其未被 GFW 屏蔽。"
-        read -r -p "仍要使用这个未经大陆验证的 SNI？[y/N]: " force_unverified
-        [[ "$force_unverified" == "y" || "$force_unverified" == "Y" ]]
-        return
-    fi
-
-    _greatfire_live_verify "$domain"
-    result=$?
-    case "$result" in
-        0)
-            _success "大陆探针本次判定：未屏蔽。"
-            _warn "该结果只覆盖 GreatFire 当前探针，不能保证所有省份、运营商和未来时刻。"
-            return 0
-            ;;
-        1)
-            _error "已拒绝该 SNI：GreatFire 判定为 ${GREATFIRE_RESULT_LABEL}。"
-            return 1
-            ;;
-        *)
-            _warn "无法取得明确的大陆侧结论：${GREATFIRE_RESULT_LABEL}。"
-            read -r -p "仍要使用这个结果不明确的 SNI？[y/N]: " force_unverified
-            [[ "$force_unverified" == "y" || "$force_unverified" == "Y" ]]
-            return
-            ;;
-    esac
-}
-
-_is_safe_reality_scan_cidr() {
-    local value="$1" ip prefix
-    [[ "$value" == */* ]] || return 1
-    ip="${value%/*}"; prefix="${value#*/}"
-    _is_valid_ipv4 "$ip" || return 1
-    [[ "$prefix" =~ ^[0-9]+$ ]] && [ "$prefix" -ge 24 ] && [ "$prefix" -le 32 ]
-}
-
-_prepare_reality_custom_scan_file() {
-    local output_file="$1" raw_line token normalized prefix expanded
-    local total_targets=0 valid_entries=0 invalid_entries=0
-    local seen=" "
-    local tokens=()
-    : > "$output_file" || { _error "无法创建自定义扫描列表。"; return 1; }
-
-    echo "请粘贴域名、IPv4 或 IPv4 CIDR；支持每行一个，也可用空格或逗号分隔。"
-    echo "CIDR 仅允许 /24-/32，全部条目展开后最多 ${REALITY_SNI_MAX_SCAN_TARGETS} 个目标；输入空行结束。"
-    while true; do
-        IFS= read -r raw_line || break
-        raw_line="${raw_line//$'\r'/}"
-        [ -z "${raw_line//[[:space:]]/}" ] && break
-        raw_line="${raw_line//,/ }"
-        raw_line="${raw_line//;/ }"
-        read -r -a tokens <<< "$raw_line"
-        for token in "${tokens[@]}"; do
-            normalized=$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')
-            [ -z "$normalized" ] && continue
-            expanded=1
-            if [[ "$normalized" == */* ]]; then
-                if ! _is_safe_reality_scan_cidr "$normalized"; then
-                    _warn "已忽略无效或过大的 CIDR: ${token}"
-                    invalid_entries=$((invalid_entries + 1))
-                    continue
-                fi
-                prefix="${normalized#*/}"
-                expanded=$((1 << (32 - 10#$prefix)))
-            elif _is_valid_ipv4 "$normalized"; then
-                :
-            elif _is_valid_reality_domain "$normalized"; then
-                :
-            else
-                _warn "已忽略无效目标: ${token}"
-                invalid_entries=$((invalid_entries + 1))
-                continue
-            fi
-            [[ "$seen" == *" ${normalized} "* ]] && continue
-            if [ $((total_targets + expanded)) -gt "$REALITY_SNI_MAX_SCAN_TARGETS" ]; then
-                _error "自定义列表展开后超过 ${REALITY_SNI_MAX_SCAN_TARGETS} 个目标，请缩小 CIDR 或减少条目。"
-                return 1
-            fi
-            printf '%s\n' "$normalized" >> "$output_file" || return 1
-            seen="${seen}${normalized} "
-            total_targets=$((total_targets + expanded))
-            valid_entries=$((valid_entries + 1))
-        done
-    done
-    [ "$valid_entries" -gt 0 ] || { _error "没有可扫描的有效目标。"; return 1; }
-    [ "$invalid_entries" -gt 0 ] && _warn "共忽略 ${invalid_entries} 个无效目标。"
-    _info "已载入 ${valid_entries} 个条目，展开后最多 ${total_targets} 个扫描目标。"
-}
-
-_first_exact_cert_domain() {
-    local target="$1" cert_info domain
-    cert_info=$(timeout 6 openssl s_client -connect "${target}:443" -showcerts </dev/null 2>/dev/null | \
-        openssl x509 -noout -ext subjectAltName 2>/dev/null) || return 1
-    while read -r domain; do
-        domain="${domain#DNS:}"
-        domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
-        _is_valid_reality_domain "$domain" && { printf '%s\n' "$domain"; return 0; }
-    done < <(printf '%s\n' "$cert_info" | grep -oE 'DNS:[^,[:space:]]+')
-    return 1
-}
-
-_scan_reality_sni_once() {
-    if [ "$REALITY_SNI_SCAN_DONE" = "true" ]; then
-        [ "${#REALITY_SNI_DOMAINS[@]}" -gt 0 ] && return 0
-    fi
-    REALITY_SNI_SCAN_DONE=false
-    REALITY_SNI_DOMAINS=()
-    REALITY_SNI_LATENCIES=()
-    REALITY_SNI_TARGETS=()
-    REALITY_SNI_CHINA_STATUSES=()
-
-    _install_realitlscanner || {
-        _error "RealiTLScanner 安装或校验失败，尚未开始扫描。"
-        return 1
-    }
-    local temp_dir csv_file scan_log scan_status input_file scan_mode scan_label entry_count
-    local public_ipv4 default_cidr="" scan_cidr
-    local scan_args=()
-    temp_dir=$(mktemp -d /tmp/sb-reality-scan.XXXXXX) || {
-        _error "无法创建 Reality 扫描临时目录。"
-        return 1
-    }
-    csv_file="${temp_dir}/out.csv"
-    scan_log="${temp_dir}/scan.log"
-    input_file="${temp_dir}/targets.txt"
-
-    public_ipv4=$(_get_public_ip 2>/dev/null || true)
-    if _is_valid_ipv4 "$public_ipv4"; then
-        IFS='.' read -r _scan_a _scan_b _scan_c _scan_d <<< "$public_ipv4"
-        default_cidr="${_scan_a}.${_scan_b}.${_scan_c}.0/24"
-    fi
-
-    echo "请选择 Reality 候选扫描方式："
-    echo "  1) 扫描 VPS 邻近 IPv4 /24"
-    echo "  2) 检测内置大厂域名种子（推荐）"
-    echo "  3) 粘贴自定义域名/IPv4/CIDR 列表"
-    read -r -p "请选择 [1-3] (默认: 2): " scan_mode
-    scan_mode="${scan_mode:-2}"
-    case "$scan_mode" in
-        1)
-            _warn "上游建议在本地而非云 VPS 扫描；本模式限制为最多 /24、16 线程、3 秒单目标超时。"
-            read -r -p "请输入扫描 IPv4 CIDR [${default_cidr:-例如 203.0.113.0/24}]: " scan_cidr
-            scan_cidr="${scan_cidr:-$default_cidr}"
-            if ! _is_safe_reality_scan_cidr "$scan_cidr"; then
-                [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-                _error "扫描范围必须是 IPv4 CIDR，且前缀长度为 /24-/32。"
-                return 1
-            fi
-            scan_args=(-addr "$scan_cidr")
-            scan_label="VPS 邻近网段 ${scan_cidr}:443"
-            ;;
-        2)
-            printf '%s\n' "${REALITY_SNI_SEED_DOMAINS[@]}" > "$input_file" || {
-                [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-                _error "无法写入内置 Reality 域名种子。"
-                return 1
-            }
-            scan_args=(-in "$input_file")
-            scan_label="内置大厂域名种子（${#REALITY_SNI_SEED_DOMAINS[@]} 个）"
-            _info "种子源自 3x-ui 当前内置列表；已按既有规则排除 www.cloudflare.com。"
-            ;;
-        3)
-            if ! _prepare_reality_custom_scan_file "$input_file"; then
-                [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-                return 1
-            fi
-            entry_count=$(wc -l < "$input_file" | tr -d ' ')
-            scan_args=(-in "$input_file")
-            scan_label="自定义列表（${entry_count} 个条目）"
-            ;;
-        *)
-            [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-            _error "扫描方式无效。"
-            return 1
-            ;;
-    esac
-
-    _info "正在使用 RealiTLScanner 检测 ${scan_label}..."
-    timeout 180 "$REALITL_SCANNER_BIN" "${scan_args[@]}" -port 443 -thread 16 -timeout 3 \
-        -out "$csv_file" > "$scan_log" 2>&1
-    scan_status=$?
-    if [ "$scan_status" -eq 124 ]; then
-        _warn "扫描达到 180 秒上限，将使用已获得的结果。"
-    elif [ "$scan_status" -ne 0 ]; then
-        if [ -s "$csv_file" ]; then
-            _warn "扫描器返回状态 ${scan_status}，将尝试使用已获得的结果。"
-        else
-            _error "RealiTLScanner 执行失败（状态 ${scan_status}）。"
-            [ -s "$scan_log" ] && tail -n 5 "$scan_log" >&2
-            [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-            return 1
-        fi
-    fi
-
-    local results="" target origin candidate key china_status
-    local gfw_result gfw_rejected=0
-    local seen=" "
-    local csv_header header_name csv_line cert_domain_index=-1 i
-    local csv_fields=()
-    if [ -s "$csv_file" ]; then
-        IFS= read -r csv_header < "$csv_file"
-        IFS=',' read -r -a csv_fields <<< "$csv_header"
-        for i in "${!csv_fields[@]}"; do
-            header_name=$(printf '%s' "${csv_fields[$i]}" | tr -d '\r\" ' | tr '[:lower:]' '[:upper:]')
-            [ "$header_name" = "CERT_DOMAIN" ] && { cert_domain_index="$i"; break; }
-        done
-        if [ "$cert_domain_index" -lt 0 ]; then
-            _error "无法识别 RealiTLScanner CSV 格式：缺少 CERT_DOMAIN 列。"
-            [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-            return 1
-        fi
-        while IFS= read -r csv_line; do
-            IFS=',' read -r -a csv_fields <<< "$csv_line"
-            [ "${#csv_fields[@]}" -gt "$cert_domain_index" ] || continue
-            target="${csv_fields[0]}"
-            origin="${csv_fields[1]}"
-            candidate="${csv_fields[$cert_domain_index]}"
-            target=$(printf '%s' "$target" | tr -d '\r ')
-            origin=$(printf '%s' "$origin" | tr -d '\r\" ' | tr '[:upper:]' '[:lower:]')
-            candidate=$(printf '%s' "$candidate" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
-            _is_valid_ipv4 "$target" || continue
-            if ! _is_valid_ipv4 "$origin" && _is_valid_reality_domain "$origin"; then
-                candidate="$origin"
-            elif [[ "$candidate" == \*.* ]]; then
-                candidate=$(_first_exact_cert_domain "$target" 2>/dev/null || true)
-            fi
-            _is_valid_reality_domain "$candidate" || continue
-            key="${target}|${candidate}"
-            [[ "$seen" == *" ${key} "* ]] && continue
-            seen+="${key} "
-            _probe_reality_target "$target" "$candidate" || continue
-            china_status="未验证"
-            if [ "$REALITY_CHINA_CHECK_ENABLED" = "true" ]; then
-                _greatfire_cached_verdict "$candidate"
-                gfw_result=$?
-                china_status="$GREATFIRE_RESULT_LABEL"
-                if [ "$gfw_result" -eq 1 ]; then
-                    gfw_rejected=$((gfw_rejected + 1))
-                    _warn "已过滤大陆侧高风险候选: ${candidate} (${china_status})"
-                    continue
-                fi
-            fi
-            results+="${REALITY_PROBE_LATENCY}"$'\t'"${candidate}"$'\t'"${target}"$'\t'"${REALITY_PROBE_HTTP_STATUS}"$'\t'"${china_status}"$'\n'
-        done < <(tail -n +2 "$csv_file")
-    fi
-    [[ "$temp_dir" == /tmp/sb-reality-scan.* ]] && rm -rf -- "$temp_dir"
-
-    local sorted_latency sorted_domain sorted_target sorted_status sorted_china_status
-    while IFS=$'\t' read -r sorted_latency sorted_domain sorted_target sorted_status sorted_china_status; do
-        [ -z "$sorted_domain" ] && continue
-        REALITY_SNI_LATENCIES+=("$sorted_latency")
-        REALITY_SNI_DOMAINS+=("$sorted_domain")
-        REALITY_SNI_TARGETS+=("$sorted_target")
-        REALITY_SNI_CHINA_STATUSES+=("${sorted_china_status:-未验证}")
-        [ "${#REALITY_SNI_DOMAINS[@]}" -ge 20 ] && break
-    done < <(printf '%s' "$results" | sort -n -k1,1)
-
-    if [ "${#REALITY_SNI_DOMAINS[@]}" -eq 0 ]; then
-        _warn "本次未找到同时满足 TLS 1.3、H2、不跳转、证书匹配、非 Cloudflare 且未命中大陆高风险判定的候选。"
-        return 1
-    fi
-    REALITY_SNI_SCAN_DONE=true
-    _success "扫描与复核完成，共保留 ${#REALITY_SNI_DOMAINS[@]} 个候选；大陆侧高风险过滤 ${gfw_rejected} 个。"
-}
-
-_select_reality_sni() {
-    REALITY_SNI_SCAN_DONE=false
-    REALITY_SNI_DOMAINS=()
-    REALITY_SNI_LATENCIES=()
-    REALITY_SNI_TARGETS=()
-    REALITY_SNI_CHINA_STATUSES=()
-    SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
-    SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
-    SELECTED_REALITY_HANDSHAKE_PORT=443
-
-    echo "Reality 目标优先使用你自己控制的、真实可访问的 HTTPS 域名。"
-    read -r -p "你是否有符合条件的自有域名？[y/N]: " own_domain_choice
-    if [[ "$own_domain_choice" == "y" || "$own_domain_choice" == "Y" ]]; then
-        echo "  自有域名使用方式："
-        echo "  1) 单机自动模式：本机安装 Nginx、申请证书并配置自动续期（默认）"
-        echo "  2) 使用已经存在的独立 HTTPS 源站"
-        local own_mode own_domain
-        read -r -p "请选择 [1-2] (默认: 1): " own_mode
-        own_mode="${own_mode:-1}"
-        if [ "$own_mode" = "1" ]; then
-            echo "  单机自动模式要求："
-            echo "  1) 域名 A/AAAA 已指向本机，且使用 DNS only。"
-            echo "  2) 公网 TCP 80 可访问，用于 Let's Encrypt HTTP-01；不需要 Cloudflare Token。"
-            echo "  3) Nginx 仅在 127.0.0.1:${REALITY_LOCAL_ORIGIN_PORT} 提供 Reality HTTPS 源站。"
-            echo "  4) 若 Reality 与 Emby 都使用公网 443，请启用 HAProxy SNI 分流，并确保两个域名不同。"
-            read -r -p "请输入自有域名: " own_domain
-            own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
-            _is_valid_reality_domain "$own_domain" || { _error "自有域名格式无效。"; return 1; }
-            _prepare_local_reality_origin "$own_domain" || return 1
-            SELECTED_REALITY_SNI="$own_domain"
-            SELECTED_REALITY_HANDSHAKE_SERVER="$REALITY_LOCAL_ORIGIN_HOST"
-            SELECTED_REALITY_HANDSHAKE_PORT="$REALITY_LOCAL_ORIGIN_PORT"
-            return 0
-        elif [ "$own_mode" != "2" ]; then
-            _error "无效选择。"
-            return 1
-        fi
-
-        echo "  独立 HTTPS 源站要求："
-        echo "  1) A/AAAA/CNAME 指向另一个真实 HTTPS 源站。"
-        echo "  2) 使用 DNS only，不要开启 Cloudflare 代理/CDN。"
-        echo "  3) 证书匹配域名，支持 TLS 1.3 + H2，根路径不返回 30x。"
-        echo "  4) 不要指向当前 Reality 公网监听端口，以免形成自连接回环。"
-        read -r -p "请输入自有 Reality 目标域名: " own_domain
-        own_domain=$(printf '%s' "$own_domain" | tr -d '\r ' | tr '[:upper:]' '[:lower:]')
-        if _is_valid_reality_domain "$own_domain" && _probe_reality_target "$own_domain" "$own_domain"; then
-            SELECTED_REALITY_SNI="$own_domain"
-            SELECTED_REALITY_HANDSHAKE_SERVER="$own_domain"
-            SELECTED_REALITY_HANDSHAKE_PORT=443
-            _success "自有域名已通过 TLS/H2/跳转/Cloudflare 复核。"
-            _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
-            return 0
-        fi
-        _warn "自有域名未通过复核：${REALITY_PROBE_ERROR:-域名格式无效}。将转入扫描/默认选择。"
-    fi
-
-    local scan_choice scan_action greatfire_choice default_china_status="未验证"
-    echo ""
-    _warn "境外 VPS 无法自行证明候选域名在中国大陆可达。"
-    echo "  可选的大陆侧校验会把候选 HTTPS 域名提交给 GreatFire。"
-    echo "  GreatFire 使用中国大陆探针与境外对照点测试，测量结果可能公开；不会提交你的 VPS IP、UUID 或 Reality 密钥。"
-    read -r -p "是否启用 GreatFire 大陆可达性筛查？[Y/n]: " greatfire_choice
-    if [[ "$greatfire_choice" == "n" || "$greatfire_choice" == "N" ]]; then
-        REALITY_CHINA_CHECK_ENABLED=false
-        _warn "已关闭大陆侧校验；选择候选时需要再次明确确认风险。"
-    else
-        REALITY_CHINA_CHECK_ENABLED=true
-    fi
-
-    read -r -p "是否使用 XTLS/RealiTLScanner 查找 Reality 候选？[Y/n]: " scan_choice
-    if [[ "$scan_choice" != "n" && "$scan_choice" != "N" ]]; then
-        while ! _scan_reality_sni_once; do
-            while true; do
-                echo "  1) 重新扫描（默认）"
-                echo "  2) 跳过扫描，进入默认域名选择"
-                echo "  0) 取消本次 Reality 节点添加"
-                read -r -p "扫描未成功，请选择 [0-2] (默认: 1): " scan_action
-                scan_action="${scan_action:-1}"
-                case "$scan_action" in
-                    1) break ;;
-                    2) break 2 ;;
-                    0)
-                        _info "已取消本次 Reality 节点添加。"
-                        return 1
-                        ;;
-                    *) _warn "无效选择，请重新输入。" ;;
-                esac
-            done
-        done
-    fi
-
-    if [ "$REALITY_CHINA_CHECK_ENABLED" = "true" ]; then
-        _greatfire_cached_verdict "$DEFAULT_REALITY_SNI"
-        default_china_status="$GREATFIRE_RESULT_LABEL"
-    fi
-
-    local i sni_choice force_default
-    while true; do
-        echo "请选择 Reality SNI（候选已按 TLS 延迟从低到高排序）:"
-        echo "  回车) ${DEFAULT_REALITY_SNI} (默认，AMD 官方站点；仍需现场复核；大陆判定: ${default_china_status})"
-        for i in "${!REALITY_SNI_DOMAINS[@]}"; do
-            printf '  %d) %s (目标 %s:443, %s ms；大陆判定: %s)\n' "$((i + 1))" \
-                "${REALITY_SNI_DOMAINS[$i]}" "${REALITY_SNI_TARGETS[$i]}" \
-                "${REALITY_SNI_LATENCIES[$i]}" "${REALITY_SNI_CHINA_STATUSES[$i]:-未验证}"
-        done
-        echo "  0) 取消本次 Reality 节点添加"
-
-        SELECTED_REALITY_SNI="$DEFAULT_REALITY_SNI"
-        SELECTED_REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_SNI"
-        SELECTED_REALITY_HANDSHAKE_PORT=443
-        read -r -p "请输入候选编号，回车使用 ${DEFAULT_REALITY_SNI}，或输入 0 取消: " sni_choice
-        if [ "$sni_choice" = "0" ]; then
-            _info "已取消本次 Reality 节点添加。"
-            return 1
-        elif [[ "$sni_choice" =~ ^[0-9]+$ ]] && [ "$sni_choice" -ge 1 ] && [ "$sni_choice" -le "${#REALITY_SNI_DOMAINS[@]}" ]; then
-            SELECTED_REALITY_SNI="${REALITY_SNI_DOMAINS[$((sni_choice - 1))]}"
-            SELECTED_REALITY_HANDSHAKE_SERVER="${REALITY_SNI_TARGETS[$((sni_choice - 1))]}"
-        elif [ -n "$sni_choice" ]; then
-            _warn "编号无效，已使用默认 ${DEFAULT_REALITY_SNI}。"
-        fi
-
-        if [ "$SELECTED_REALITY_SNI" = "$DEFAULT_REALITY_SNI" ] && \
-           ! _probe_reality_target "$DEFAULT_REALITY_SNI" "$DEFAULT_REALITY_SNI"; then
-            _warn "默认目标当前复核失败：${REALITY_PROBE_ERROR}；建议重新选择扫描结果。"
-            read -r -p "仍要继续检查该默认目标的大陆可达性？[y/N]: " force_default
-            if [[ "$force_default" != "y" && "$force_default" != "Y" ]]; then
-                continue
-            fi
-        fi
-        if _confirm_reality_china_reachability "$SELECTED_REALITY_SNI"; then
-            break
-        fi
-        _warn "该候选未通过严格大陆可达性筛查，请重新选择。"
-    done
-    _info "Reality SNI: ${SELECTED_REALITY_SNI} | 握手目标: ${SELECTED_REALITY_HANDSHAKE_SERVER}:${SELECTED_REALITY_HANDSHAKE_PORT}"
-}
-
-_validate_reality_no_self_loop() {
-    local listen_port="$1" target="$2" target_port="${3:-443}" public_ip target_ip
-    [ "$listen_port" = "$target_port" ] || return 0
-    if [[ "$target" == 127.* || "$target" == "::1" || "$target" == "localhost" ]]; then
-        _error "Reality 入站与本机握手目标同时使用 ${target_port}，会发生端口冲突或自连接回环。"
-        return 1
-    fi
-    public_ip=$(_get_public_ip 2>/dev/null || true)
-    _is_valid_ipv4 "$public_ip" || return 0
-    if _is_valid_ipv4 "$target"; then
-        [ "$target" = "$public_ip" ] || return 0
-    else
-        while read -r target_ip; do
-            [ "$target_ip" = "$public_ip" ] && {
-                _error "Reality 握手目标 ${target}:${target_port} 解析回本机，与入站 ${listen_port} 形成自连接回环。"
-                return 1
-            }
-        done < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
-        return 0
-    fi
-    _error "Reality 握手目标 ${target}:${target_port} 就是本机公网 IP，与入站 ${listen_port} 形成自连接回环。"
-    return 1
-}
-
-# 端口冲突检测 (与主脚本 singbox.sh 保持一致，区分 TCP/UDP)
-_check_port_occupied() {
-    local port=$1
-    local proto=${2:-tcp}
-    if [[ "$proto" == "tcp" ]]; then
-        if command -v ss &>/dev/null; then
-            ss -lnpt | grep -q ":${port} " && return 0
-        else
-            netstat -lnpt | grep -q ":${port} " && return 0
-        fi
-    else
-        if command -v ss &>/dev/null; then
-            ss -lnpu | grep -q ":${port} " && return 0
-        else
-            netstat -lnpu | grep -q ":${port} " && return 0
-        fi
-    fi
-    return 1
-}
-
-_is_pid_running_cmd() {
-    local pid="$1"
-    local pattern="$2"
-    [ -n "$pid" ] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
-    if [ -r "/proc/${pid}/cmdline" ]; then
-        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
-    else
-        ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$pattern"
-    fi
-}
-
-_is_pid_file_running_cmd() {
-    local pid_file="$1"
-    local pattern="$2"
-    local pid
-    [ -s "$pid_file" ] || return 1
-    pid=$(cat "$pid_file" 2>/dev/null)
-    _is_pid_running_cmd "$pid" "$pattern"
-}
-
-# nftables 规则管理 (独立表，避免污染系统其他防火墙规则)
-NFT_TABLE="${NFT_TABLE:-singboxlite}"
-NFT_PERSIST_FILE="${NFT_PERSIST_FILE:-/etc/nftables.d/singboxlite.nft}"
-
-_nft_ensure_base() {
-    command -v nft &>/dev/null || return 1
-    nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || return 1
-    nft list chain inet "$NFT_TABLE" prerouting >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" prerouting '{ type nat hook prerouting priority -100; policy accept; }' >/dev/null 2>&1 || return 1
-    nft list chain inet "$NFT_TABLE" output >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" output '{ type nat hook output priority -100; policy accept; }' >/dev/null 2>&1 || return 1
-    nft list chain inet "$NFT_TABLE" postrouting >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" postrouting '{ type nat hook postrouting priority 100; policy accept; }' >/dev/null 2>&1 || return 1
-    nft list chain inet "$NFT_TABLE" forward >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" forward '{ type filter hook forward priority 0; policy accept; }' >/dev/null 2>&1 || return 1
-}
-
-_nft_delete_rules_by_comment() {
-    local comment="$1"
-    local entries chain handle rc=0
-    command -v nft &>/dev/null || return 0
-    entries=$(nft -a list table inet "$NFT_TABLE" 2>/dev/null | awk -v c="comment \"$comment\"" '
-        /^[[:space:]]*chain / { chain=$2 }
-        index($0, c) && /# handle / { print chain, $NF }
-    ')
-    [ -z "$entries" ] && return 0
-    while read -r chain handle; do
-        if [ -n "$chain" ] && [ -n "$handle" ]; then
-            nft delete rule inet "$NFT_TABLE" "$chain" handle "$handle" >/dev/null 2>&1 || rc=1
-        fi
-    done <<< "$entries"
-    return "$rc"
-}
-
-_nft_port_expr() {
-    local start="$1" end="$2"
-    if [ "$start" = "$end" ]; then
-        echo "$start"
-    else
-        echo "${start}-${end}"
-    fi
-}
-
-_nft_apply_redirect_rule() {
-    local action="$1" start_port="$2" end_port="$3" target_port="$4" comment="$5"
-    if [ "$action" = "delete" ]; then
-        _nft_delete_rules_by_comment "$comment"
-        return 0
-    fi
-    _nft_ensure_base || return 1
-    _nft_delete_rules_by_comment "$comment"
-    nft add rule inet "$NFT_TABLE" prerouting udp dport "$(_nft_port_expr "$start_port" "$end_port")" redirect to ":${target_port}" comment "$comment" >/dev/null 2>&1
-}
-
-_nft_can_redirect() {
-    local test_port="${1:-65530}" target_port="${2:-65531}" comment="singboxlite-test-redirect-$$"
-    _nft_apply_redirect_rule add "$test_port" "$test_port" "$target_port" "$comment" || return 1
-    _nft_apply_redirect_rule delete "$test_port" "$test_port" "$target_port" "$comment"
-    return 0
-}
-
-_find_pf_udp_conflict_in_range() {
-    local start="$1" end="$2"
-    local pf_meta="${RELAY_AUX_DIR}/relay_pf.json"
-    [ -f "$pf_meta" ] || return 1
-    jq -r --argjson start "$start" --argjson end "$end" '
-        to_entries[]
-        | (.key | tonumber?) as $port
-        | select($port != null and $port >= $start and $port <= $end)
-        | select(.value.network == "udp" or .value.network == "tcp+udp")
-        | [
-            .key,
-            (.value.name // "端口转发"),
-            (.value.network_display // .value.network // "UDP"),
-            ((.value.target_addr // "") + ":" + ((.value.target_port // "") | tostring))
-          ]
-        | @tsv
-    ' "$pf_meta" 2>/dev/null | head -n 1
-}
-
-_find_udp_hop_conflict_in_range() {
-    local start="$1" end="$2" exclude_tag="${3:-}"
-    local conflict=""
-    if [ -f "$MAIN_METADATA_FILE" ]; then
-        conflict=$(jq -r --argjson start "$start" --argjson end "$end" --arg exclude "$exclude_tag" '
-            to_entries[]
-            | select(.key != $exclude)
-            | select(.value.portHopping)
-            | (.value.portHopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
-            | select($range != null)
-            | ($range.start | tonumber) as $other_start
-            | ($range.end | tonumber) as $other_end
-            | select($start <= $other_end and $end >= $other_start)
-            | [
-                .key,
-                (.value.name // .key),
-                .value.portHopping,
-                ("主HY2/" + (.value.portHoppingMode // "unknown"))
-              ]
-            | @tsv
-        ' "$MAIN_METADATA_FILE" 2>/dev/null | head -n 1)
-        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
-    fi
-
-    local relay_links="${RELAY_AUX_DIR}/relay_links.json"
-    if [ -f "$relay_links" ]; then
-        conflict=$(jq -r --argjson start "$start" --argjson end "$end" --arg exclude "$exclude_tag" '
-            to_entries[]
-            | select(.key != $exclude)
-            | select(.value.port_hopping)
-            | (.value.port_hopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
-            | select($range != null)
-            | ($range.start | tonumber) as $other_start
-            | ($range.end | tonumber) as $other_end
-            | select($start <= $other_end and $end >= $other_start)
-            | [
-                .key,
-                (.value.node_name // .key),
-                .value.port_hopping,
-                "中转HY2/nftables"
-              ]
-            | @tsv
-        ' "$relay_links" 2>/dev/null | head -n 1)
-        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
-    fi
-
-    return 1
-}
-
-_save_nftables_rules() {
-    command -v nft &>/dev/null || return 0
-    mkdir -p /etc/nftables.d
-    local persist_tmp validate_tmp validate_table conf_tmp
-    persist_tmp=$(mktemp /etc/nftables.d/.singboxlite.nft.XXXXXX) || return 1
-    validate_tmp=$(mktemp /tmp/singboxlite-nft-check.XXXXXX) || {
-        rm -f "$persist_tmp"
-        return 1
-    }
-    validate_table="${NFT_TABLE}_check_$$"
-
-    if ! nft list table inet "$NFT_TABLE" > "$persist_tmp" 2>/dev/null; then
-        rm -f "$persist_tmp" "$validate_tmp"
-        return 1
-    fi
-    # 用临时表名进行语法检查，避免与当前已加载的同名表冲突。
-    sed "0,/^table inet ${NFT_TABLE} /s//table inet ${validate_table} /" "$persist_tmp" > "$validate_tmp"
-    if ! nft -c -f "$validate_tmp" >/dev/null 2>&1; then
-        rm -f "$persist_tmp" "$validate_tmp"
-        return 1
-    fi
-    rm -f "$validate_tmp"
-    mv -f "$persist_tmp" "$NFT_PERSIST_FILE" || return 1
-
-    if [ ! -f /etc/nftables.conf ]; then
-        conf_tmp=$(mktemp /etc/.nftables.conf.XXXXXX) || return 1
-        printf '%s\n%s\n' '#!/usr/sbin/nft -f' 'include "/etc/nftables.d/*.nft"' > "$conf_tmp" \
-            && mv -f "$conf_tmp" /etc/nftables.conf || {
-                rm -f "$conf_tmp"
-                return 1
-            }
-    elif ! grep -q 'singboxlite\.nft\|/etc/nftables\.d/\*\.nft' /etc/nftables.conf 2>/dev/null; then
-        conf_tmp=$(mktemp /etc/.nftables.conf.XXXXXX) || return 1
-        if ! cp -a /etc/nftables.conf "$conf_tmp" || \
-           ! printf '%s\n' 'include "/etc/nftables.d/singboxlite.nft"' >> "$conf_tmp" || \
-           ! mv -f "$conf_tmp" /etc/nftables.conf; then
-            rm -f "$conf_tmp"
-            return 1
-        fi
-    fi
-    if command -v systemctl &>/dev/null; then
-        systemctl enable nftables >/dev/null 2>&1 || true
-    fi
-    if command -v rc-update &>/dev/null; then
-        rc-update add nftables default >/dev/null 2>&1 || true
-    fi
-}
-
-# 原子修改 JSON (与主脚本 singbox.sh 保持一致，不静默吞掉 jq 错误)
-_atomic_modify_json() {
+# 中转文件的原子修改；调用方已持有配置写锁，并由中转事务负责快照与回滚。
+_relay_modify_json() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
     local tmp
@@ -1192,64 +43,15 @@ _atomic_modify_json() {
 }
 
 # 单个原子修改 YAML
-_atomic_modify_yaml() {
+_relay_modify_yaml() {
     local file="$1" filter="$2" tmp
     [ -f "$file" ] || return 1
     tmp=$(mktemp "${file}.XXXXXX") || return 1
-    if ${YQ_BINARY} eval "$filter" "$file" > "$tmp" && mv -- "$tmp" "$file"; then return 0; fi
+    if ${YQ_BINARY} eval "$filter" "$file" > "$tmp" &&
+       ${YQ_BINARY} eval '.' "$tmp" >/dev/null && mv -- "$tmp" "$file"; then return 0; fi
     _error "修改 YAML 失败: $file"
     rm -f -- "$tmp"
     return 1
-}
-
-# 服务管理
-_manage_service() {
-    local action="$1"
-    # 中转脚本可能使用独立服务或主服务，此处保持与主脚本一致的逻辑
-    local service_pkg="sing-box"
-    # 如果检测到中转专用服务文件，则使用单机中转模式
-    [ -f "/etc/systemd/system/sing-box-relay.service" ] && service_pkg="sing-box-relay"
-
-    _info "执行服务操作: $action ($service_pkg)..."
-    case "$INIT_SYSTEM" in
-        systemd) systemctl "$action" "$service_pkg" ;;
-        openrc) rc-service "$service_pkg" "$action" ;;
-        direct)
-            local pid_file="/tmp/sing-box.pid"
-            local log_file="/var/log/sing-box.log"
-            case "$action" in
-                start)
-                    if _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"; then
-                        return 0
-                    fi
-                    rm -f "$pid_file"
-                    [ -s "$RELAY_CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
-                    nohup "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
-                        >> "$log_file" 2>&1 8>&- 9>&- &
-                    echo $! > "$pid_file"
-                    ;;
-                stop)
-                    if [ -s "$pid_file" ]; then
-                        local pid
-                        pid=$(cat "$pid_file" 2>/dev/null)
-                        if _is_pid_running_cmd "$pid" "$SINGBOX_BIN"; then
-                            kill "$pid" 2>/dev/null
-                        fi
-                    fi
-                    rm -f "$pid_file"
-                    ;;
-                restart)
-                    _manage_service stop
-                    sleep 1
-                    _manage_service start
-                    ;;
-                status)
-                    _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"
-                    ;;
-            esac
-            ;;
-        *) _warn "不支持的服务管理系统: ${INIT_SYSTEM}"; return 1 ;;
-    esac
 }
 
 # 日志记录函数
@@ -1279,11 +81,11 @@ _add_node_to_relay_yaml() {
     
     # 使用环境变量传递 JSON 字符串，确保安全性
     export NODE_JSON="$proxy_json"
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxies += [env(NODE_JSON)]' || return 1
+    _relay_modify_yaml "$RELAY_CLASH_YAML" '.proxies += [env(NODE_JSON)]' || return 1
     
     # 使用环境变量避免名称中特殊字符问题
     export PROXY_NAME="$proxy_name"
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies += [strenv(PROXY_NAME)] | .proxies |= unique)' || return 1
+    _relay_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies += [strenv(PROXY_NAME)] | .proxies |= unique)' || return 1
     
     _info "已添加节点到 YAML 配置: ${proxy_name}"
 }
@@ -1302,8 +104,8 @@ _remove_node_from_relay_yaml() {
     
     # 删除节点 - 使用环境变量避免特殊字符问题
     export PROXY_NAME="$proxy_name"
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" 'del(.proxies[] | select(.name == strenv(PROXY_NAME)))' || return 1
-    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies |= del(.[] | select(. == strenv(PROXY_NAME))))' || return 1
+    _relay_modify_yaml "$RELAY_CLASH_YAML" 'del(.proxies[] | select(.name == strenv(PROXY_NAME)))' || return 1
+    _relay_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点" or .name == "节点选择") | .proxies |= del(.[] | select(. == strenv(PROXY_NAME))))' || return 1
     
     _info "已从 YAML 配置中删除节点: ${proxy_name}"
 }
@@ -1373,53 +175,14 @@ EOF
     fi
 )
 
-# 检查并下载解析脚本；只执行与同仓库当前版本匹配的文件。
-_verify_parser_component() {
-    local file="$1"
-    local actual
-    [ -s "$file" ] || return 1
-    actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
-    [ "$actual" = "$PARSER_SHA256" ] || return 1
-    bash -n "$file" >/dev/null 2>&1
-}
-
+# 链接解析组件与中转模块一起安装在库目录，sb 启动时已核对其来源与标记。
 _check_parser() {
-    local PARSER_NAME="parser.sh"
-    local local_parser="${SCRIPT_DIR}/${PARSER_NAME}"
-    local prod_parser="${SINGBOX_DIR}/${PARSER_NAME}"
-    local PARSER_BIN=""
-    local candidate
-
-    for candidate in "$local_parser" "$prod_parser"; do
-        if _verify_parser_component "$candidate"; then
-            PARSER_BIN="$candidate"
-            break
-        fi
-        [ -e "$candidate" ] && _warn "忽略未通过 SHA-256/语法校验的解析脚本: $candidate"
-    done
-
-    if [ -z "$PARSER_BIN" ]; then
-        local PARSER_URL="${GITHUB_RAW_BASE}/${PARSER_NAME}"
-        local temp_parser="${prod_parser}.tmp.$$"
-        _info "正在从同仓库下载并校验解析脚本 (${PARSER_NAME})..."
-        rm -f "$temp_parser"
-        if ! timeout 15 wget -qO "$temp_parser" "$PARSER_URL"; then
-            _error "解析脚本下载失败，请检查网络！"
-            rm -f "$temp_parser"
-            return 1
-        fi
-        if ! _verify_parser_component "$temp_parser"; then
-            _error "下载的解析脚本未通过 SHA-256 或 Bash 语法校验，已拒绝执行。"
-            rm -f "$temp_parser"
-            return 1
-        fi
-        chmod 700 "$temp_parser" && mv -f "$temp_parser" "$prod_parser" || return 1
-        PARSER_BIN="$prod_parser"
-        _success "解析脚本下载并校验成功。"
+    local parser="${SB_LIB_DIR}/parser.sh"
+    if [ ! -s "$parser" ] || ! bash -n "$parser" 2>/dev/null; then
+        _error "链接解析组件缺失或损坏：${parser}。请运行 proxyall --update 补齐全部脚本。"
+        return 1
     fi
-
-    chmod 700 "$PARSER_BIN"
-    _PARSER_PATH="$PARSER_BIN"
+    _PARSER_PATH="$parser"
 }
 
 # --- 2.1 导入第三方节点链接 ---
@@ -1507,8 +270,8 @@ _landing_config_locked() {
     # 获取本机IP，作为备选
     local server_ip=$(_get_public_ip)
     # 使用主脚本中定义的全局 YQ_BINARY 和路径常量
-    local MAIN_CLASH_YAML="/usr/local/etc/sing-box/clash.yaml"
-    local METADATA_FILE="/usr/local/etc/sing-box/metadata.json"
+    local MAIN_CLASH_YAML="${SINGBOX_DIR}/clash.yaml"
+    local METADATA_FILE="$MAIN_METADATA_FILE"
 
     # 获取所有有效的落地节点 (排除 tag 为 direct 的 outbound，获取所有 inbounds)
     local nodes=$(jq -c '.inbounds[] | select(.tag != "direct")' "$MAIN_CONFIG_FILE")
@@ -1955,11 +718,11 @@ _offer_existing_inbound_relay() {
         return 2
     fi
 
-    if ! _manage_service restart; then
+    if ! _relay_service restart; then
         _error "服务重启失败，正在恢复原中转配置。"
         mv -f "$config_backup" "$RELAY_CONFIG_FILE"
         mv -f "$links_backup" "$links_file"
-        _manage_service restart >/dev/null 2>&1 || true
+        _relay_service restart >/dev/null 2>&1 || true
         return 2
     fi
     rm -f "$config_backup" "$links_backup"
@@ -2306,7 +1069,7 @@ _finalize_relay_setup() {
     fi
     combined_filter="${combined_filter} | .route.rules += [$rule_json]"
     
-    if ! _atomic_modify_json "$CONFIG_FILE" "$combined_filter"; then
+    if ! _relay_modify_json "$CONFIG_FILE" "$combined_filter"; then
         mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
         _error "配置写入失败，已回滚"
         return 1
@@ -2318,16 +1081,16 @@ _finalize_relay_setup() {
     fi
     
     _success "配置已更新！正在重启服务..."
-    if ! _manage_service restart; then
+    if ! _relay_service restart; then
         _error "服务重启失败，正在恢复原中转配置。"
         mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
+        _relay_service restart >/dev/null 2>&1 || true
         return 1
     fi
     if [ "$router_mode" = true ] && ! _sni_router_call register-reality advanced-relay "$inbound_tag" "$entrance_sni" "$backend_port"; then
         _error "HAProxy Reality 路由登记失败，正在恢复原中转配置。"
         mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
+        _relay_service restart >/dev/null 2>&1 || true
         return 1
     fi
     _save_nftables_rules
@@ -2343,7 +1106,7 @@ _finalize_relay_setup() {
          if $routed then .fronted_by="haproxy" | .router_role="reality-default" else . end') || {
         [ "$router_mode" = true ] && _sni_router_call remove-reality "$inbound_tag" >/dev/null 2>&1 || true
         mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
+        _relay_service restart >/dev/null 2>&1 || true
         _error "中转元数据生成失败，已回滚。"
         return 1
     }
@@ -2352,7 +1115,7 @@ _finalize_relay_setup() {
         rm -f "${LINKS_FILE}.tmp"
         [ "$router_mode" = true ] && _sni_router_call remove-reality "$inbound_tag" >/dev/null 2>&1 || true
         mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
+        _relay_service restart >/dev/null 2>&1 || true
         _error "中转元数据写入失败，已回滚。"
         return 1
     fi
@@ -2565,9 +1328,9 @@ _relay_run_transaction() (
                 exit 1
             fi
             if [ -f "$work/service.active" ]; then
-                _validate_merged_config && _manage_service restart >/dev/null 2>&1 || _error "配置已恢复，但服务重启失败，请检查服务日志。"
+                _validate_merged_config && _relay_service restart >/dev/null 2>&1 || _error "配置已恢复，但服务重启失败，请检查服务日志。"
             else
-                _manage_service stop >/dev/null 2>&1 || _error "配置已恢复，但服务停止失败，请检查服务日志。"
+                _relay_service stop >/dev/null 2>&1 || _error "配置已恢复，但服务停止失败，请检查服务日志。"
             fi
             _error "中转操作失败，已恢复原配置。"
         fi
@@ -2666,7 +1429,7 @@ _clear_all_relays_locked() {
     mv "$links_tmp" "$links_file" || { rm -f "$links_tmp"; return 1; }
     chmod 600 "$RELAY_CONFIG_FILE" "$links_file" 2>/dev/null || true
 
-    if ! _manage_service restart; then
+    if ! _relay_service restart; then
         _error "sing-box 重启失败，请检查服务日志。"
         return 1
     fi
@@ -2764,7 +1527,7 @@ _delete_relay_locked() {
         }
         RELAY_TX_ROUTER_REMOVED="$in_tag"
     fi
-    if ! _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$in_tag\")) | del(.outbounds[] | select(.tag == \"$out_tag\")) | del(.route.rules[] | select(.inbound == \"$in_tag\"))"; then
+    if ! _relay_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$in_tag\")) | del(.outbounds[] | select(.tag == \"$out_tag\")) | del(.route.rules[] | select(.inbound == \"$in_tag\"))"; then
         return 1
     fi
     
@@ -2788,7 +1551,7 @@ _delete_relay_locked() {
             _info "已卸载绑定的 nftables UDP 端口跳跃范围转发规则 (${port_hopping})"
         fi
         
-        _atomic_modify_json "$LINKS_FILE" "del(.\""$in_tag"\")" || return 1
+        _relay_modify_json "$LINKS_FILE" "del(.\""$in_tag"\")" || return 1
     fi
     
     # 复用节点的证书属于 sb.sh 主配置，解除中转时必须保留。
@@ -2800,7 +1563,7 @@ _delete_relay_locked() {
         fi
     fi
     
-    _validate_merged_config && _manage_service restart || return 1
+    _validate_merged_config && _relay_service restart || return 1
     RELAY_TX_DIRTY=false
     _success "已移除中转链路 [$in_tag]。"
     [ "$reuse_existing" == "true" ] && _info "复用的 sb.sh 本机节点已保留，仅解除其出口绑定。"
@@ -2911,7 +1674,7 @@ _modify_relay_port_locked() {
     
     _info "正在修改端口..."
     RELAY_TX_DIRTY=true
-    _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = $new_port" || return 1
+    _relay_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = $new_port" || return 1
     
     local old_node_name=""
     local new_node_name=""
@@ -2941,9 +1704,9 @@ _modify_relay_port_locked() {
         export NEW_RELAY_NAME="$new_node_name"
         export NEW_RELAY_PORT="$new_port"
         
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME)) | .name) = strenv(NEW_RELAY_NAME)' || return 1
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == strenv(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' || return 1
-        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == strenv(OLD_RELAY_NAME))) = strenv(NEW_RELAY_NAME)' || return 1
+        _relay_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == strenv(OLD_RELAY_NAME)) | .name) = strenv(NEW_RELAY_NAME)' || return 1
+        _relay_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == strenv(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' || return 1
+        _relay_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == strenv(OLD_RELAY_NAME))) = strenv(NEW_RELAY_NAME)' || return 1
     fi
 
     if [ -n "$current_hop_info" ]; then
@@ -2953,7 +1716,7 @@ _modify_relay_port_locked() {
         _save_nftables_rules || return 1
     fi
 
-    _validate_merged_config && _manage_service restart || return 1
+    _validate_merged_config && _relay_service restart || return 1
     RELAY_TX_DIRTY=false
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
     _success "服务已重启"
@@ -3030,7 +1793,7 @@ _ruleset_change() (
             _error "恢复配置失败，备份已保留在 $work，请从备份恢复。"
             exit 1
         fi
-        _manage_service restart >/dev/null 2>&1 || _error "原配置已恢复，但服务重启失败，请检查服务日志。"
+        _relay_service restart >/dev/null 2>&1 || _error "原配置已恢复，但服务重启失败，请检查服务日志。"
         _error "规则集分流未生效，已恢复原配置。"
     fi; rm -rf -- "$work"' EXIT
     trap 'exit 1' INT TERM HUP
@@ -3048,9 +1811,9 @@ _ruleset_change() (
     fi
     published=true
     mv "$work/links.json.main" "$MAIN_CONFIG_FILE" && mv "$work/links.json.config" "$RELAY_CONFIG_FILE" && mv "$work/links.json" "$links_file" || exit 1
-    _manage_service restart || exit 1
+    _relay_service restart || exit 1
     sleep 1
-    _manage_service status >/dev/null 2>&1 || exit 1
+    _relay_service status >/dev/null 2>&1 || exit 1
     published=false
     _log_operation "RULESET_${operation^^}" "$(jq -r '.id' <<< "$policy")"
     _success "规则集分流配置已更新。"
@@ -3266,10 +2029,10 @@ _pf_restore_transaction() {
     fi
     if [ -f "${snapshot_dir}/service.active" ]; then
         if [ -s "$RELAY_CONFIG_FILE" ]; then
-            _validate_merged_config >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1 || true
+            _validate_merged_config >/dev/null 2>&1 && _relay_service restart >/dev/null 2>&1 || true
         fi
     else
-        _manage_service stop >/dev/null 2>&1 || true
+        _relay_service stop >/dev/null 2>&1 || true
     fi
 }
 
@@ -3560,8 +2323,8 @@ _pf_view() {
 
 # 安装/卸载 DNS 定时刷新 cron 任务
 _pf_setup_dns_cron() {
-    local SCRIPT_PATH="$(readlink -f "$0")"
-    local CRON_CMD="* * * * * /bin/bash \"${SCRIPT_PATH}\" pf-dns-refresh >/dev/null 2>&1"
+    # 定时任务通过 sb 入口调用，由 sb 核对并加载中转模块。
+    local CRON_CMD="* * * * * /bin/bash \"${SELF_SCRIPT_PATH}\" pf-dns-refresh >/dev/null 2>&1"
     local CRON_TAG="# pf-dns-auto-refresh"
 
     # 始终替换带标签的旧任务，确保检查周期和脚本绝对路径保持最新。
@@ -3809,7 +2572,7 @@ _pf_apply_singbox_rules() {
         local del_filter="del(.inbounds[] | select(.tag == \"$in_tag\"))"
         del_filter="${del_filter} | del(.outbounds[] | select(.tag == \"$out_tag\"))"
         del_filter="${del_filter} | .route.rules = [.route.rules[] | select(.inbound != \"$in_tag\")]"
-        _atomic_modify_json "$RELAY_CONFIG_FILE" "$del_filter"
+        _relay_modify_json "$RELAY_CONFIG_FILE" "$del_filter"
         return $?
     fi
 
@@ -3825,7 +2588,7 @@ _pf_apply_singbox_rules() {
         combined_filter="${combined_filter} | . + {\"route\":{\"rules\":[]}}"
     fi
     combined_filter="${combined_filter} | .route.rules += [$rule_json]"
-    _atomic_modify_json "$RELAY_CONFIG_FILE" "$combined_filter"
+    _relay_modify_json "$RELAY_CONFIG_FILE" "$combined_filter"
 }
 
 _pf_store_metadata() {
@@ -4014,7 +2777,7 @@ _pf_add_impl() {
             _error "配置写入失败"
             read -p "  按回车继续..."; return 1
         fi
-        if ! _validate_merged_config || ! _manage_service restart; then
+        if ! _validate_merged_config || ! _relay_service restart; then
             _error "sing-box 配置校验或服务重启失败"
             read -p "  按回车继续..."; return 1
         fi
@@ -4087,7 +2850,7 @@ _pf_delete_impl() {
     else
         _pf_mark_dirty
         if ! _pf_apply_singbox_rules "delete" "$selected_port" || \
-           ! _validate_merged_config || ! _manage_service restart; then
+           ! _validate_merged_config || ! _relay_service restart; then
             _error "sing-box 转发规则删除失败"
             read -p "  按回车继续..."; return 1
         fi
@@ -4250,7 +3013,7 @@ _pf_modify_impl() {
                 _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
                 _save_nftables_rules
             else
-                _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
+                _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _relay_service restart >/dev/null 2>&1
             fi
             _error "修改失败，已恢复旧规则"
             read -p "  按回车继续..."; return 1
@@ -4268,7 +3031,7 @@ _pf_modify_impl() {
         fi
     else
         if _pf_apply_singbox_rules "add" "$selected_port" "$new_addr" "$new_tport" "$new_net"; then
-            if _validate_merged_config && _manage_service restart; then
+            if _validate_merged_config && _relay_service restart; then
                 apply_ok="true"
             else
                 _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1
@@ -4282,7 +3045,7 @@ _pf_modify_impl() {
             _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
             _save_nftables_rules
         else
-            _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
+            _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _relay_service restart >/dev/null 2>&1
         fi
         _error "修改失败，已恢复旧规则"
         read -p "  按回车继续..."; return 1
@@ -4347,7 +3110,7 @@ _pf_clear_impl() {
         fi
     fi
     if [ "$need_singbox_restart" = true ]; then
-        if ! _validate_merged_config || ! _manage_service restart; then
+        if ! _validate_merged_config || ! _relay_service restart; then
             _error "sing-box 校验或重启失败"
             read -p "  按回车继续..."; return 1
         fi
@@ -4503,7 +3266,7 @@ _pf_switch_engine_impl() {
             _error "切换失败，已恢复旧的 nftables 规则"
             read -p "  按回车继续..."; return 1
         fi
-        if ! _validate_merged_config || ! _manage_service restart; then
+        if ! _validate_merged_config || ! _relay_service restart; then
             _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1
             _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
             _save_nftables_rules
@@ -4567,9 +3330,9 @@ _pf_switch_engine_impl() {
             _error "旧的 singbox 规则删除失败，无法切换"
             read -p "  按回车继续..."; return 1
         fi
-        if ! _validate_merged_config || ! _manage_service restart; then
+        if ! _validate_merged_config || ! _relay_service restart; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
-            _manage_service restart >/dev/null 2>&1
+            _relay_service restart >/dev/null 2>&1
             _error "切换失败，已恢复旧的 singbox 规则"
             read -p "  按回车继续..."; return 1
         fi
@@ -4582,7 +3345,7 @@ _pf_switch_engine_impl() {
         resolved_payload=$(_pf_prepare_nft_target "$cur_addr")
         if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
-            _manage_service restart >/dev/null 2>&1
+            _relay_service restart >/dev/null 2>&1
             _error "目标地址无法解析为可用的 IPv4/IPv6，已恢复旧的 singbox 规则"
             read -p "  按回车继续..."; return 1
         fi
@@ -4595,7 +3358,7 @@ _pf_switch_engine_impl() {
         fi
         if ! _pf_apply_nft_rules "add" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family"; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
-            _manage_service restart >/dev/null 2>&1
+            _relay_service restart >/dev/null 2>&1
             _error "切换失败，已恢复旧的 singbox 规则"
             read -p "  按回车继续..."; return 1
         fi
@@ -4667,7 +3430,7 @@ _port_forward_menu() {
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
         
-        read -p "  请输入选项 [0-6]: " pf_choice
+        read -r -p "  请输入选项 [0-6]: " pf_choice || return 0
         case "$pf_choice" in
             1) _pf_add ;;
             2) _pf_view ;;
@@ -4682,7 +3445,7 @@ _port_forward_menu() {
 }
 
 
-_menu() {
+_relay_menu() {
     _check_deps
     _init_relay_dirs
 
@@ -4701,8 +3464,8 @@ _menu() {
         # 标题框
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
-        echo "  ║       singbox-lite 进阶转发管理       ║"
-    echo "  ║           (v${SCRIPT_VERSION})               ║"
+        echo "  ║        sing-box 中转与端口转发        ║"
+        echo "  ║           (v${SCRIPT_VERSION})            ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
@@ -4712,14 +3475,13 @@ _menu() {
         
         local service_status="${RED}○ 已停止${NC}"
         local service_name="sing-box"
-        [ -f "/etc/systemd/system/sing-box-relay.service" ] && service_name="sing-box-relay"
-        
+
         if [ "$INIT_SYSTEM" == "systemd" ]; then
             systemctl is-active --quiet "$service_name" && service_status="${GREEN}● 运行中${NC}"
         elif [ "$INIT_SYSTEM" == "openrc" ]; then
             rc-service "$service_name" status 2>/dev/null | grep -q "started" && service_status="${GREEN}● 运行中${NC}"
         else
-            _is_pid_file_running_cmd /tmp/sing-box.pid "$SINGBOX_BIN" && service_status="${GREEN}● 运行中${NC}"
+            _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN" && service_status="${GREEN}● 运行中${NC}"
         fi
 
         echo -e "  系统版本: ${CYAN}${os_info}${NC}"
@@ -4745,7 +3507,7 @@ _menu() {
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-9]: " choice
+        read -r -p "  请输入选项 [0-9]: " choice || break
         case $choice in
             1) _landing_config ;;
             2) _relay_config ;;
@@ -4764,20 +3526,3 @@ _menu() {
         esac
     done
 }
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    if [ "$EUID" -ne 0 ]; then
-        _error "此脚本必须以 root 权限运行。"
-        exit 1
-    fi
-
-    # 命令行参数解析：支持 cron 定时任务直接调用刷新函数
-    case "${1:-}" in
-        pf-dns-refresh)
-            _pf_dns_refresh
-            exit $?
-            ;;
-    esac
-
-    printf '%s\n' '中转已整合到 Xray 节点菜单：先创建入口，再选 8 绑定落地出站。' >&2
-    exec /usr/local/bin/sb
-fi

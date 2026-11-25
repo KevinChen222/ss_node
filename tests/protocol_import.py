@@ -21,7 +21,7 @@ BASE = ('vless://bf000d23-0752-40b4-affe-68f7707a9661@example.com:443?'
 
 class ImportTests(unittest.TestCase):
     def parse(self, extra='', base=BASE):
-        p = subprocess.run(['bash', str(REPO/'parser.sh'), base+extra], capture_output=True, text=True)
+        p = subprocess.run(['bash', str(REPO/'lib/parser.sh'), base+extra], capture_output=True, text=True)
         return p.returncode, json.loads(p.stdout)
 
     def test_plain_vless(self):
@@ -191,7 +191,7 @@ class RealityTests(unittest.TestCase):
 
     def probe(self, outbound):
         before=set(Path("/tmp").glob("sb-reality-probe.*"))
-        result=subprocess.run(['bash','-c','source "$1"; SINGBOX_BIN="$2"; _probe_reality_outbound "$3" "$4"','test',str(REPO/'advanced_relay.sh'),CORE,json.dumps(outbound),f'http://127.0.0.1:{self.http.server_port}/'],capture_output=True,text=True,timeout=25)
+        result=subprocess.run(['bash','-c','source "${1%/lib/relay.sh}/sb.sh" && source "$1"; SINGBOX_BIN="$2"; _probe_reality_outbound "$3" "$4"','test',str(REPO/'lib/relay.sh'),CORE,json.dumps(outbound),f'http://127.0.0.1:{self.http.server_port}/'],capture_output=True,text=True,timeout=25)
         self.assertEqual(set(Path("/tmp").glob("sb-reality-probe.*")),before)
         return result
 
@@ -226,7 +226,7 @@ _create_anyreality_node_impl 127.0.0.1 "$NODE_PORT" localhost secret \
 '''], env=env, capture_output=True, text=True, timeout=15)
         self.assertEqual(generated.returncode, 0, generated.stderr)
         metadata = json.loads((self.root/'metadata.json').read_text())['generated-reality']
-        parsed = subprocess.run(['bash', str(REPO/'parser.sh'), metadata['share_link']],
+        parsed = subprocess.run(['bash', str(REPO/'lib/parser.sh'), metadata['share_link']],
                                 capture_output=True, text=True)
         self.assertEqual(parsed.returncode, 0, parsed.stderr)
         outbound = json.loads(parsed.stdout)

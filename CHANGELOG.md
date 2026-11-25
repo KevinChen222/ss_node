@@ -1,5 +1,17 @@
 # 修改記錄
 
+## 23-singbox.1 — 恢復 sing-box 中轉選單、模組化拆分與整套安裝
+
+版本：`proxyall 2.3.0`、`sb.sh 23-singbox.1`、`deploy.sh 2026.11.25-local24`。
+
+- 修復主選單 17「落地/中轉/第三方節點導入」直接重開 `sb` 主選單、無法進入中轉選單的問題。中轉恢復為 sing-box 實現（`relay.json` 與主配置一起由 sing-box 載入），選單包含落地 Token、Token / 第三方連結導入、鏈路檢視、刪除、改端口、端口轉發與規則集分流；中轉只重啟 sing-box，不再連帶重啟 Xray，EOF 時直接返回主選單。
+- `sb.sh` 拆分為按職責與協議分組的模組：`lib/sb_tx.sh`、`sb_core.sh`、`sb_origin.sh`、`sb_nodes.sh`、`sb_argo.sh`，以及 `sb_proto_vless.sh`、`sb_proto_anytls.sh`、`sb_proto_tls.sh`、`sb_proto_quic.sh`、`sb_proto_basic.sh`、`sb_proto_xhttp.sh`；與中轉共用的工具移入 `lib/common.sh`、`lib/nft.sh`、`lib/reality.sh`。`sb.sh` 保留入口、路徑常量、日誌維護、主選單與命令分派。
+- 中轉模組改為 `lib/relay.sh`，由 `sb` 在子 shell 中載入，刪除約 50 個與 `sb.sh` 重複且已出現差異的函數副本（Reality SNI 選擇、nftables、原子修改、服務管理等），統一使用 `sb` 的實現；不再透過 `export -f` 傳遞函數。Reality 目標選擇與 `sb` 一致，nftables 持久化改用先校驗再原子替換的版本。
+- `advanced_relay.sh`、`parser.sh` 不再從 `main` 分支按需下載，改為 `lib/relay.sh`、`lib/parser.sh` 隨整套腳本按同一提交安裝與校驗；`proxyall` 統一固定全部 17 個庫的雜湊，`tools/component_pins.py` 改為單層。舊版下載到 `/usr/local/etc/sing-box/` 的副本及指向它的域名刷新定時任務在 `setup-maintenance` 時遷移為 `sb pf-dns-refresh`。
+- `sb.sh` 與 `deploy.sh` 的入口引導段逐字一致並由測試校驗；兩者安裝的 acme.sh 版本與歸檔雜湊集中在 `lib/common.sh`。
+- 升級方式：已安裝 `2.2.x` 的伺服器先執行一次 `proxyall --update` 更新現有五個檔案，再從新版選單選擇 3 檢查更新一次，下載並安裝全部模組。第一步完成後日誌維護照常運作，`sb` 選單會提示再更新一次。
+- 新增 `tools/check_functions.py` 與 `tests/relay_entry.py`；`installer_upgrade.py` 覆蓋從 `2.2.1` 起的兩步升級。
+
 ## 22-singbox.2 — 節點建立與編輯完成後按回車返回
 
 版本：`proxyall 2.2.1`、`sb.sh 22-singbox.2`。

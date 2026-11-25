@@ -13,9 +13,13 @@ from installer import BUNDLE_FILES, REPO, copy_files
 LEGACY = '52431e518f6b1941f4f6aab577d0c9331afa1543'
 STAGE_ONE = '1' * 40
 STAGE_TWO = '2' * 40
+RELEASE_221 = 'f0df4826a1229fa1628d0e5dc8a4e177e4b4e98e'
+FILES_221 = ('sb.sh', 'deploy.sh', 'lib/common.sh', 'lib/sni_router.sh', 'proxyall')
 TARGETS = ('bin/sb', 'bin/nginxproxy', 'bin/proxyall',
-           'lib/proxyall/common.sh', 'lib/proxyall/sni_router.sh')
-KEYS = ('SB_SHA256', 'DEPLOY_SHA256', None, 'COMMON_SHA256', 'SNI_ROUTER_SHA256')
+           *(f'lib/proxyall/{name[4:]}' for name in BUNDLE_FILES[3:]))
+KEYS = ('SB_SHA256', 'DEPLOY_SHA256', None,
+        *(name[4:-3].upper() + '_SHA256' for name in BUNDLE_FILES[3:]))
+TARGET_OF = dict(zip(BUNDLE_FILES, TARGETS))
 
 MOCK_ENV = r'''
 stat() {
@@ -117,8 +121,8 @@ class UpgradeTests(unittest.TestCase):
                 self.assertEqual(count, 1, key)
         installer.write_text(content)
 
-    def git_file(self, path):
-        return subprocess.check_output(['git', 'show', f'{LEGACY}:{path}'], cwd=REPO)
+    def git_file(self, path, revision=LEGACY):
+        return subprocess.check_output(['git', 'show', f'{revision}:{path}'], cwd=REPO)
 
     def install_legacy_files(self):
         self.installer.parent.mkdir(parents=True)
@@ -249,6 +253,48 @@ class UpgradeTests(unittest.TestCase):
         self.command('--install', script=standalone, answer='0\n')
         self.assert_bundle()
         self.assertEqual((self.root / 'components').read_text(), 'maintenance with libraries\n')
+
+    def install_221_files(self):
+        for directory in (self.root / 'usr', self.local, self.local / 'bin',
+                          self.local / 'lib', self.local / 'lib/proxyall'):
+            directory.mkdir(mode=0o755, exist_ok=True)
+            directory.chmod(0o755)
+        self.state.mkdir(mode=0o700)
+        (self.state / '.managed').write_text('# PROXYALL_MANAGED_COMMAND=1\n')
+        (self.state / 'commit').write_text(RELEASE_221 + '\n')
+        for name in ('.managed', 'commit'):
+            (self.state / name).chmod(0o600)
+        for name in FILES_221:
+            path = self.local / TARGET_OF[name]
+            data = self.git_file(name, RELEASE_221)
+            if name == 'proxyall':
+                data = self.sandbox(data.decode()).encode()
+            path.write_bytes(data)
+            path.chmod(0o644 if name.startswith('lib/') else 0o700)
+
+    def test_221_update_then_menu_update_installs_all_modules(self):
+        self.install_221_files()
+        # Stage one: the 2.2.1 installer replaces its own five files from the new commit.
+        p = self.command('--update', answer='y\n0\n', ref=STAGE_ONE)
+        self.assertEqual(self.downloaded(), list(FILES_221))
+        self.assertEqual((self.root / 'components').read_text(), 'maintenance with libraries\n')
+        for name in FILES_221:
+            self.assertEqual((self.local / TARGET_OF[name]).read_bytes(), (self.remote / name).read_bytes())
+        for name in BUNDLE_FILES[3:]:
+            if name not in FILES_221:
+                self.assertFalse((self.local / TARGET_OF[name]).exists(), name)
+        # The new entry gates node menus until the remaining modules are installed.
+        p = self.command(answer='0\n', ref=STAGE_ONE)
+        self.assertIn('配套库缺失或版本不匹配', p.stderr)
+        self.assertNotIn('1) Emby', p.stdout)
+        # Stage two: one more update downloads and installs every module.
+        p = self.command(answer='3\ny\n2\n0\n')
+        self.assertEqual(self.downloaded()[len(FILES_221):],
+                         ['sb.sh', 'deploy.sh', *BUNDLE_FILES[3:], 'proxyall'])
+        self.assertIn('1) Emby', p.stdout)
+        self.assert_bundle()
+        self.assertEqual((self.root / 'components').read_text().splitlines(),
+                         ['maintenance with libraries', 'maintenance with libraries', 'sb menu'])
 
     def test_unrecognized_library_target_prevents_update(self):
         backup, _ = self.stage_one()

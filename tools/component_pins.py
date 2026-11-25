@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check repository component pins, or refresh them with --write."""
+"""Check the SHA-256 pins in proxyall for every bundled file, or refresh them with --write."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,35 +7,35 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-# Process dependencies before the scripts whose digests include their pins.
-PINS = {
-    'advanced_relay.sh': {'PARSER_SHA256': 'parser.sh'},
-    'sb.sh': {'PARSER_SHA256': 'parser.sh', 'ADVANCED_RELAY_SHA256': 'advanced_relay.sh'},
-    'proxyall': {'PARSER_SHA256': 'parser.sh', 'RELAY_SHA256': 'advanced_relay.sh',
-                 'SB_SHA256': 'sb.sh', 'DEPLOY_SHA256': 'deploy.sh',
-                 'COMMON_SHA256': 'lib/common.sh', 'SNI_ROUTER_SHA256': 'lib/sni_router.sh'},
-}
+
+
+def pins(installer_text):
+    """Map each pin constant to its file: SB_SHA256/DEPLOY_SHA256 for the entries, and one
+    constant per library in PA_LIBS, named after the file (sb_core.sh -> SB_CORE_SHA256)."""
+    match = re.search(r'^PA_LIBS=\((.*?)\)', installer_text, re.M | re.S)
+    if not match:
+        raise ValueError('proxyall: PA_LIBS not found')
+    mapping = {'SB_SHA256': 'sb.sh', 'DEPLOY_SHA256': 'deploy.sh'}
+    for name in match.group(1).split():
+        mapping[name[:-3].upper() + '_SHA256'] = f'lib/{name}'
+    return mapping
 
 
 def sync(root, write):
-    pending = {}
-    for name, pins in PINS.items():
-        original = data = (root / name).read_bytes()
-        for field, dependency in pins.items():
-            source = pending[dependency] if dependency in pending else (root / dependency).read_bytes()
-            digest = hashlib.sha256(source).hexdigest().encode()
-            key = field.encode() + b'='
-            assignments = re.findall(b'^' + key + b'.*$', data, re.M)
-            if len(assignments) != 1 or not re.fullmatch(key + b'"[0-9a-f]{64}"', assignments[0]):
-                raise ValueError(f'{name}: expected one SHA-256 assignment for {field}')
-            data = re.sub(b'^' + key + b'.*$', key + b'"' + digest + b'"', data, flags=re.M)
-        if data != original:
-            pending[name] = data
-    for name, data in pending.items():
-        if write:
-            (root / name).write_bytes(data)
-        print(name)
-    return 0 if write or not pending else 1
+    installer = root / 'proxyall'
+    original = data = installer.read_text()
+    for key, name in pins(data).items():
+        digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        assignments = re.findall(rf'^{key}=.*$', data, re.M)
+        if len(assignments) != 1 or not re.fullmatch(rf'{key}="[0-9a-f]{{64}}"', assignments[0]):
+            raise ValueError(f'proxyall: expected one SHA-256 assignment for {key}')
+        data = re.sub(rf'^{key}=.*$', f'{key}="{digest}"', data, flags=re.M)
+    if data == original:
+        return 0
+    if write:
+        installer.write_text(data)
+    print('proxyall')
+    return 0 if write else 1
 
 
 if __name__ == '__main__':

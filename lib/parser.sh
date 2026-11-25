@@ -1,5 +1,6 @@
 #!/bin/bash
-# PROXYALL_COMPONENT=parser.sh
+# PROXYALL_LIB=parser.sh
+# 分享链接解析：把 vless/vmess/trojan/ss/hy2/tuic/anytls 等链接转为 sing-box 出站 JSON，由中转模块以独立进程调用。
 
 # 节点链接中可能包含密码、UUID 等凭据，临时文件默认仅允许当前用户读取。
 umask 077

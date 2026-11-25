@@ -2,8 +2,9 @@
 
 # NGINXPROXY_MANAGED_COMMAND=1
 
-# Keep this bootstrap in sync with sb.sh. Installed entries use only the
-# fixed library directory, even when reached through a symlink.
+# >>> proxyall bootstrap
+# 本段在 sb.sh 与 deploy.sh 中逐字一致（tests/common.py 校验）。已安装入口只从固定库目录
+# /usr/local/lib/proxyall 加载，经符号链接调用也一样；从仓库检出运行时使用同目录下的 lib/。
 _proxyall_trusted_lib_path() {
     local path=$1 depth=${2:-0} owner mode link
     (( depth < 40 )) || return 1
@@ -22,10 +23,13 @@ _proxyall_trusted_lib_path() {
     done
 }
 
+# 用法：_proxyall_check_libraries 目录 文件名...
+# 每个文件须是带 "# PROXYALL_LIB=文件名" 标记的普通文件；固定库目录还要求整条路径只有 root 可写。
 _proxyall_check_libraries() {
     local dir=$1 name
+    shift
     [[ -d $dir && ! -L $dir ]] || return 1
-    for name in common.sh sni_router.sh; do
+    for name in "$@"; do
         [[ -f $dir/$name && -r $dir/$name && ! -L $dir/$name ]] || return 1
         if [[ $dir == /usr/local/lib/proxyall ]]; then
             _proxyall_trusted_lib_path "$dir/$name" || return 1
@@ -34,18 +38,26 @@ _proxyall_check_libraries() {
     done
 }
 
-_proxyall_entry=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || _proxyall_entry=
-_proxyall_lib_dir=/usr/local/lib/proxyall
-if [[ $_proxyall_entry == */deploy.sh && -f $_proxyall_entry && ! $_proxyall_entry -ef /usr/local/bin/nginxproxy ]]; then
-    _proxyall_lib_dir=${_proxyall_entry%/*}/lib
-fi
-if ! { _proxyall_check_libraries "$_proxyall_lib_dir" &&
+# 用法：_proxyall_resolve_lib_dir 检出文件名 安装路径
+_proxyall_resolve_lib_dir() {
+    local entry
+    entry=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || entry=
+    if [[ $entry == */"$1" && -f $entry && ! $entry -ef $2 ]]; then
+        printf '%s\n' "${entry%/*}/lib"
+    else
+        printf '%s\n' /usr/local/lib/proxyall
+    fi
+}
+# <<< proxyall bootstrap
+
+_proxyall_lib_dir=$(_proxyall_resolve_lib_dir deploy.sh /usr/local/bin/nginxproxy)
+if ! { _proxyall_check_libraries "$_proxyall_lib_dir" common.sh sni_router.sh &&
     source "$_proxyall_lib_dir/common.sh" && source "$_proxyall_lib_dir/sni_router.sh"; }; then
     printf '配套库缺失或不可信（%s）。请运行 proxyall --install 或 proxyall --update，或从完整仓库运行。\n' "$_proxyall_lib_dir" >&2
     return 1 2>/dev/null || exit 1
 fi
-unset _proxyall_entry _proxyall_lib_dir
-unset -f _proxyall_trusted_lib_path _proxyall_check_libraries
+unset _proxyall_lib_dir
+unset -f _proxyall_trusted_lib_path _proxyall_check_libraries _proxyall_resolve_lib_dir
 
 # Nginx Emby reverse-proxy deployment script with optional HAProxy SNI sharing.
 # Supports multiple
@@ -75,8 +87,8 @@ ROOT_HOME=${ROOT_HOME:-/root}
 BACKUP_DIR='/etc/nginx/backup'
 ACME_SH="${ROOT_HOME}/.acme.sh/acme.sh"
 ACME_WEBROOT='/var/www/acme-challenge'
-ACME_VERSION='3.1.2'
-ACME_ARCHIVE_SHA256='a51511ad0e2912be45125cf189401e4ae776ca1a29d5768f020a1e35a9560186'
+ACME_VERSION=$PROXYALL_ACME_VERSION
+ACME_ARCHIVE_SHA256=$PROXYALL_ACME_ARCHIVE_SHA256
 ACME_ARCHIVE_URL="https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_VERSION}.tar.gz"
 
 # These commands are persisted by acme.sh and therefore must be standalone:
@@ -85,7 +97,7 @@ ACME_NGINX_PRE_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev
 ACME_NGINX_POST_HOOK='if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx 8>&- 9>&-; elif command -v service >/dev/null 2>&1 && service nginx start 8>&- 9>&-; then :; elif [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then :; else nginx 8>&- 9>&-; fi'
 ACME_NGINX_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload 8>&- 9>&-; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx 8>&- 9>&-; elif command -v service >/dev/null 2>&1 && service nginx start 8>&- 9>&-; then :; else nginx 8>&- 9>&-; fi'
 
-SCRIPT_VERSION='2026.11.22-local23'
+SCRIPT_VERSION='2026.11.25-local24'
 QUICK_COMMAND_PATH='/usr/local/bin/nginxproxy'
 QUICK_COMMAND_MARKER='# NGINXPROXY_MANAGED_COMMAND=1'
 SNI_ROUTER_BIN='/usr/local/bin/sb'

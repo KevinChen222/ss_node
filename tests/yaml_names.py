@@ -20,7 +20,8 @@ class YamlNames(unittest.TestCase):
                            'proxy-groups': [{'name': '节点选择', 'proxies': ['keep']}]}
                 path.write_text(json.dumps(initial))
                 script = r'''
-source "$REPO/$ENTRY" || exit 1
+source "$REPO/sb.sh" || exit 1
+[ "$ENTRY" = sb.sh ] || source "$REPO/$ENTRY" || exit 1
 YQ_BINARY=$TEST_YQ CLASH_YAML_FILE=$WORK/nodes.yaml RELAY_CLASH_YAML=$WORK/nodes.yaml
 PROXYALL_WRITE_LOCK_FILE=$WORK/lock
 ''' + operations
@@ -44,7 +45,7 @@ _remove_node_from_yaml "$NAME"
 ''')
 
     def test_relay_group_uses_string_names(self):
-        self.exercise('advanced_relay.sh', r'''
+        self.exercise('lib/relay.sh', r'''
 _add_node_to_relay_yaml "$NODE"
 "$YQ_BINARY" -o=json '.' "$RELAY_CLASH_YAML" > "$WORK/added.json"
 _remove_node_from_relay_yaml "$NAME"

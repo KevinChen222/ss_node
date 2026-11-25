@@ -186,7 +186,7 @@ class ExportTests(NodeFixture):
             with self.subTest(variant=variant):
                 self.generate(variant=variant)
                 link = self.read('metadata.json')['tcp-node-test']['share_link']
-                result = subprocess.run(['bash', str(REPO / 'parser.sh'), link],
+                result = subprocess.run(['bash', str(REPO / 'lib/parser.sh'), link],
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout)['multiplex'],

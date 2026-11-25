@@ -17,7 +17,7 @@ class RelayImportTests(unittest.TestCase):
     def run_import(self, link=LINK, *, output=None, status=0, answer=''):
         with tempfile.TemporaryDirectory(prefix='proxyall-relay-import-') as work:
             root = Path(work)
-            parser = REPO / 'parser.sh'
+            parser = REPO / 'lib/parser.sh'
             env = os.environ.copy()
             if output is not None:
                 parser = root / 'parser.sh'
@@ -25,13 +25,13 @@ class RelayImportTests(unittest.TestCase):
                 env.update(TEST_PARSER_OUTPUT=output, TEST_PARSER_STATUS=str(status))
             marker = root / 'finalize.args'
             result = subprocess.run(['bash', '-c', r'''
-source "$1" || exit 99
+source "${1%/lib/relay.sh}/sb.sh" && source "$1" || exit 99
 test_parser="$2"
 finalize_marker="$3"
 _check_parser() { _PARSER_PATH="$test_parser"; }
 _finalize_relay_setup() { printf '%s\0' "$@" >> "$finalize_marker"; }
 _import_link_config_locked
-''', 'test', str(REPO / 'advanced_relay.sh'), str(parser), str(marker)],
+''', 'test', str(REPO / 'lib/relay.sh'), str(parser), str(marker)],
                 cwd=root, env=env, input=f'{link}\n{answer}', text=True,
                 capture_output=True, timeout=10)
             finalized = marker.read_bytes().decode().split('\0')[:-1] if marker.exists() else None

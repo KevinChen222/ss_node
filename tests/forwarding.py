@@ -55,7 +55,7 @@ class ForwardingTests(unittest.TestCase):
         self.relay = self.root / "relay.json"
         self.links = self.root / "relay_links.json"
         self.meta = self.root / "relay_pf.json"
-        (self.root / "parser.sh").write_bytes((REPO / "parser.sh").read_bytes())
+        (self.root / "parser.sh").write_bytes((REPO / "lib/parser.sh").read_bytes())
         self.write(self.main, {
             "log": {"level": "debug", "timestamp": False},
             "dns": {"servers": [{"type": "local", "tag": "dns-main"}]},
@@ -92,7 +92,8 @@ class ForwardingTests(unittest.TestCase):
 
     def bash(self, body, stdin="", engine="singbox", extra=None, check=True):
         setup = r'''
-source "$REPO/advanced_relay.sh"
+source "$REPO/sb.sh"
+source "$REPO/lib/relay.sh"
 SCRIPT_DIR="$WORK"
 SINGBOX_DIR="$WORK"
 RELAY_AUX_DIR="$WORK"
@@ -111,7 +112,7 @@ YQ_BINARY="$WORK/yq"
 INIT_SYSTEM=direct
 _pf_detect_engine() { PF_ENGINE="$TEST_ENGINE"; PF_ENV_KIND=host; PF_ACCESS_HINT=""; PF_PUBLISH_HINT=false; }
 _pf_service_is_active() { return 0; }
-_manage_service() {
+_relay_service() {
     printf '%s\n' "$1" >> "$WORK/services.log"
     [ "${FAIL_RESTART:-0}" != 1 ]
 }
@@ -596,7 +597,7 @@ _delete_relay
         else:
             self.make_relay(choice, outbound)
             link = next(iter(self.read(self.links).values()))["link"]
-            result = subprocess.run(["bash", str(REPO / "parser.sh"), link], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(["bash", str(REPO / "lib/parser.sh"), link], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             node = json.loads(result.stdout)
         _, relay_log = self.start_core(self.main, self.relay)
@@ -626,7 +627,7 @@ _delete_relay
     def test_generated_tuic_link_preserves_insecure(self):
         self.make_relay(3)
         link = next(iter(self.read(self.links).values()))["link"]
-        result = subprocess.run(["bash", str(REPO / "parser.sh"), link], capture_output=True, text=True, check=True)
+        result = subprocess.run(["bash", str(REPO / "lib/parser.sh"), link], capture_output=True, text=True, check=True)
         self.assertTrue(json.loads(result.stdout)["tls"]["insecure"],
                         "Generated allow_insecure=1 is discarded by the node link parser")
 

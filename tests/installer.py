@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise installer checks and component downloads in temporary directories."""
+"""Exercise installer checks, bundle hashes and target recognition in temporary directories."""
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -9,7 +10,14 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
-BUNDLE_FILES = ('sb.sh', 'deploy.sh', 'proxyall', 'lib/common.sh', 'lib/sni_router.sh')
+def bundle_libraries():
+    text = (REPO / 'proxyall').read_text()
+    match = re.search(r'^PA_LIBS=\((.*?)\)', text, re.M | re.S)
+    return tuple(f'lib/{name}' for name in match.group(1).split())
+
+
+# Entries first (the three-file legacy bundle), then every library in installer order.
+BUNDLE_FILES = ('sb.sh', 'deploy.sh', 'proxyall', *bundle_libraries())
 
 
 def copy_files(source, target, names):
@@ -72,7 +80,7 @@ class InstallerTests(unittest.TestCase):
     def test_bundle_rejects_untrusted_library_sources(self):
         copy_files(REPO, self.root, BUNDLE_FILES)
         lib = self.root / 'lib'
-        for name in ('common.sh', 'sni_router.sh'):
+        for name in ('common.sh', 'sni_router.sh', 'sb_core.sh', 'relay.sh', 'parser.sh'):
             with self.subTest(name=name):
                 path = lib / name
                 original = path.read_bytes()
@@ -90,28 +98,24 @@ class InstallerTests(unittest.TestCase):
         lib.symlink_to(self.root / 'saved-lib')
         self.shell('pa_validate_bundle "$WORK"', ok=False)
 
-    def test_refresh_transitive_component_pins(self):
+    def test_refresh_component_pins(self):
         tool = self.root / 'tools/component_pins.py'
         tool.parent.mkdir()
         shutil.copyfile(REPO / 'tools/component_pins.py', tool)
-        copy_files(REPO, self.root, (*BUNDLE_FILES, 'advanced_relay.sh', 'parser.sh'))
-        with (self.root / 'parser.sh').open('a') as parser:
-            parser.write('\n# fixture\n')
+        copy_files(REPO, self.root, BUNDLE_FILES)
         cmd = [sys.executable, tool]
-        check = subprocess.run(cmd, capture_output=True, text=True)
-        self.assertEqual(check.returncode, 1)
-        self.assertEqual(check.stdout.splitlines(), ['advanced_relay.sh', 'sb.sh', 'proxyall'])
-        subprocess.run(cmd + ['--write'], check=True, capture_output=True)
         subprocess.run(cmd, check=True)
-        self.shell('pa_validate_bundle "$WORK"')
-        for name in ('lib/common.sh', 'lib/sni_router.sh'):
-            with (self.root / name).open('a') as library:
-                library.write('\n# fixture\n')
-            check = subprocess.run(cmd, capture_output=True, text=True)
-            self.assertEqual(check.returncode, 1)
-            self.assertEqual(check.stdout.splitlines(), ['proxyall'])
-            subprocess.run(cmd + ['--write'], check=True, capture_output=True)
-            self.shell('pa_validate_bundle "$WORK"')
+        for name in ('sb.sh', 'lib/common.sh', 'lib/sb_proto_quic.sh', 'lib/parser.sh'):
+            with self.subTest(name=name):
+                with (self.root / name).open('a') as changed:
+                    changed.write('\n# fixture\n')
+                self.shell('pa_validate_bundle "$WORK"', ok=False)
+                check = subprocess.run(cmd, capture_output=True, text=True)
+                self.assertEqual(check.returncode, 1)
+                self.assertEqual(check.stdout.splitlines(), ['proxyall'])
+                subprocess.run(cmd + ['--write'], check=True, capture_output=True)
+                subprocess.run(cmd, check=True)
+                self.shell('pa_validate_bundle "$WORK"')
 
     def test_unmarked_scripts_recognized_without_execution(self):
         for name, marker in (('sb.sh', '# SB_MANAGER_MANAGED_COMMAND=1'),
@@ -133,7 +137,7 @@ class InstallerTests(unittest.TestCase):
         target = self.root / 'custom'
         target.write_text('#!/bin/bash\necho custom\n')
         (self.root / 'link').symlink_to(target)
-        for name in ('sb.sh', 'deploy.sh', 'parser.sh', 'advanced_relay.sh', *BUNDLE_FILES[-2:]):
+        for name in ('sb.sh', 'deploy.sh', *BUNDLE_FILES[2:]):
             self.shell(f'pa_known_target "$WORK/custom" {name}', ok=False)
             self.shell(f'pa_known_target "$WORK/link" {name}', ok=False)
 
@@ -187,37 +191,6 @@ ln -s "$WORK/writable/hop" "$WORK/local"
 pa_safe_directory "$WORK/local/bin"
 chmod 777 "$WORK/writable"
 if pa_safe_directory "$WORK/local/bin"; then exit 1; fi
-''')
-
-    def test_curl_component_download_and_integrity(self):
-        for mode in ('success', 'download-failure', 'bad-hash'):
-            with self.subTest(mode=mode):
-                self.shell(f'MODE={mode}\n' + r'''
-source "$REPO/sb.sh"
-SINGBOX_DIR="$WORK/components"
-mkdir -p "$SINGBOX_DIR"
-printf existing > "$SINGBOX_DIR/parser.sh"
-_info() { :; }
-_error() { :; }
-wget() { echo unexpected-wget >&2; return 99; }
-curl() {
-    printf '%s\n' "$*" > "$WORK/curl.args"
-    [ "$MODE" != download-failure ] || return 1
-    local output
-    while [ "$#" -gt 0 ]; do output="$1"; shift; done
-    if [ "$MODE" = bad-hash ]; then printf corrupted > "$output"
-    else cp "$REPO/parser.sh" "$output"; fi
-}
-if [ "$MODE" = success ]; then
-    _ensure_component_script parser.sh
-    cmp "$SINGBOX_DIR/parser.sh" "$REPO/parser.sh"
-    curl() { return 99; }
-    _ensure_component_script parser.sh
-else
-    if _ensure_component_script parser.sh; then exit 1; fi
-    test "$(cat "$SINGBOX_DIR/parser.sh")" = existing
-    test ! -e "$SINGBOX_DIR/parser.sh.tmp.$$"
-fi
 ''')
 
 
