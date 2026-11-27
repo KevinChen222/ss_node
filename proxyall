@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PROXYALL_MANAGED_COMMAND=1
 # 安装同一提交的 Sing-box / Xray 管理器、Nginx 反代与统一入口。
-PROXYALL_VERSION="2.3.0"
+PROXYALL_VERSION="2.3.1"
 SB_SHA256="9e86e9ed3ad4fac9db7fe9d39d96d4316ad66a052ccabcee425e4f9bd0bed353"
 DEPLOY_SHA256="f111feb1040b92ceda285b2bf50182458f7ae2e813bd2744ba57a67113fcb73e"
 COMMON_SHA256="d160baa5428fa7662b4a309298f39c380a2417df06d532cb76e68b69979280e4"
@@ -67,7 +67,7 @@ proxyall：Emby / Sing-box / Xray 统一管理
 
   proxyall                 打开菜单（首次运行下载并安装配套脚本）
   proxyall --install       安装或更新全部脚本，然后打开菜单
-  proxyall --update        检查并询问是否更新全部脚本
+  proxyall --update        检查并询问是否更新全部脚本（可加 -v/--verbose 查看完整清单）
   proxyall --uninstall     卸载统一入口，保留服务及原有管理脚本
   proxyall --version       显示版本
   proxyall --fix-http2     备份并修复受管 Nginx 配置的 HTTP/2 旧语法
@@ -89,24 +89,24 @@ pa_fetch() {
 
 pa_dependencies() {
     local missing=0 cmd
-    for cmd in curl sha256sum flock install mktemp; do
+    for cmd in curl sha256sum flock install mktemp tar gzip; do
         command -v "$cmd" >/dev/null 2>&1 || missing=1
     done
     [ "$missing" = 0 ] && return 0
     pa_info '安装下载与文件校验依赖...'
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates coreutils util-linux || return 1
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates coreutils util-linux tar gzip || return 1
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl ca-certificates coreutils util-linux || return 1
+        dnf install -y curl ca-certificates coreutils util-linux tar gzip || return 1
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl ca-certificates coreutils util-linux || return 1
+        yum install -y curl ca-certificates coreutils util-linux tar gzip || return 1
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl ca-certificates coreutils util-linux || return 1
+        apk add --no-cache curl ca-certificates coreutils util-linux tar gzip || return 1
     else
-        pa_error '请先安装 curl、ca-certificates、coreutils、util-linux。'
+        pa_error '请先安装 curl、ca-certificates、coreutils、util-linux、tar、gzip。'
         return 1
     fi
-    for cmd in curl sha256sum flock install mktemp; do command -v "$cmd" >/dev/null 2>&1 || return 1; done
+    for cmd in curl sha256sum flock install mktemp tar gzip; do command -v "$cmd" >/dev/null 2>&1 || return 1; done
 }
 
 pa_trusted_directory_chain() {
@@ -189,6 +189,13 @@ pa_constant() {
     printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
+pa_version_of() {
+    local file="$1" assignment
+    assignment=$(grep -E '^PROXYALL_VERSION=' "$file") || return 1
+    [[ "$assignment" =~ ^PROXYALL_VERSION=\"([A-Za-z0-9._-]+)\"$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 pa_validate_bundle() {
     local dir="$1" file path key expected actual i
     pa_safe_directory "$dir" && pa_safe_directory "$dir/lib" || return 1
@@ -220,25 +227,158 @@ pa_libs_ready() {
     done
 }
 
+pa_local_bundle_verified() {
+    local i file target key actual
+    for i in "${!PA_FILES[@]}"; do
+        file=${PA_FILES[$i]}; target=${PA_TARGETS[$i]}; key=${PA_KEYS[$i]}
+        pa_safe_directory "${target%/*}" && pa_trusted_file "$target" &&
+            grep -Fqx "${PA_MARKERS[$i]}" "$target" || return 1
+        [[ "$file" = lib/* ]] || [ -x "$target" ] || return 1
+        if [ -n "$key" ]; then
+            actual=$(pa_hash "$target") || return 1
+            [ "$actual" = "${!key}" ] || return 1
+        else
+            bash -n "$target" 2>/dev/null || return 1
+            [ "$(pa_version_of "$target")" = "$PROXYALL_VERSION" ] || return 1
+            if [ -f "${BASH_SOURCE[0]}" ]; then
+                cmp -s "${BASH_SOURCE[0]}" "$target" || return 1
+            fi
+        fi
+    done
+}
+
 pa_incomplete_notice() {
     pa_info '配套库缺失或版本不匹配。请在菜单选择 3) 检查脚本更新并输入 y，或运行 proxyall --update。'
 }
 
-pa_download_bundle() {
-    local ref_file commit file raw
-    PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX") || return 1
-    ref_file="$PA_STAGE/ref.json"
-    pa_info '查询仓库 main 的提交，下载同一提交的全部管理脚本和配套库...'
+pa_fetch_remote_commit() {
+    local ref_file="${1:-$PA_STAGE/ref.json}" commit
     pa_fetch "https://api.github.com/repos/$PA_REPO/git/ref/heads/main" "$ref_file" && pa_trusted_file "$ref_file" || {
-        pa_error '无法读取 GitHub 提交（也可能是 API 限流）。本地文件未改动。'; return 1;
+        pa_error '无法读取 GitHub 提交（也可能是 API 限流）。本地文件未改动。'
+        return 1
     }
     commit=$(sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([a-f0-9]\{40\}\)".*/\1/p' "$ref_file")
-    [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || { pa_error 'GitHub 提交格式无效。'; return 1; }
-    raw="https://raw.githubusercontent.com/$PA_REPO/$commit"
-    mkdir -m 700 -- "$PA_STAGE/lib" || return 1
-    for file in "${PA_FILES[@]}"; do
-        pa_fetch "$raw/$file" "$PA_STAGE/$file" || { pa_error "下载失败: $file"; return 1; }
+    [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || {
+        pa_error 'GitHub 提交格式无效。'
+        return 1
+    }
+    printf '%s\n' "$commit"
+}
+
+pa_extract_tarball() {
+    local archive="$1" dest="$2"
+    local list vlist entry vline top root="" type clean_path file member extract_dir i
+    local -a entries=() vlines=() members=()
+    local -A required=() seen=()
+
+    list=$(LC_ALL=C tar -tzf "$archive" 2>/dev/null) || return 1
+    vlist=$(LC_ALL=C tar -tvzf "$archive" 2>/dev/null) || return 1
+    [ -n "$list" ] || return 1
+
+    mapfile -t entries <<< "$list"
+    mapfile -t vlines <<< "$vlist"
+    [ "${#entries[@]}" -gt 0 ] && [ "${#entries[@]}" -eq "${#vlines[@]}" ] || return 1
+
+    for i in "${!entries[@]}"; do
+        entry=${entries[$i]}
+        [ -n "$entry" ] || return 1
+        [[ "$entry" != /* ]] || return 1
+        [[ "/$entry/" != */../* ]] || return 1
+        [[ "/$entry/" != */./* ]] || return 1
+        [[ "$entry" != *//* ]] || return 1
+        if [ "$entry" = pax_global_header ]; then
+            continue
+        fi
+        top=${entry%%/*}
+        if [[ ! "$top" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            return 1
+        fi
+        if [ -z "$root" ]; then
+            root="$top"
+        elif [ "$top" != "$root" ]; then
+            return 1
+        fi
     done
+    [ -n "$root" ] || return 1
+
+    for file in "${PA_FILES[@]}"; do
+        required["$root/$file"]=1
+    done
+
+    for i in "${!entries[@]}"; do
+        entry=${entries[$i]}
+        vline=${vlines[$i]}
+        [ "$entry" != pax_global_header ] || continue
+        type=${vline:0:1}
+        clean_path=${entry%/}
+        if [ "$clean_path" = "$root" ] || [ "$clean_path" = "$root/lib" ]; then
+            [ "$type" = d ] || return 1
+        fi
+        if [ -n "${required[$clean_path]:-}" ]; then
+            [ "$entry" = "$clean_path" ] || return 1
+            [[ "$vline" =~ ^-[rwxstST-]{9}[.+]?[[:space:]]+.*[[:space:]][0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[0-9]{2}:[0-9]{2}(:[0-9]{2})?[[:space:]]+(.+)$ ]] || return 1
+            [ "${BASH_REMATCH[2]}" = "$entry" ] || return 1
+            [[ "$vline" != *' -> '* ]] && [[ "$vline" != *' link to '* ]] || return 1
+            seen["$clean_path"]=$(( ${seen[$clean_path]:-0} + 1 ))
+            [ "${seen[$clean_path]}" -eq 1 ] || return 1
+        fi
+    done
+
+    for file in "${PA_FILES[@]}"; do
+        member="$root/$file"
+        [ "${seen[$member]:-0}" -eq 1 ] || return 1
+        members+=("$member")
+    done
+
+    extract_dir="$dest/extract"
+    mkdir -m 700 -- "$extract_dir" || return 1
+    if ! tar -xzf "$archive" -C "$extract_dir" "${members[@]}" 2>/dev/null; then
+        rm -rf -- "$extract_dir"
+        return 1
+    fi
+    if [ -L "$extract_dir/$root" ] || [ ! -d "$extract_dir/$root" ] ||
+       [ -L "$extract_dir/$root/lib" ] || [ ! -d "$extract_dir/$root/lib" ]; then
+        rm -rf -- "$extract_dir"
+        return 1
+    fi
+    if [ ! -d "$dest/lib" ]; then
+        mkdir -m 700 -- "$dest/lib" || { rm -rf -- "$extract_dir"; return 1; }
+    elif [ -L "$dest/lib" ]; then
+        rm -rf -- "$extract_dir"
+        return 1
+    fi
+    for file in "${PA_FILES[@]}"; do
+        if [ -L "$extract_dir/$root/$file" ] || [ ! -f "$extract_dir/$root/$file" ] ||
+           [ "$(stat -c '%h' -- "$extract_dir/$root/$file")" != 1 ] ||
+           ! cp -- "$extract_dir/$root/$file" "$dest/$file" ||
+           ! chmod 600 -- "$dest/$file"; then
+            rm -rf -- "$extract_dir"
+            return 1
+        fi
+    done
+    rm -rf -- "$extract_dir" "$archive"
+}
+
+pa_download_bundle() {
+    local commit="${1:-}" archive file raw
+    [ -n "$PA_STAGE" ] || PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX") || return 1
+    [ -n "$commit" ] || commit=$(pa_fetch_remote_commit "$PA_STAGE/ref.json") || return 1
+    archive="$PA_STAGE/bundle.tar.gz"
+    pa_info "正在下载提交 ${commit:0:7} 的整套脚本..."
+    if pa_fetch "https://codeload.github.com/$PA_REPO/tar.gz/$commit" "$archive" && pa_trusted_file "$archive"; then
+        if ! pa_extract_tarball "$archive" "$PA_STAGE"; then
+            pa_error '源码归档校验或解压失败，本地文件未改动。'
+            return 1
+        fi
+    else
+        rm -f -- "$archive"
+        pa_info '归档下载失败，回退至逐文件下载...'
+        raw="https://raw.githubusercontent.com/$PA_REPO/$commit"
+        [ -d "$PA_STAGE/lib" ] || mkdir -m 700 -- "$PA_STAGE/lib" || return 1
+        for file in "${PA_FILES[@]}"; do
+            pa_fetch "$raw/$file" "$PA_STAGE/$file" || { pa_error "下载失败: $file"; return 1; }
+        done
+    fi
     pa_validate_bundle "$PA_STAGE" || { pa_error '整套脚本校验失败，本地文件未改动。'; return 1; }
     printf '%s\n' "$commit" > "$PA_STAGE/commit"
 }
@@ -397,24 +537,85 @@ pa_install_bundle() {
     pa_info '现有节点、证书、Nginx 和 HAProxy 配置均保留。以后输入 proxyall 即可打开。'
 }
 
-pa_update() {
-    local mode="${1:-ask}" i changed=0 answer
-    pa_check_targets || return 1
-    pa_download_bundle || { pa_cleanup; return 1; }
-    printf '\n  文件                   状态\n\n'
+pa_print_status_table() {
+    local table_mode="${1:-all_current}" i
+    shift || true
+    local -a statuses=("$@")
+    printf '\n  文件                   状态\n'
     for i in "${!PA_FILES[@]}"; do
-        if { [[ ${PA_FILES[$i]} = lib/* ]] || [ -x "${PA_TARGETS[$i]}" ]; } &&
-            cmp -s "$PA_STAGE/${PA_FILES[$i]}" "${PA_TARGETS[$i]}"; then
-            printf '  %-22s 已是仓库版本\n\n' "${PA_FILES[$i]}"
+        if [ "$table_mode" = all_current ] || [ "${statuses[$i]:-}" = unchanged ]; then
+            printf '  %-22s 已是仓库版本\n' "${PA_FILES[$i]}"
         else
-            printf '  %-22s 待安装 / 有变化\n\n' "${PA_FILES[$i]}"
-            changed=1
+            printf '  %-22s 待安装 / 有变化\n' "${PA_FILES[$i]}"
         fi
     done
-    if [ "$changed" = 0 ]; then
-        pa_atomic_install "$PA_STAGE/commit" "$PA_STATE/commit" 600 || { pa_cleanup; return 1; }
+}
+
+pa_update() {
+    local mode="${1:-ask}" verbose="${2:-0}" i file commit local_commit="" local_short remote_ver answer
+    local changed=0 changed_bins=0 changed_libs=0
+    local -a file_status=() changed_files=()
+    pa_check_targets || return 1
+    PA_STAGE=$(mktemp -d "$PA_STATE/stage.XXXXXXXX") || return 1
+    commit=$(pa_fetch_remote_commit "$PA_STAGE/ref.json") || { pa_cleanup; return 1; }
+    if [ -f "$PA_STATE/commit" ]; then
+        IFS= read -r local_commit < "$PA_STATE/commit" || true
+    fi
+    if [ "$mode" != install ] && [ -n "$local_commit" ] && [ "$local_commit" = "$commit" ] && pa_local_bundle_verified; then
+        if [ "$verbose" = 1 ]; then
+            pa_print_status_table all_current
+        else
+            pa_info "已是最新版本 v$PROXYALL_VERSION (${commit:0:7})，共 ${#PA_FILES[@]} 个文件均完整。"
+        fi
         pa_cleanup
         return 0
+    fi
+    pa_download_bundle "$commit" || { pa_cleanup; return 1; }
+    for i in "${!PA_FILES[@]}"; do
+        file=${PA_FILES[$i]}
+        if { [[ "$file" = lib/* ]] || [ -x "${PA_TARGETS[$i]}" ]; } &&
+            cmp -s "$PA_STAGE/$file" "${PA_TARGETS[$i]}"; then
+            file_status+=(unchanged)
+        else
+            file_status+=(changed)
+            changed=$((changed + 1))
+            changed_files+=("$file")
+            if [[ "$file" = lib/* ]]; then
+                changed_libs=$((changed_libs + 1))
+            else
+                changed_bins=$((changed_bins + 1))
+            fi
+        fi
+    done
+    remote_ver=$(pa_version_of "$PA_STAGE/proxyall") || remote_ver="未知"
+    if [ "$changed" = 0 ]; then
+        pa_atomic_install "$PA_STAGE/commit" "$PA_STATE/commit" 600 || { pa_cleanup; return 1; }
+        if [ "$verbose" = 1 ]; then
+            pa_print_status_table all_current
+        else
+            pa_info "已是最新脚本 v${remote_ver} (${commit:0:7})，${#PA_FILES[@]} 个文件无变化（已同步提交记录）。"
+        fi
+        pa_cleanup
+        return 0
+    fi
+    if [ "$verbose" = 1 ]; then
+        pa_print_status_table diff "${file_status[@]}"
+    elif [ "$mode" = install ]; then
+        pa_info "准备安装 v${remote_ver} (${commit:0:7})，共 ${#PA_FILES[@]} 个文件（已通过 SHA-256 校验）。"
+    else
+        if [[ "$local_commit" =~ ^[a-f0-9]{40}$ ]]; then
+            local_short="${local_commit:0:7}"
+        else
+            local_short="未知"
+        fi
+        pa_info "发现更新: v${PROXYALL_VERSION} (${local_short}) -> v${remote_ver} (${commit:0:7})，共 ${changed}/${#PA_FILES[@]} 个文件有变化"
+        if [ "$changed" -le 8 ]; then
+            for file in "${changed_files[@]}"; do
+                printf '  - %s\n' "$file"
+            done
+        else
+            printf '  包含入口脚本 %d 个、配套库 %d 个（运行 proxyall --update --verbose 查看完整清单）\n' "$changed_bins" "$changed_libs"
+        fi
     fi
     if [ "$mode" != install ]; then
         read -r -p '是否备份并统一更新上述脚本？[y/N]: ' answer || { pa_cleanup; return 1; }
@@ -562,8 +763,14 @@ pa_menu() {
 }
 
 main() {
-    local action="${1:-}"
-    [ "$#" -le 1 ] || { pa_error '参数过多，请只指定一个操作。'; pa_help >&2; return 2; }
+    local action="${1:-}" verbose=0
+    if [ "$action" = --update ] && [ "$#" -eq 2 ] && { [ "$2" = --verbose ] || [ "$2" = -v ]; }; then
+        verbose=1
+    elif [ "$#" -gt 1 ]; then
+        pa_error '参数过多，请只指定一个操作。'
+        pa_help >&2
+        return 2
+    fi
     case "$action" in
         --version) printf '%s\n' "$PROXYALL_VERSION"; return 0 ;;
         -h|--help) pa_help; return 0 ;;
@@ -586,7 +793,7 @@ main() {
     case "$action" in
         --swap) pa_setup_swap; return $? ;;
         --install) pa_update install || return 1; pa_menu; return $? ;;
-        --update) pa_update; return $? ;;
+        --update) pa_update ask "$verbose"; return $? ;;
         --uninstall) pa_uninstall; return $? ;;
         --fix-http2) pa_run "${PA_TARGETS[1]}" --fix-http2; return $? ;;
     esac

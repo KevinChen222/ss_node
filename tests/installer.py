@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise installer checks, bundle hashes and target recognition in temporary directories."""
+import io
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -59,12 +61,159 @@ class InstallerTests(unittest.TestCase):
         return result
 
     def test_extra_arguments_report_usage(self):
-        for action in ('--install', '--help', '--version'):
-            p = subprocess.run(['bash', str(REPO / 'proxyall'), action, 'extra'],
-                               capture_output=True, text=True)
-            self.assertEqual(p.returncode, 2)
-            self.assertIn('参数过多', p.stderr)
-            self.assertIn('proxyall --install', p.stderr)
+        invalid_cases = (
+            ('--install', 'extra'),
+            ('--help', 'extra'),
+            ('--version', 'extra'),
+            ('--update', 'extra'),
+            ('--update', '--verbose', 'extra'),
+            ('--update', '-v', 'extra'),
+        )
+        for args in invalid_cases:
+            with self.subTest(args=args):
+                p = subprocess.run(['bash', str(REPO / 'proxyall'), *args],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn('参数过多', p.stderr)
+                self.assertIn('proxyall --install', p.stderr)
+
+    def test_update_verbose_argument_parsing(self):
+        for args, expected in (
+            ('--update', 'ask 0'),
+            ('--update --verbose', 'ask 1'),
+            ('--update -v', 'ask 1'),
+        ):
+            with self.subTest(args=args):
+                res = self.shell(rf'''
+pa_dependencies() {{ return 0; }}
+pa_prepare_state() {{ return 0; }}
+pa_update() {{ printf '%s %s\n' "$1" "${{2:-0}}"; }}
+eval "$(declare -f main | sed 's/\[ "\$EUID" = 0 \]/true/')"
+main {args}
+''')
+                self.assertEqual(res.stdout.strip(), expected)
+
+    def _build_tarball(self, archive_path, entries):
+        with tarfile.open(archive_path, 'w:gz') as tf:
+            for spec in entries:
+                kind = spec[0]
+                if kind == 'dir':
+                    info = tarfile.TarInfo(spec[1])
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    tf.addfile(info)
+                elif kind == 'file':
+                    data = spec[2]
+                    info = tarfile.TarInfo(spec[1])
+                    info.type = tarfile.REGTYPE
+                    info.mode = spec[3] if len(spec) > 3 else 0o755
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+                elif kind == 'symlink':
+                    info = tarfile.TarInfo(spec[1])
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = spec[2]
+                    tf.addfile(info)
+                elif kind == 'hardlink':
+                    info = tarfile.TarInfo(spec[1])
+                    info.type = tarfile.LNKTYPE
+                    info.linkname = spec[2]
+                    tf.addfile(info)
+                elif kind == 'fifo':
+                    info = tarfile.TarInfo(spec[1])
+                    info.type = tarfile.FIFOTYPE
+                    info.mode = 0o644
+                    tf.addfile(info)
+                elif kind == 'chr':
+                    info = tarfile.TarInfo(spec[1])
+                    info.type = tarfile.CHRTYPE
+                    info.mode = 0o644
+                    info.devmajor = 1
+                    info.devminor = 3
+                    tf.addfile(info)
+
+    def _valid_tar_entries(self, prefix='ss_node-test'):
+        entries = [('dir', f'{prefix}/'), ('dir', f'{prefix}/lib/')]
+        for name in BUNDLE_FILES:
+            entries.append(('file', f'{prefix}/{name}', (REPO / name).read_bytes()))
+        return entries
+
+    def test_extract_tarball_valid_and_busybox_portable(self):
+        entries = self._valid_tar_entries() + [('file', 'ss_node-test/README.md', b'extra\n', 0o644)]
+        tar_variants = [('gnu', '')]
+        if shutil.which('busybox'):
+            tar_variants.append(('busybox', 'tar() { busybox tar "$@"; }\n'))
+        for label, wrapper in tar_variants:
+            with self.subTest(tar=label):
+                stage = self.root / f'stage-{label}'
+                stage.mkdir(mode=0o700)
+                archive = stage / 'bundle.tar.gz'
+                self._build_tarball(archive, entries)
+                self.shell(wrapper + f'pa_extract_tarball "{archive}" "{stage}" && pa_validate_bundle "{stage}"')
+                self.assertFalse((stage / 'extract').exists())
+                self.assertFalse(archive.exists())
+                self.assertFalse((stage / 'README.md').exists())
+                for name in BUNDLE_FILES:
+                    extracted = stage / name
+                    self.assertEqual(extracted.read_bytes(), (REPO / name).read_bytes())
+                    self.assertEqual(extracted.stat().st_mode & 0o777, 0o600)
+
+    def test_extract_tarball_rejects_malicious_archives(self):
+        base = self._valid_tar_entries()
+        host_secret = self.root / 'secret ss_node-test'
+        host_secret.mkdir(mode=0o700)
+        secret_file = host_secret / 'sb.sh'
+        secret_file.write_text('# host secret\n')
+
+        def replace_entry(entries, target, replacement):
+            return [replacement if e[1].rstrip('/') == target.rstrip('/') else e for e in entries]
+
+        cases = {
+            'symlink_member': replace_entry(base, 'ss_node-test/sb.sh', ('symlink', 'ss_node-test/sb.sh', '/etc/passwd')),
+            'symlink_lib_dir': replace_entry(base, 'ss_node-test/lib', ('symlink', 'ss_node-test/lib', '/tmp')),
+            'symlink_root_dir': replace_entry(base, 'ss_node-test', ('symlink', 'ss_node-test', '/tmp')),
+            'hardlink_member': replace_entry(base, 'ss_node-test/sb.sh', ('hardlink', 'ss_node-test/sb.sh', 'ss_node-test/deploy.sh')),
+            'hardlink_spoofed_suffix': replace_entry(base, 'ss_node-test/sb.sh', ('hardlink', 'ss_node-test/sb.sh', str(secret_file))),
+            'hardlink_fake_timestamp': replace_entry(base, 'ss_node-test/sb.sh', ('hardlink', 'ss_node-test/sb.sh', '2026-01-01 00:00 ss_node-test/sb.sh')),
+            'fifo_member': replace_entry(base, 'ss_node-test/sb.sh', ('fifo', 'ss_node-test/sb.sh')),
+            'chr_member': replace_entry(base, 'ss_node-test/sb.sh', ('chr', 'ss_node-test/sb.sh')),
+            'hyphen_root': self._valid_tar_entries(prefix='-C'),
+            'dot_root': self._valid_tar_entries(prefix='.hidden'),
+            'dotdot_traversal_nested': base + [('file', 'ss_node-test/../evil.sh', b'evil\n')],
+            'dotdot_traversal_top': base + [('file', '../evil.sh', b'evil\n')],
+            'absolute_path': base + [('file', '/tmp/evil.sh', b'evil\n')],
+            'missing_member': [e for e in base if e[1] != 'ss_node-test/lib/parser.sh'],
+            'duplicate_entry': base + [('file', 'ss_node-test/sb.sh', (REPO / 'sb.sh').read_bytes())],
+            'multiple_roots': base + [('file', 'other-root/extra.sh', b'x\n')],
+        }
+        tar_variants = [('gnu', '')]
+        if shutil.which('busybox'):
+            tar_variants.append(('busybox', 'tar() { busybox tar "$@"; }\n'))
+        for label, entries in cases.items():
+            archive = self.root / f'bad-{label}.tar.gz'
+            self._build_tarball(archive, entries)
+            for tar_label, wrapper in tar_variants:
+                with self.subTest(case=label, tar=tar_label):
+                    stage = self.root / f'bad-{label}-{tar_label}'
+                    stage.mkdir(mode=0o700)
+                    self.shell(wrapper + f'pa_extract_tarball "{archive}" "{stage}"', ok=False)
+                    self.assertFalse((stage / 'extract').exists())
+                    self.assertFalse((stage / 'sb.sh').exists())
+
+        with self.subTest(case='corrupt_archive'):
+            stage = self.root / 'bad-corrupt'
+            stage.mkdir(mode=0o700)
+            archive = stage / 'bundle.tar.gz'
+            archive.write_text('<html>502 Bad Gateway</html>\n')
+            self.shell(f'pa_extract_tarball "{archive}" "{stage}"', ok=False)
+            self.assertFalse((stage / 'extract').exists())
+
+    def test_version_of_helper(self):
+        res = self.shell('pa_version_of "$REPO/proxyall"')
+        self.assertEqual(res.stdout.strip(), '2.3.1')
+        bad = self.root / 'bad-ver'
+        bad.write_text('PROXYALL_VERSION="1.0.0"\nPROXYALL_VERSION="2.0.0"\n')
+        self.shell('pa_version_of "$WORK/bad-ver"', ok=False)
 
     def test_source_and_process_substitution(self):
         result = self.shell('source "$REPO/proxyall"')

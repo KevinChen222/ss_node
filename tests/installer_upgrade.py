@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Run the 52431e5 updater and the current menu in an isolated installation root."""
 import hashlib
+import io
 import os
 from pathlib import Path
 import re
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -41,6 +43,20 @@ curl() {
     case "$url" in
         https://api.github.com/repos/KevinChen222/ss_node/git/ref/heads/main)
             printf '{"object":{"sha":"%s"}}\n' "$REMOTE_REF" > "$output" ;;
+        "https://codeload.github.com/KevinChen222/ss_node/tar.gz/$REMOTE_REF")
+            printf 'tar.gz:%s\n' "$REMOTE_REF" >> "$WORK/downloads"
+            [ "${FAIL_TARBALL:-}" != 1 ] || return 1
+            if [ -n "${TAMPER_TARBALL:-}" ]; then
+                cp -- "$TAMPER_TARBALL" "$output"
+            else
+                local tmp rc
+                tmp=$(mktemp -d) || return 1
+                cp -a -- "$WORK/remote" "$tmp/ss_node-$REMOTE_REF" &&
+                    tar -czf "$output" -C "$tmp" "ss_node-$REMOTE_REF"
+                rc=$?
+                rm -rf -- "$tmp"
+                return "$rc"
+            fi ;;
         "https://raw.githubusercontent.com/KevinChen222/ss_node/$REMOTE_REF/"*)
             local name="${url#*"$REMOTE_REF/"}"
             printf '%s\n' "$name" >> "$WORK/downloads"
@@ -153,7 +169,18 @@ class UpgradeTests(unittest.TestCase):
         return p
 
     def downloaded(self):
-        return (self.root / 'downloads').read_text().splitlines()
+        path = self.root / 'downloads'
+        return path.read_text().splitlines() if path.exists() else []
+
+    def clear_downloads(self):
+        (self.root / 'downloads').unlink(missing_ok=True)
+
+    def install_current_bundle(self, ref=STAGE_TWO):
+        standalone = self.root / 'standalone-init'
+        standalone.write_bytes((self.remote / 'proxyall').read_bytes())
+        self.command('--install', script=standalone, answer='0\n', ref=ref)
+        self.assert_bundle(ref=ref)
+        self.clear_downloads()
 
     def assert_bundle(self, ref=STAGE_TWO):
         for name, target in zip(BUNDLE_FILES, TARGETS):
@@ -182,7 +209,7 @@ class UpgradeTests(unittest.TestCase):
         backup, _ = self.stage_one()
         p = self.command(answer='3\ny\n1\n2\n0\n', ref=STAGE_ONE)
         self.assertIn('1) Emby', p.stdout)
-        self.assertEqual(self.downloaded()[3:], ['sb.sh', 'deploy.sh', *BUNDLE_FILES[3:], 'proxyall'])
+        self.assertEqual(self.downloaded()[3:], [f'tar.gz:{STAGE_ONE}'])
         self.assert_bundle(ref=STAGE_ONE)
         self.assertEqual(list(self.state.glob('backup.*')), [backup])
         self.assertEqual((self.root / 'components').read_text().splitlines(),
@@ -240,17 +267,22 @@ class UpgradeTests(unittest.TestCase):
         standalone = self.root / 'standalone'
         standalone.write_bytes((self.remote / 'proxyall').read_bytes())
         last = BUNDLE_FILES[-1]
-        self.command('--install', script=standalone, status=1, FAIL_DOWNLOAD=last)
+        self.command('--install', script=standalone, status=1, FAIL_TARBALL='1', FAIL_DOWNLOAD=last)
         self.assertFalse(self.local.exists())
         library = self.remote / last
         original = library.read_bytes()
         library.write_bytes(original.replace(b'# PROXYALL_LIB=', b'# WRONG_MARKER='))
         self.refresh_pins()
+        self.clear_downloads()
         self.command('--install', script=standalone, status=1)
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
         self.assertFalse(self.local.exists())
         library.write_bytes(original)
         self.refresh_pins()
-        self.command('--install', script=standalone, answer='0\n')
+        self.clear_downloads()
+        p = self.command('--install', script=standalone, answer='0\n')
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
+        self.assertIn('准备安装 v2.3.1', p.stderr)
         self.assert_bundle()
         self.assertEqual((self.root / 'components').read_text(), 'maintenance with libraries\n')
 
@@ -287,12 +319,11 @@ class UpgradeTests(unittest.TestCase):
         p = self.command(answer='0\n', ref=STAGE_ONE)
         self.assertIn('配套库缺失或版本不匹配', p.stderr)
         self.assertNotIn('1) Emby', p.stdout)
-        # Stage two: one more update downloads and installs every module.
-        p = self.command(answer='3\ny\n2\n0\n')
-        self.assertEqual(self.downloaded()[len(FILES_221):],
-                         ['sb.sh', 'deploy.sh', *BUNDLE_FILES[3:], 'proxyall'])
+        # Stage two: one more update against the same commit downloads and installs every module.
+        p = self.command(answer='3\ny\n2\n0\n', ref=STAGE_ONE)
+        self.assertEqual(self.downloaded()[len(FILES_221):], [f'tar.gz:{STAGE_ONE}'])
         self.assertIn('1) Emby', p.stdout)
-        self.assert_bundle()
+        self.assert_bundle(ref=STAGE_ONE)
         self.assertEqual((self.root / 'components').read_text().splitlines(),
                          ['maintenance with libraries', 'maintenance with libraries', 'sb menu'])
 
@@ -307,6 +338,149 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(path.read_text(), 'local file\n')
         self.assertEqual(self.downloaded(), list(BUNDLE_FILES[:3]))
         self.assertTrue(backup.is_dir())
+
+    def test_up_to_date_commit_fast_path(self):
+        self.install_current_bundle(ref=STAGE_TWO)
+        p = self.command('--update', ref=STAGE_TWO)
+        self.assertEqual(self.downloaded(), [])
+        self.assertEqual(p.stdout, '')
+        non_empty = [line for line in p.stderr.splitlines() if line.strip()]
+        self.assertEqual(len(non_empty), 1, p.stderr)
+        self.assertIn('已是最新版本 v2.3.1', non_empty[0])
+        self.assertIn(STAGE_TWO[:7], non_empty[0])
+
+        # Verbose mode on fast-path prints the full 20-file single-spaced list without downloading.
+        pv = self.command('--update', '--verbose', ref=STAGE_TWO)
+        self.assertEqual(self.downloaded(), [])
+        rows = [line for line in pv.stdout.splitlines() if '已是仓库版本' in line]
+        self.assertEqual(len(rows), len(BUNDLE_FILES), pv.stdout)
+        self.assertNotIn('已是仓库版本\n\n', pv.stdout)
+
+        # Losing executable bit on an entry disables fast-path and triggers a tarball download.
+        (self.local / TARGETS[0]).chmod(0o600)
+        pm = self.command('--update', answer='n\n', ref=STAGE_TWO)
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
+        self.assertIn('  - sb.sh', pm.stdout)
+        (self.local / TARGETS[0]).chmod(0o700)
+
+        # Running a different standalone proxyall against an installed proxyall bypasses fast-path.
+        self.clear_downloads()
+        standalone_alt = self.root / 'standalone-alt'
+        standalone_alt.write_text(self.installer.read_text() + '\n# standalone diff\n')
+        pa = self.command('--update', script=standalone_alt, ref=STAGE_TWO)
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
+        self.assertIn('无变化', pa.stderr)
+
+    def test_docs_only_commit_syncs_without_prompt(self):
+        self.install_current_bundle(ref=STAGE_ONE)
+        p = self.command('--update', ref=STAGE_TWO)
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
+        self.assertEqual((self.state / 'commit').read_text(), STAGE_TWO + '\n')
+        self.assertIn('无变化', p.stderr)
+        self.assertIn('已同步提交记录', p.stderr)
+
+    def test_compact_update_output_and_verbose_mode(self):
+        self.install_current_bundle(ref=STAGE_ONE)
+        # <= 8 changed files: lists each changed file individually.
+        (self.remote / 'sb.sh').write_text((self.remote / 'sb.sh').read_text() + '# change 1\n')
+        (self.remote / 'lib/common.sh').write_text((self.remote / 'lib/common.sh').read_text() + '# change 1\n')
+        self.refresh_pins()
+        p_small = self.command('--update', answer='n\n', ref=STAGE_TWO)
+        self.assertIn(f'发现更新: v2.3.1 ({STAGE_ONE[:7]}) -> v2.3.1 ({STAGE_TWO[:7]})，共 3/{len(BUNDLE_FILES)} 个文件有变化', p_small.stderr)
+        self.assertIn('  - sb.sh\n', p_small.stdout)
+        self.assertIn('  - lib/common.sh\n', p_small.stdout)
+        self.assertIn('  - proxyall\n', p_small.stdout)
+        self.assertNotIn('deploy.sh', p_small.stdout)
+        self.assertNotIn('包含入口脚本', p_small.stdout)
+
+        # > 8 changed files: prints categorized summary instead of long list.
+        for lib in BUNDLE_FILES[3:13]:
+            (self.remote / lib).write_text((self.remote / lib).read_text() + '# bulk change\n')
+        self.refresh_pins()
+        p_large = self.command('--update', answer='n\n', ref=STAGE_TWO)
+        self.assertIn(f'共 12/{len(BUNDLE_FILES)} 个文件有变化', p_large.stderr)
+        self.assertIn('包含入口脚本 2 个、配套库 10 个（运行 proxyall --update --verbose 查看完整清单）', p_large.stdout)
+        self.assertNotIn('  - lib/', p_large.stdout)
+
+        # --verbose and -v show clean single-spaced table for all 20 files.
+        for flag in ('--verbose', '-v'):
+            with self.subTest(flag=flag):
+                pv = self.command('--update', flag, answer='n\n', ref=STAGE_TWO)
+                table_lines = [line for line in pv.stdout.splitlines() if '已是仓库版本' in line or '待安装 / 有变化' in line]
+                self.assertEqual(len(table_lines), len(BUNDLE_FILES), pv.stdout)
+                self.assertNotIn('\n\n  sb.sh', pv.stdout)
+                self.assertNotIn('已是仓库版本\n\n', pv.stdout)
+                self.assertNotIn('待安装 / 有变化\n\n', pv.stdout)
+
+    def test_codeload_http_failure_falls_back_to_raw(self):
+        standalone = self.root / 'standalone-fallback'
+        standalone.write_bytes((self.remote / 'proxyall').read_bytes())
+        p = self.command('--install', script=standalone, answer='0\n', FAIL_TARBALL='1')
+        self.assertIn('回退至逐文件下载', p.stderr)
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}', 'sb.sh', 'deploy.sh', *BUNDLE_FILES[3:], 'proxyall'])
+        self.assert_bundle(ref=STAGE_TWO)
+
+    def test_tampered_or_symlink_tarball_fails_without_raw_fallback(self):
+        self.install_current_bundle(ref=STAGE_ONE)
+        installed_before = {name: (self.local / target).read_bytes() for name, target in zip(BUNDLE_FILES, TARGETS)}
+
+        # Case 1: tarball contains a symlink for lib/common.sh -> fails immediately, no raw fallback.
+        symlink_tar = self.root / 'symlink.tar.gz'
+        with tarfile.open(symlink_tar, 'w:gz') as tf:
+            for d in (f'ss_node-{STAGE_TWO}/', f'ss_node-{STAGE_TWO}/lib/'):
+                info = tarfile.TarInfo(d)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tf.addfile(info)
+            for name in BUNDLE_FILES:
+                member = f'ss_node-{STAGE_TWO}/{name}'
+                if name == 'lib/common.sh':
+                    info = tarfile.TarInfo(member)
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = '/etc/passwd'
+                    tf.addfile(info)
+                else:
+                    data = (self.remote / name).read_bytes()
+                    info = tarfile.TarInfo(member)
+                    info.type = tarfile.REGTYPE
+                    info.mode = 0o755
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+
+        self.clear_downloads()
+        p1 = self.command('--update', ref=STAGE_TWO, status=1, TAMPER_TARBALL=str(symlink_tar))
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
+        self.assertIn('源码归档校验或解压失败', p1.stderr)
+        self.assertNotIn('回退至逐文件下载', p1.stderr)
+
+        # Case 2: tarball has valid structure but tampered sb.sh (SHA-256 mismatch) -> fails without raw fallback.
+        tampered_tar = self.root / 'tampered.tar.gz'
+        with tarfile.open(tampered_tar, 'w:gz') as tf:
+            for d in (f'ss_node-{STAGE_TWO}/', f'ss_node-{STAGE_TWO}/lib/'):
+                info = tarfile.TarInfo(d)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tf.addfile(info)
+            for name in BUNDLE_FILES:
+                data = (self.remote / name).read_bytes()
+                if name == 'sb.sh':
+                    data += b'\n# tampered\n'
+                info = tarfile.TarInfo(f'ss_node-{STAGE_TWO}/{name}')
+                info.type = tarfile.REGTYPE
+                info.mode = 0o755
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+        self.clear_downloads()
+        p2 = self.command('--update', ref=STAGE_TWO, status=1, TAMPER_TARBALL=str(tampered_tar))
+        self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
+        self.assertIn('SHA-256 不匹配', p2.stderr)
+        self.assertNotIn('回退至逐文件下载', p2.stderr)
+
+        # Verify local files and commit were untouched.
+        for name, target in zip(BUNDLE_FILES, TARGETS):
+            self.assertEqual((self.local / target).read_bytes(), installed_before[name])
+        self.assertEqual((self.state / 'commit').read_text(), STAGE_ONE + '\n')
 
 
 if __name__ == '__main__':

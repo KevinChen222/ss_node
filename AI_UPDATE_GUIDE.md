@@ -12,7 +12,7 @@
 
 日常客户端为 `sing-box`（含 `sing-box refine`，直接兼容原有 mihomo 订阅格式并配合 Sub-Store），服务端以 `sing-box` 为主力核心，负责 VLESS Vision + Reality、AnyTLS / Any-Reality 及其他所有非 XHTTP 节点（Hysteria2、TUICv5、Shadowsocks、WS/gRPC、裸 VLESS TCP、SOCKS5 等）、Argo、分享链接与中转；独立 `Xray` 备用核心仅用于创建与维护两种 XHTTP 节点（VLESS XHTTP + TLS / H2 与 VLESS XHTTP + Reality），不向 Xray 扩展非 XHTTP 协议。中转只使用 sing-box（`relay.json` 与主配置一起由 sing-box 加载），不改动或重启 Xray。
 
-`proxyall` 按同一 Git 提交下载并校验整套文件：`sb.sh`、`deploy.sh` 安装为 `sb`、`nginxproxy`，`proxyall` 为统一入口，`PA_LIBS` 列出的库全部安装到 `/usr/local/lib/proxyall/`。每个库带 `# PROXYALL_LIB=文件名` 标记，哈希常量名由文件名生成（`sb_core.sh` → `SB_CORE_SHA256`）。`sb.sh` 与 `deploy.sh` 开头的 `proxyall bootstrap` 段逐字一致，负责核对库目录与文件权限。`archive/` 存放独立历史工具，仅在明确维护归档工具时读取。
+`proxyall` 按同一 Git 提交下载并校验整套文件（默认从 `codeload.github.com` 单次下载 `tar.gz` 归档并经 GNU/BusyBox 兼容预检后仅解压 20 个受管文件；仅在归档下载失败时回退 `raw.githubusercontent.com` 逐文件下载，归档校验或 SHA-256 失败不回退；依赖包含 `tar` 与 `gzip`）：`sb.sh`、`deploy.sh` 安装为 `sb`、`nginxproxy`，`proxyall` 为统一入口，`PA_LIBS` 列出的库全部安装到 `/usr/local/lib/proxyall/`。每个库带 `# PROXYALL_LIB=文件名` 标记，哈希常量名由文件名生成（`sb_core.sh` → `SB_CORE_SHA256`）。更新检查支持同提交本地完整性快路径（提交一致且 20 个本地文件全部完整时免下载并单行提示）与精简差异输出，需查看逐文件完整清单时运行 `proxyall --update --verbose` 或 `-v`。`sb.sh` 与 `deploy.sh` 开头的 `proxyall bootstrap` 段逐字一致，负责核对库目录与文件权限。`archive/` 存放独立历史工具，仅在明确维护归档工具时读取。
 
 | 文件 | 内容 | 加载方 |
 | --- | --- | --- |
