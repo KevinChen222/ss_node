@@ -82,7 +82,7 @@ unset -f _proxyall_trusted_lib_path _proxyall_check_libraries _proxyall_resolve_
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="23-singbox.1"
+export SCRIPT_VERSION="23-singbox.2"
 export DEFAULT_SNI="www.icloud.com"
 export DEFAULT_REALITY_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
@@ -108,6 +108,7 @@ SB_ACME_VERSION="$PROXYALL_ACME_VERSION"
 SB_ACME_ARCHIVE_SHA256="$PROXYALL_ACME_ARCHIVE_SHA256"
 SB_ACME_ARCHIVE_URL="https://github.com/acmesh-official/acme.sh/archive/refs/tags/${SB_ACME_VERSION}.tar.gz"
 SB_ACME_RELOAD_CMD='if [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; then nginx -s reload 8>&- 9>&-; elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start nginx 8>&- 9>&-; elif command -v service >/dev/null 2>&1 && service nginx start 8>&- 9>&-; then :; else nginx 8>&- 9>&-; fi'
+SB_ACME_NAIVE_RELOAD_CMD="${SB_ACME_RELOAD_CMD}; if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sing-box 2>/dev/null; then systemctl restart sing-box 8>&- 9>&-; elif command -v rc-service >/dev/null 2>&1 && rc-service sing-box status >/dev/null 2>&1; then rc-service sing-box restart 8>&- 9>&-; fi"
 
 
 # --- 核心变量定义 ---
@@ -870,6 +871,7 @@ _show_add_node_menu() {
         echo -e "    ${GREEN}[8]${NC}  Shadowsocks"
         echo -e "    ${GREEN}[9]${NC}  VLESS (裸 TCP，无 TLS)"
         echo -e "    ${GREEN}[10]${NC} SOCKS5"
+        echo -e "    ${GREEN}[14]${NC} NaiveProxy (HTTP/2 / QUIC)"
         echo ""
 
         echo -e "  ${CYAN}【Xray 备用核心协议 (XHTTP)】${NC}"
@@ -885,7 +887,7 @@ _show_add_node_menu() {
         echo -e "    ${YELLOW}[0]${NC}  返回主菜单"
         echo ""
 
-        read -r -p "  请输入选项 [0-13]: " choice || return 0
+        read -r -p "  请输入选项 [0-14]: " choice || return 0
 
         local op_status=0
         # 如果输入包含逗号或空格，自动进入批量处理模式
@@ -899,7 +901,7 @@ _show_add_node_menu() {
             return "$op_status"
         fi
 
-        if [[ "$choice" =~ ^([1-9]|10|12|13)$ ]]; then
+        if [[ "$choice" =~ ^([1-9]|10|12|13|14)$ ]]; then
             _info '填写节点参数时输入 0 可取消并返回协议选择；回车保留提示中的默认值。'
         fi
 
@@ -925,6 +927,7 @@ _show_add_node_menu() {
                 return "$op_status" ;;
             12) _add_vless_xhttp_tls || op_status=$? ;;
             13) _add_vless_xhttp_reality || op_status=$? ;;
+            14) _require_singbox && _add_naive || op_status=$? ;;
             *) _error "无效输入，请重试。"; continue ;;
         esac
         if [ "$op_status" -eq 0 ]; then

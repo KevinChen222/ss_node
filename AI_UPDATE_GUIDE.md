@@ -10,7 +10,7 @@
 
 ## 组件
 
-日常客户端为 `sing-box`（含 `sing-box refine`，直接兼容原有 mihomo 订阅格式并配合 Sub-Store），服务端以 `sing-box` 为主力核心，负责 VLESS Vision + Reality、AnyTLS / Any-Reality 及其他所有非 XHTTP 节点（Hysteria2、TUICv5、Shadowsocks、WS/gRPC、裸 VLESS TCP、SOCKS5 等）、Argo、分享链接与中转；独立 `Xray` 备用核心仅用于创建与维护两种 XHTTP 节点（VLESS XHTTP + TLS / H2 与 VLESS XHTTP + Reality），不向 Xray 扩展非 XHTTP 协议。中转只使用 sing-box（`relay.json` 与主配置一起由 sing-box 加载），不改动或重启 Xray。
+日常客户端为 `sing-box`（含 `sing-box refine`，直接兼容原有 mihomo 订阅格式并配合 Sub-Store），服务端以 `sing-box` 为主力核心，负责 VLESS Vision + Reality、AnyTLS / Any-Reality 及其他所有非 XHTTP 节点（NaiveProxy、Hysteria2、TUICv5、Shadowsocks、WS/gRPC、裸 VLESS TCP、SOCKS5 等）、Argo、分享链接与中转；独立 `Xray` 备用核心仅用于创建与维护两种 XHTTP 节点（VLESS XHTTP + TLS / H2 与 VLESS XHTTP + Reality），不向 Xray 扩展非 XHTTP 协议。中转只使用 sing-box（`relay.json` 与主配置一起由 sing-box 加载），不改动或重启 Xray。
 
 `proxyall` 按同一 Git 提交下载并校验整套文件（默认从 `codeload.github.com` 单次下载 `tar.gz` 归档并经 GNU/BusyBox 兼容预检后仅解压 20 个受管文件；仅在归档下载失败时回退 `raw.githubusercontent.com` 逐文件下载，归档校验或 SHA-256 失败不回退；依赖包含 `tar` 与 `gzip`）：`sb.sh`、`deploy.sh` 安装为 `sb`、`nginxproxy`，`proxyall` 为统一入口，`PA_LIBS` 列出的库全部安装到 `/usr/local/lib/proxyall/`。每个库带 `# PROXYALL_LIB=文件名` 标记，哈希常量名由文件名生成（`sb_core.sh` → `SB_CORE_SHA256`）。更新检查支持同提交本地完整性快路径（提交一致且 20 个本地文件全部完整时免下载并单行提示）与精简差异输出，需查看逐文件完整清单时运行 `proxyall --update --verbose` 或 `-v`。`sb.sh` 与 `deploy.sh` 开头的 `proxyall bootstrap` 段逐字一致，负责核对库目录与文件权限。`archive/` 存放独立历史工具，仅在明确维护归档工具时读取。
 
@@ -27,7 +27,7 @@
 | `lib/sb_argo.sh` | Argo 隧道节点 | sb |
 | `lib/sb_proto_vless.sh` | VLESS Vision Reality、裸 VLESS TCP | sb |
 | `lib/sb_proto_anytls.sh` | AnyTLS、Any-Reality | sb |
-| `lib/sb_proto_tls.sh` | VLESS WS TLS、VLESS gRPC TLS、Trojan WS TLS | sb |
+| `lib/sb_proto_tls.sh` | VLESS WS TLS、VLESS gRPC TLS、Trojan WS TLS、NaiveProxy | sb |
 | `lib/sb_proto_quic.sh` | Hysteria2、TUICv5 | sb |
 | `lib/sb_proto_basic.sh` | Shadowsocks（含 SS2022、ShadowTLS）、SOCKS5 | sb |
 | `lib/sb_proto_xhttp.sh` | Xray 备用核心与两种 XHTTP 节点 | sb |
@@ -47,13 +47,15 @@
 - 中转操作在配置写锁内由 `_relay_run_transaction` 快照 `config.json`、`relay.json` 与中转元数据，合并校验 sing-box 配置失败或重启失败时恢复。
 - 直接启动或重载守护进程及 ACME 钩子时必须关闭锁描述符（`8>&- 9>&-`），避免子进程继承写锁或路由锁。
 - 交互与双核共存：创建（含批量）及实际落盘修改节点展示分享链接后，在事务锁外等待用户按回车再返回（`0`/EOF 取消直接返回不暂停），避免清屏丢失链接。纯 sing-box 或纯 Xray 主机互不强依赖另一核心，也不生成对方空配置；统一状态汇报同时覆盖两个已安装核心；卸载需一并清理重启定时器、logrotate、域名刷新定时任务与两核心的 systemd 日志 drop-in（含仅安装 Xray 未建节点的场景）。
-- 同时操作节点和 SNI 路由时，先取配置写锁，再取路由锁。HAProxy 按 SNI 将 Emby 和 XHTTP TLS 转给 Nginx，将 AnyTLS TLS 转给 sing-box，将默认 Reality 流量转给 sing-box（Vision / Any-Reality / 中转 Reality 入口）或 Xray（XHTTP Reality），443 仅允许登记一个默认 Reality 后端。共享状态和渲染规则统一改 `lib/sni_router.sh`，用 `tests/sni_router.py` 覆盖两个入口。`sb` 不可用时，`nginxproxy` 通过同一个库登记或移除自己的 HTTPS 路由，保留已有 Reality 和独立 TLS 路由。
+- 同时操作节点和 SNI 路由时，先取配置写锁，再取路由锁。HAProxy 按 SNI 将 Emby 和 XHTTP TLS 转给 Nginx，将 AnyTLS TLS 和 NaiveProxy（纯 TCP HTTP/2）转给 sing-box，将默认 Reality 流量转给 sing-box（Vision / Any-Reality / 中转 Reality 入口）或 Xray（XHTTP Reality），443 仅允许登记一个默认 Reality 后端。共享状态和渲染规则统一改 `lib/sni_router.sh`，用 `tests/sni_router.py` 覆盖两个入口。`sb` 不可用时，`nginxproxy` 通过同一个库登记或移除自己的 HTTPS 路由，保留已有 Reality 和独立 TLS 路由。
 - `clash.yaml` 用于内部节点管理。用 `yq` 读写节点名称时使用 `strenv()`，保证 `443`、`true` 等名称仍为字符串。
 
 ## 分享链接与验证
 
 - **分享链接保持原有标准链接形式，不另改格式，核心要求是不丢字段**。修改协议字段或导出逻辑时，检查创建、编辑/改端口、查看、聚合订阅四条路径。把实际链接交给 Sub-Store 原生解析，再导出 Clash.Meta 并用 mihomo Alpha 验证字段值、类型、嵌套与真实流量（与 `sing-box refine` 直接消费原有 mihomo 订阅的用法一致）；SS 多路复用仍配合 `substore-smux.js` 转换，验证报告记录实测工具版本，说明丢字段对客户端的影响，并在原链接保留必要参数。
-- sing-box 主节点同时核对 sing-box 客户端连通性（Any-Reality 不在 Clash.Meta 导出范围，仅由 sing-box 客户端支持；sing-box 节点不混入 Xray 专属 VLESS `encryption`/`decryption` 或 `support-x25519mlkem768` 参数；AnyTLS 自签证书必须携带叶证书 SHA-256 `pcs` 指纹，缺指纹拒绝生成裸 `insecure=1` 链接）。两种 Xray XHTTP 节点（含可选 VLESS ENC 与 XMUX）按上述流程结合 Xray / mihomo Alpha 验证，严禁服务端 `decryption` 私钥泄露进 `clash.yaml` 或分享链接。
+- sing-box 主节点同时核对 sing-box 客户端连通性（Any-Reality 与 NaiveProxy 均不在 Clash.Meta 导出范围、以 `yaml: false` 排除在 `clash.yaml` 外，仅由 sing-box 及支持该协议的客户端使用；sing-box 节点不混入 Xray 专属 VLESS `encryption`/`decryption` 或 `support-x25519mlkem768` 参数；AnyTLS 自签证书必须携带叶证书 SHA-256 `pcs` 指纹，缺指纹拒绝生成裸 `insecure=1` 链接）。
+- NaiveProxy 使用 sing-box 原生 `naive` 入站：强制要求公网可信 CA 域名证书（sing-box Cronet 客户端拒绝 `insecure` 且忽略 `pcs`，不支持自签模式；自动签发走 `acme.sh` 并在续期时同步重启运行中的 `sing-box`）；共享 443 经 HAProxy 走纯 TCP HTTP/2（`network: "tcp"`），独立端口可选 HTTP/2 或 HTTP/2 + HTTP/3 QUIC（省略 `network` 与 `quic_congestion_control`）；用户名不允许包含 `:`、空白或控制字符；分享链接保持标准 `naive+https://`（及开启 QUIC 时的 `naive+quic://`）并带 `?padding=1`（聚合 Base64 订阅仅包含 URI），同时在创建、查看本地节点与修改端口时动态输出可复制的 sing-box 原生出站 JSON（不输出 `tls.insecure`）与 Sub-Store 单行节点 JSON（H2 及开启 QUIC 时的 H3/BBR）。
+- 两种 Xray XHTTP 节点（含可选 VLESS ENC 与 XMUX）按上述流程结合 Xray / mihomo Alpha 验证，严禁服务端 `decryption` 私钥泄露进 `clash.yaml` 或分享链接。
 
 按改动运行 `python3 tests/<主题>.py`：
 
@@ -63,6 +65,7 @@
 | 事务与取消 | `transactions.py`、`interaction.py` |
 | 混合状态与卸载清理 | `maintenance.py` |
 | sing-box TCP / SS2022 / ShadowTLS / AnyTLS `pcs` | `tcp_nodes.py` |
+| sing-box NaiveProxy（H2 / H2+H3 / 共享 443 / 证书与生命周期） | `naive.py` |
 | 节点名 YAML 读写（主节点与中转） | `yaml_names.py` |
 | 端口与共享路由 | `port_edit.py`、`sni_router.py` |
 | XHTTP 节点编辑、证书与域名 | `node_edit.py`、`xhttp_domain.py` |

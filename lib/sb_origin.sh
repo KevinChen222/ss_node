@@ -312,6 +312,7 @@ _acme_record_uses_webroot() {
 
 _issue_local_origin_certificate() {
     local domain="$1"
+    local reload_cmd="${2:-$SB_ACME_RELOAD_CMD}"
     local cert_dir="${NGINX_CERT_DIR}/${domain}"
     local -a force_args=()
     if ! _acme_ecc_cert_is_usable "$domain" || ! _acme_record_uses_webroot "$domain"; then
@@ -329,7 +330,7 @@ _issue_local_origin_certificate() {
     "$SB_ACME_SH" --install-cert -d "$domain" --ecc \
         --fullchain-file "$cert_dir/cert" \
         --key-file "$cert_dir/key" \
-        --reloadcmd "$SB_ACME_RELOAD_CMD" 8>&- 9>&- || return 1
+        --reloadcmd "$reload_cmd" 8>&- 9>&- || return 1
     [ -s "$cert_dir/cert" ] && [ -s "$cert_dir/key" ] || return 1
     chmod 600 "$cert_dir/cert" "$cert_dir/key" 2>/dev/null || true
 }

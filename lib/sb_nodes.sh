@@ -101,6 +101,94 @@ _anytls_share_link() {
         "anytls://\(.password|@uri)@\($host):\(.port)/?\($query)\($pin)#\(.name|@uri)"' <<< "$proxy"
 }
 
+_naive_share_link() {
+    local scheme="$1" username="$2" password="$3" domain="$4" port="$5" name="$6"
+    local enc_user enc_pass enc_name
+    enc_user=$(_url_encode "$username") || return 1
+    enc_pass=$(_url_encode "$password") || return 1
+    enc_name=$(_url_encode "$name") || return 1
+    printf '%s://%s:%s@%s:%s?padding=1#%s\n' "$scheme" "$enc_user" "$enc_pass" "$domain" "$port" "$enc_name"
+}
+
+_naive_singbox_json() {
+    local mode="$1" username="$2" password="$3" domain="$4" port="$5" name="$6"
+    if [ "$mode" = "quic" ]; then
+        jq -cn \
+            --arg tag "${name}-QUIC" \
+            --arg server "$domain" \
+            --arg p "$port" \
+            --arg user "$username" \
+            --arg pass "$password" \
+            '{type:"naive",tag:$tag,server:$server,server_port:($p|tonumber),username:$user,password:$pass,udp_over_tcp:true,quic:true,quic_congestion_control:"bbr",tls:{enabled:true,server_name:$server}}'
+    else
+        jq -cn \
+            --arg tag "$name" \
+            --arg server "$domain" \
+            --arg p "$port" \
+            --arg user "$username" \
+            --arg pass "$password" \
+            '{type:"naive",tag:$tag,server:$server,server_port:($p|tonumber),username:$user,password:$pass,udp_over_tcp:true,quic:false,tls:{enabled:true,server_name:$server}}'
+    fi
+}
+
+_naive_substore_json() {
+    local mode="$1" username="$2" password="$3" domain="$4" port="$5" name="$6"
+    if [ "$mode" = "quic" ]; then
+        jq -cn \
+            --arg name "${name}-QUIC" \
+            --arg server "$domain" \
+            --arg p "$port" \
+            --arg user "$username" \
+            --arg pass "$password" \
+            '{name:$name,type:"naive",server:$server,port:($p|tonumber),username:$user,password:$pass,sni:$server,"udp-over-tcp":true,quic:true,"quic-congestion-control":"bbr"}'
+    else
+        jq -cn \
+            --arg name "$name" \
+            --arg server "$domain" \
+            --arg p "$port" \
+            --arg user "$username" \
+            --arg pass "$password" \
+            '{name:$name,type:"naive",server:$server,port:($p|tonumber),username:$user,password:$pass,sni:$server,"udp-over-tcp":true,quic:false}'
+    fi
+}
+
+_naive_export_block() {
+    local url="$1" quic_url="$2" username="$3" password="$4" domain="$5" port="$6" name="$7" naive_network="${8:-tcp}"
+    local sb_h2="" sb_quic="" sub_h2="" sub_quic=""
+    if [ -n "$username" ] && [ -n "$password" ] && [ -n "$domain" ] && [ -n "$port" ]; then
+        sb_h2=$(_naive_singbox_json "h2" "$username" "$password" "$domain" "$port" "$name") || return 1
+        sub_h2=$(_naive_substore_json "h2" "$username" "$password" "$domain" "$port" "$name") || return 1
+        if [ "$naive_network" = "both" ]; then
+            sb_quic=$(_naive_singbox_json "quic" "$username" "$password" "$domain" "$port" "$name") || return 1
+            sub_quic=$(_naive_substore_json "quic" "$username" "$password" "$domain" "$port" "$name") || return 1
+        fi
+    fi
+
+    printf '\n%b═══════════════════ NaiveProxy 分享链接 ═══════════════════%b\n' "$YELLOW" "$NC"
+    if [ -n "$url" ]; then
+        printf '%b[HTTP/2 (TCP)]%b\n%b%s%b\n' "$GREEN" "$NC" "$CYAN" "$url" "$NC"
+    fi
+    if [ -n "$quic_url" ]; then
+        printf '%b[HTTP/3 (QUIC/UDP)]%b\n%b%s%b\n' "$GREEN" "$NC" "$CYAN" "$quic_url" "$NC"
+    fi
+    if [ -n "$sb_h2" ]; then
+        printf '%b─────────────────── sing-box 出站 JSON ───────────────────%b\n' "$YELLOW" "$NC"
+        printf '%b[sing-box HTTP/2 (TCP)]%b\n%b%s%b\n' "$GREEN" "$NC" "$CYAN" "$sb_h2" "$NC"
+        if [ -n "$sb_quic" ]; then
+            printf '%b[sing-box HTTP/3 (QUIC/UDP)]%b\n%b%s%b\n' "$GREEN" "$NC" "$CYAN" "$sb_quic" "$NC"
+        fi
+    fi
+    if [ -n "$sub_h2" ]; then
+        printf '%b─────────────────── Sub-Store 节点 JSON ──────────────────%b\n' "$YELLOW" "$NC"
+        printf '%b[Sub-Store HTTP/2 (TCP)]%b\n%b%s%b\n' "$GREEN" "$NC" "$CYAN" "$sub_h2" "$NC"
+        if [ -n "$sub_quic" ]; then
+            printf '%b[Sub-Store HTTP/3 (QUIC/UDP)]%b\n%b%s%b\n' "$GREEN" "$NC" "$CYAN" "$sub_quic" "$NC"
+        fi
+    fi
+    printf '%b══════════════════════════════════════════════════════════%b\n' "$YELLOW" "$NC"
+    printf '%b[提示] mihomo 不支持 NaiveProxy，本节点未写入 clash.yaml；以上 JSON 可直接复制到 sing-box 或 Sub-Store。%b\n' "$YELLOW" "$NC"
+}
+
 # 显示节点分享链接（在添加节点后调用）
 # 参数: $1=协议类型, $2=节点名称, $3=服务器IP(用于链接), $4=端口, $5=节点TAG, 其他参数根据协议不同
 _show_node_link() {
@@ -117,6 +205,7 @@ _show_node_link() {
     shift 5
     
     local url=""
+    local quic_url=""
     
     case "$type" in
         "vless-reality")
@@ -211,11 +300,21 @@ _show_node_link() {
             _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
             return
             ;;
+        "naive")
+            # 参数: username, password, naive_network (tcp|both)
+            local username="$1" password="$2" naive_network="${3:-tcp}"
+            url=$(_naive_share_link "naive+https" "$username" "$password" "$link_ip" "$port" "$name") || return 1
+            if [ "$naive_network" = "both" ]; then
+                quic_url=$(_naive_share_link "naive+quic" "$username" "$password" "$link_ip" "$port" "$name") || return 1
+            fi
+            ;;
     esac
     if [ -n "$url" ]; then
         local clean_url display_block
         clean_url=$(echo "$url" | sed 's/&insecure=1//g' | sed 's/&pcs=[a-fA-F0-9]*//g')
-        if [ "$clean_url" != "$url" ] && [[ "$type" != "anytls" ]] && [[ "$type" != "hysteria2" ]] && [[ "$type" != "tuic" ]] && [[ "$type" != "vless-reality" ]] && [[ "$type" != "any-reality" ]]; then
+        if [ "$type" = "naive" ]; then
+            display_block=$(_naive_export_block "$url" "$quic_url" "$username" "$password" "$link_ip" "$port" "$name" "$naive_network") || return 1
+        elif [ "$clean_url" != "$url" ] && [[ "$type" != "anytls" ]] && [[ "$type" != "hysteria2" ]] && [[ "$type" != "tuic" ]] && [[ "$type" != "vless-reality" ]] && [[ "$type" != "any-reality" ]] && [[ "$type" != "naive" ]]; then
             display_block=$(printf '\n%b═══════════════ 🔗 直连分享链接 (含防劫持指纹) ═══════════════%b\n%b%s%b\n%b══════════════════════════════════════════════════════════════%b\n\n%b═════════════ 🔗 CF优选专用链接 (纯净版，无指纹冲突) ═════════════%b\n%b%s%b\n%b══════════════════════════════════════════════════════════════%b\n%b[提示] 如果您套用了 Cloudflare，请导入 %bCF优选专用链接%b 以避免握手失败！%b\n' \
                 "$YELLOW" "$NC" "$CYAN" "$url" "$NC" "$YELLOW" "$NC" \
                 "$YELLOW" "$NC" "$CYAN" "$clean_url" "$NC" "$YELLOW" "$NC" \
@@ -228,7 +327,11 @@ _show_node_link() {
         # [持久化] 将生成的链接存入元数据，防止查看时由于动态提取导致的 SNI 丢失
         if [ -n "$tag" ] && [ "$tag" != "null" ]; then
             local entry
-            entry=$(jq -nc --arg tag "$tag" --arg url "$url" '{($tag):{share_link:$url}}') || return 1
+            if [ -n "$quic_url" ]; then
+                entry=$(jq -nc --arg tag "$tag" --arg url "$url" --arg qurl "$quic_url" '{($tag):{share_link:$url,share_link_quic:$qurl}}') || return 1
+            else
+                entry=$(jq -nc --arg tag "$tag" --arg url "$url" '{($tag):{share_link:$url}}') || return 1
+            fi
             if [[ "$tag" == argo-* ]]; then
                 _atomic_modify_json "$ARGO_METADATA_FILE" ". * $entry" || return 1
             else
@@ -329,6 +432,23 @@ _view_nodes() {
         echo "-------------------------------------"
         # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
+        local naive_net="" naive_domain="" naive_label="" naive_user="" naive_pass=""
+        if [ "$type" = "naive" ]; then
+            naive_domain=$(jq -r --arg t "$tag" '.[$t].domain // .[$t].server_name // empty' "$METADATA_FILE" 2>/dev/null)
+            [ -n "$naive_domain" ] || naive_domain=$(jq -r '.tls.server_name // empty' <<< "$node")
+            naive_user=$(jq -r '.users[0].username // empty' <<< "$node")
+            naive_pass=$(jq -r '.users[0].password // empty' <<< "$node")
+            naive_net=$(jq -r --arg t "$tag" '.[$t].naiveNetwork // empty' "$METADATA_FILE" 2>/dev/null)
+            if [ -z "$naive_net" ]; then
+                if [ "$(jq -r '.network // empty' <<< "$node")" = "tcp" ]; then naive_net="tcp"; else naive_net="both"; fi
+            fi
+            if [ "$naive_net" = "both" ]; then
+                naive_label="NaiveProxy (H2+H3)"
+            else
+                naive_label="NaiveProxy (H2)"
+            fi
+            _info " 协议: ${naive_label} | 域名/SNI: ${naive_domain} | 公网端口: ${port}"
+        fi
         if [ "$backend_port" != "$port" ]; then
             if [ "$(jq -r --arg t "$tag" '.[$t].routerRole // empty' "$METADATA_FILE")" = xhttp-https ]; then
                 _info " 入口: 公网 ${port} -> Nginx -> Xray 127.0.0.1:${backend_port}"
@@ -337,6 +457,7 @@ _view_nodes() {
             fi
         fi
         local url=""
+        local quic_url=""
         
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
         if [ "$type" = shadowsocks ]; then
@@ -346,9 +467,17 @@ _view_nodes() {
             url=$(_anytls_share_link "$proxy_name_to_find" "$(jq -r '.tls.certificate_path // empty' <<< "$node")") || continue
         else
             url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$METADATA_FILE")
+            if [ "$type" = "naive" ]; then
+                quic_url=$(jq -r --arg t "$tag" '.[$t].share_link_quic // empty' "$METADATA_FILE")
+            fi
         fi
         if { [ -z "$url" ] || [ "$url" == "null" ]; } && [[ "$tag" == argo-* ]] && [ -f "$ARGO_METADATA_FILE" ]; then
             url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
+        fi
+        if [ "$type" = "naive" ] && [ "$naive_net" = "both" ] && { [ -z "$quic_url" ] || [ "$quic_url" = "null" ]; }; then
+            if [ -n "$naive_user" ] && [ -n "$naive_pass" ] && [ -n "$naive_domain" ]; then
+                quic_url=$(_naive_share_link "naive+quic" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || quic_url=""
+            fi
         fi
         
         if [ -n "$url" ] && [ "$url" != "null" ]; then
@@ -459,6 +588,16 @@ _view_nodes() {
             "anytls")
                 _warning "缺少 ${display_name} 的客户端映射或原始分享链接，无法重建完整 AnyTLS 链接。"
                 ;;
+            "naive")
+                if [ -n "$naive_user" ] && [ -n "$naive_pass" ] && [ -n "$naive_domain" ]; then
+                    url=$(_naive_share_link "naive+https" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || url=""
+                    if [ "$naive_net" = "both" ]; then
+                        quic_url=$(_naive_share_link "naive+quic" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || quic_url=""
+                    fi
+                else
+                    _warning "缺少 ${display_name} 的用户名、密码或域名，无法重建 NaiveProxy 链接。"
+                fi
+                ;;
             "socks")
                 # [资源优化] 合并2次jq为1次
                 local u p
@@ -467,9 +606,31 @@ _view_nodes() {
                 ;;
         esac
         fi
-        [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
-        # 收集链接到临时文件
-        [ -n "$url" ] && echo "$url" >> "$links_tmp"
+        if [ "$type" = "naive" ] && [ -n "$quic_url" ]; then
+            [ -n "$url" ] && printf '  %b分享链接 (H2):%b %s\n' "$YELLOW" "$NC" "$url"
+            printf '  %b分享链接 (H3/QUIC):%b %s\n' "$YELLOW" "$NC" "$quic_url"
+            [ -n "$url" ] && printf '%s\n' "$url" >> "$links_tmp"
+            printf '%s\n' "$quic_url" >> "$links_tmp"
+        else
+            [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
+            # 收集链接到临时文件
+            [ -n "$url" ] && echo "$url" >> "$links_tmp"
+        fi
+        if [ "$type" = "naive" ] && [ -n "$naive_user" ] && [ -n "$naive_pass" ] && [ -n "$naive_domain" ] && [ -n "$port" ]; then
+            local sb_h2_json="" sb_quic_json="" sub_h2_json="" sub_quic_json=""
+            sb_h2_json=$(_naive_singbox_json "h2" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || sb_h2_json=""
+            sub_h2_json=$(_naive_substore_json "h2" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || sub_h2_json=""
+            [ -n "$sb_h2_json" ] && printf '  %bsing-box JSON (H2):%b\n%b%s%b\n' "$YELLOW" "$NC" "$CYAN" "$sb_h2_json" "$NC"
+            if [ "$naive_net" = "both" ]; then
+                sb_quic_json=$(_naive_singbox_json "quic" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || sb_quic_json=""
+                [ -n "$sb_quic_json" ] && printf '  %bsing-box JSON (H3/QUIC):%b\n%b%s%b\n' "$YELLOW" "$NC" "$CYAN" "$sb_quic_json" "$NC"
+            fi
+            [ -n "$sub_h2_json" ] && printf '  %bSub-Store JSON (H2):%b\n%b%s%b\n' "$YELLOW" "$NC" "$CYAN" "$sub_h2_json" "$NC"
+            if [ "$naive_net" = "both" ]; then
+                sub_quic_json=$(_naive_substore_json "quic" "$naive_user" "$naive_pass" "$naive_domain" "$port" "$display_name") || sub_quic_json=""
+                [ -n "$sub_quic_json" ] && printf '  %bSub-Store JSON (H3/QUIC):%b\n%b%s%b\n' "$YELLOW" "$NC" "$CYAN" "$sub_quic_json" "$NC"
+            fi
+        fi
     done
     echo "-------------------------------------"
     
@@ -865,7 +1026,7 @@ _switch_reality_public_port() {
     fi
 
     current_link=$(jq -r --arg tag "$tag" '.[$tag].share_link // empty' "$METADATA_FILE")
-    new_link=$(printf '%s' "$current_link" | sed -E "s#^([^:]+://[^/]*):${old_public}([/?].*|$)#\\1:${new_public}\\2#")
+    new_link=$(printf '%s' "$current_link" | sed -E "s#^([^:]+://[^/?#]*):${old_public}([/?#].*|$)#\\1:${new_public}\\2#")
     current_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$METADATA_FILE")
     new_name="$current_name"
     if ! jq --arg new_tag "$new_tag" --arg link "$new_link" --arg name "$new_name" \
@@ -1114,7 +1275,7 @@ _modify_port_impl() {
     fi
 
     if [ "$(jq -r --arg tag "$tag_to_modify" '.[$tag].routerRole // empty' "$METADATA_FILE" 2>/dev/null)" = "tls-sni" ]; then
-        _error "HAProxy 443 复用模式下的普通 AnyTLS 暂不支持直接修改端口，请删除后重新创建。"
+        _error "HAProxy 443 复用模式下的 TLS SNI 节点暂不支持直接修改端口，请删除后重新创建。"
         return 1
     fi
 
@@ -1171,7 +1332,29 @@ _modify_port_impl() {
         return 1
     fi
 
-    if [[ "$type_to_modify" == "hysteria2" || "$type_to_modify" == "tuic" ]]; then
+    local naive_uses_udp=false
+    if [ "$type_to_modify" = "naive" ]; then
+        if _check_port_in_config "$new_port"; then
+            _error "端口 ${new_port} 已被现有节点配置占用！"
+            return 1
+        fi
+        if _check_port_occupied "$new_port" "tcp"; then
+            _error "TCP 端口 ${new_port} 已被系统其他程序占用，无法修改端口。"
+            return 1
+        fi
+        local naive_net_meta naive_net_cfg
+        naive_net_meta=$(jq -r --arg t "$tag_to_modify" '.[$t].naiveNetwork // empty' "$METADATA_FILE" 2>/dev/null)
+        naive_net_cfg=$(jq -r --arg t "$tag_to_modify" '.inbounds[] | select(.tag == $t) | .network // empty' "$CONFIG_FILE" 2>/dev/null)
+        if [ "$naive_net_meta" = "both" ] || { [ -z "$naive_net_meta" ] && [ "$naive_net_cfg" != "tcp" ]; }; then
+            naive_uses_udp=true
+        fi
+    fi
+
+    if [[ "$type_to_modify" == "hysteria2" || "$type_to_modify" == "tuic" ]] || [ "$naive_uses_udp" = true ]; then
+        if [ "$naive_uses_udp" = true ] && _check_port_occupied "$new_port" "udp"; then
+            _error "UDP 端口 ${new_port} 已被系统其他程序占用，无法修改端口。"
+            return 1
+        fi
         local new_port_hop_conflict
         new_port_hop_conflict=$(_find_udp_hop_conflict_in_range "$new_port" "$new_port" "$tag_to_modify")
         if [ -n "$new_port_hop_conflict" ]; then
@@ -1180,6 +1363,16 @@ _modify_port_impl() {
             _error "新端口 ${new_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
             _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口。"
             return 1
+        fi
+        if [ "$naive_uses_udp" = true ]; then
+            local new_port_pf_conflict
+            new_port_pf_conflict=$(_find_pf_udp_conflict_in_range "$new_port" "$new_port")
+            if [ -n "$new_port_pf_conflict" ]; then
+                local c_port c_name c_net c_target
+                IFS=$'\t' read -r c_port c_name c_net c_target <<< "$new_port_pf_conflict"
+                _error "新端口 ${new_port} 与已有 ${c_net} 端口转发入口 ${c_port} 冲突（${c_name} -> ${c_target}）。请换端口。"
+                return 1
+            fi
         fi
     fi
     
@@ -1222,13 +1415,14 @@ _modify_port_impl() {
     fi
     
     # [修复] 3. 全局同步更新 metadata.json 中的链接端口与备注名
+    local updated_share_link="" updated_quic_link=""
     if [ -f "$METADATA_FILE" ]; then
         if jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
             # [关键修复] _view_nodes 优先读取的是 .share_link 字段 (非 .link)
             local current_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE")
             if [ -n "$current_link" ]; then
                 # 精准替换：仅替换 URL 中端口位置的数字（@IP:PORT? 和 #name-PORT 部分），避免误伤 UUID/密码
-                local new_link=$(echo "$current_link" | sed -E "s#^([^:]+://[^/]*):${old_port}([/?].*|$)#\1:${new_port}\2#")
+                local new_link=$(echo "$current_link" | sed -E "s#^([^:]+://[^/?#]*):${old_port}([/?#].*|$)#\1:${new_port}\2#")
                 if [ -n "$hop_info" ]; then
                     if [ -n "$final_hop_info" ]; then
                         # 更新 mport 参数
@@ -1249,11 +1443,24 @@ _modify_port_impl() {
                         new_link=$(echo "$new_link" | sed -E 's/\?&/?/g; s/&$//g; s/\?$//g')
                     fi
                 fi
-                _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
+                updated_share_link="$new_link"
+                _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = $(jq -Rn --arg v "$new_link" '$v')" || return 1
                 _info "分享链接已同步更新。"
-                if [ -n "${NODE_TX_DIR:-}" ]; then
+                if [ "$type_to_modify" != "naive" ] && [ -n "${NODE_TX_DIR:-}" ]; then
                     printf '\n%b═══════════════════ 分享链接 ═══════════════════%b\n%b%s%b\n%b═════════════════════════════════════════════════%b\n' \
                         "$YELLOW" "$NC" "$CYAN" "$new_link" "$NC" "$YELLOW" "$NC" >> "$NODE_TX_DIR/share-links"
+                fi
+            fi
+            local current_quic_link
+            current_quic_link=$(jq -r --arg t "$tag_to_modify" '.[$t].share_link_quic // ""' "$METADATA_FILE")
+            if [ -n "$current_quic_link" ]; then
+                local new_quic_link
+                new_quic_link=$(printf '%s' "$current_quic_link" | sed -E "s#^([^:]+://[^/?#]*):${old_port}([/?#].*|$)#\1:${new_port}\2#")
+                updated_quic_link="$new_quic_link"
+                _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link_quic = $(jq -Rn --arg v "$new_quic_link" '$v')" || return 1
+                if [ "$type_to_modify" != "naive" ] && [ -n "${NODE_TX_DIR:-}" ]; then
+                    printf '\n%b═══════════════════ 分享链接 (H3/QUIC) ═══════════════════%b\n%b%s%b\n%b═════════════════════════════════════════════════════════%b\n' \
+                        "$YELLOW" "$NC" "$CYAN" "$new_quic_link" "$NC" "$YELLOW" "$NC" >> "$NODE_TX_DIR/share-links"
                 fi
             fi
             local current_meta_name
@@ -1281,6 +1488,27 @@ _modify_port_impl() {
     # 节点 ID 和证书路径终身不随端口变化；relay.json 的引用保持有效。
     local new_tag="$tag_to_modify"
     _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".publicPort = $new_port | .\"$tag_to_modify\".backendPort = $new_port" || return 1
+
+    if [ "$type_to_modify" = "naive" ]; then
+        local naive_user naive_pass naive_domain naive_net_out="tcp" naive_block=""
+        naive_user=$(jq -r --arg t "$tag_to_modify" '.inbounds[] | select(.tag == $t) | .users[0].username // empty' "$CONFIG_FILE")
+        naive_pass=$(jq -r --arg t "$tag_to_modify" '.inbounds[] | select(.tag == $t) | .users[0].password // empty' "$CONFIG_FILE")
+        naive_domain=$(jq -r --arg t "$tag_to_modify" '.[$t].domain // .[$t].server_name // empty' "$METADATA_FILE" 2>/dev/null)
+        [ -n "$naive_domain" ] || naive_domain=$(jq -r --arg t "$tag_to_modify" '.inbounds[] | select(.tag == $t) | .tls.server_name // empty' "$CONFIG_FILE")
+        [ "$naive_uses_udp" = true ] && naive_net_out="both"
+        if [ -z "$updated_share_link" ] && [ -n "$naive_user" ] && [ -n "$naive_pass" ] && [ -n "$naive_domain" ]; then
+            updated_share_link=$(_naive_share_link "naive+https" "$naive_user" "$naive_pass" "$naive_domain" "$new_port" "$display_name_to_modify") || updated_share_link=""
+        fi
+        if [ "$naive_net_out" = "both" ] && [ -z "$updated_quic_link" ] && [ -n "$naive_user" ] && [ -n "$naive_pass" ] && [ -n "$naive_domain" ]; then
+            updated_quic_link=$(_naive_share_link "naive+quic" "$naive_user" "$naive_pass" "$naive_domain" "$new_port" "$display_name_to_modify") || updated_quic_link=""
+        fi
+        naive_block=$(_naive_export_block "$updated_share_link" "$updated_quic_link" "$naive_user" "$naive_pass" "$naive_domain" "$new_port" "$display_name_to_modify" "$naive_net_out") || return 1
+        if [ -n "${NODE_TX_DIR:-}" ]; then
+            printf '%s\n' "$naive_block" >> "$NODE_TX_DIR/share-links"
+        else
+            printf '%s\n' "$naive_block"
+        fi
+    fi
 
     _sync_node_relay_metadata "$tag_to_modify" || return 1
 

@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 import unittest
 
-from installer import BUNDLE_FILES, REPO, copy_files
+from installer import BUNDLE_FILES, BUNDLE_VERSION, REPO, copy_files
 
 LEGACY = '52431e518f6b1941f4f6aab577d0c9331afa1543'
 STAGE_ONE = '1' * 40
@@ -282,7 +282,7 @@ class UpgradeTests(unittest.TestCase):
         self.clear_downloads()
         p = self.command('--install', script=standalone, answer='0\n')
         self.assertEqual(self.downloaded(), [f'tar.gz:{STAGE_TWO}'])
-        self.assertIn('准备安装 v2.3.1', p.stderr)
+        self.assertIn(f'准备安装 v{BUNDLE_VERSION}', p.stderr)
         self.assert_bundle()
         self.assertEqual((self.root / 'components').read_text(), 'maintenance with libraries\n')
 
@@ -346,7 +346,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(p.stdout, '')
         non_empty = [line for line in p.stderr.splitlines() if line.strip()]
         self.assertEqual(len(non_empty), 1, p.stderr)
-        self.assertIn('已是最新版本 v2.3.1', non_empty[0])
+        self.assertIn(f'已是最新版本 v{BUNDLE_VERSION}', non_empty[0])
         self.assertIn(STAGE_TWO[:7], non_empty[0])
 
         # Verbose mode on fast-path prints the full 20-file single-spaced list without downloading.
@@ -386,7 +386,7 @@ class UpgradeTests(unittest.TestCase):
         (self.remote / 'lib/common.sh').write_text((self.remote / 'lib/common.sh').read_text() + '# change 1\n')
         self.refresh_pins()
         p_small = self.command('--update', answer='n\n', ref=STAGE_TWO)
-        self.assertIn(f'发现更新: v2.3.1 ({STAGE_ONE[:7]}) -> v2.3.1 ({STAGE_TWO[:7]})，共 3/{len(BUNDLE_FILES)} 个文件有变化', p_small.stderr)
+        self.assertIn(f'发现更新: v{BUNDLE_VERSION} ({STAGE_ONE[:7]}) -> v{BUNDLE_VERSION} ({STAGE_TWO[:7]})，共 3/{len(BUNDLE_FILES)} 个文件有变化', p_small.stderr)
         self.assertIn('  - sb.sh\n', p_small.stdout)
         self.assertIn('  - lib/common.sh\n', p_small.stdout)
         self.assertIn('  - proxyall\n', p_small.stdout)

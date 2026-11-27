@@ -18,8 +18,15 @@ def bundle_libraries():
     return tuple(f'lib/{name}' for name in match.group(1).split())
 
 
+def bundle_version():
+    text = (REPO / 'proxyall').read_text()
+    match = re.search(r'^PROXYALL_VERSION="([^"]+)"', text, re.M)
+    return match.group(1)
+
+
 # Entries first (the three-file legacy bundle), then every library in installer order.
 BUNDLE_FILES = ('sb.sh', 'deploy.sh', 'proxyall', *bundle_libraries())
+BUNDLE_VERSION = bundle_version()
 
 
 def copy_files(source, target, names):
@@ -210,7 +217,7 @@ main {args}
 
     def test_version_of_helper(self):
         res = self.shell('pa_version_of "$REPO/proxyall"')
-        self.assertEqual(res.stdout.strip(), '2.3.1')
+        self.assertEqual(res.stdout.strip(), BUNDLE_VERSION)
         bad = self.root / 'bad-ver'
         bad.write_text('PROXYALL_VERSION="1.0.0"\nPROXYALL_VERSION="2.0.0"\n')
         self.shell('pa_version_of "$WORK/bad-ver"', ok=False)

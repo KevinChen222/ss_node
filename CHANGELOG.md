@@ -1,5 +1,14 @@
 # 修改記錄
 
+## 23-singbox.2 — 新增 sing-box 原生 NaiveProxy 節點支援
+
+版本：`proxyall 2.3.2`、`sb.sh 23-singbox.2`。
+
+- 新增 sing-box 原生 `naive` 入站節點（添加節點選單 `[14]`），支援獨立端口 HTTP/2（`network: "tcp"`）或 HTTP/2 + HTTP/3 QUIC（省略 `network` 與 `quic_congestion_control` 以相容 1.12+ 並於 1.13+ 預設 BBR），以及透過 HAProxy 共享公網 443 的純 TCP/H2 SNI 透傳（`frontedBy: "haproxy"`、`routerRole: "tls-sni"`）。
+- 強制要求公網可信 CA 域名證書（自動複用本機有效可信證書或經 `acme.sh` 簽發 Let's Encrypt 證書並配置續期時同步重啟運行中的 `sing-box`，或指定已有可信證書鏈與私鑰；拒絕自簽與未受信任證書，拒絕用戶名含 `:`／空白／控制字元以避免 HTTP Basic Auth 407）。
+- NaiveProxy 不寫入 `clash.yaml`（`yaml: false`，與 Any-Reality 一致，因 mihomo 不支援 NaiveProxy），輸出並持久化標準 `naive+https://`（及開啟 QUIC 時的 `naive+quic://`）分享連結，並於建立、查看已有節點與修改端口時動態輸出可直接複製的 sing-box 原生出站 JSON（不含 `tls.insecure`）與 Sub-Store 單行節點 JSON（H2 及開啟 QUIC 時的 H3/BBR；聚合 Base64 訂閱僅保留標準 URI）；完整支援查看（含缺欄位重建）、獨立節點改端口（含跨配置 TCP/UDP、HY2 跳躍與端口轉發衝突檢查，並同步更新 H2/H3 分享連結與 JSON）及單刪／全刪（含 HAProxy 路由清理）。
+- 修正分享連結改端口正則，避免查詢參數或片段中出現 `:舊端口` 時誤替換；補全 `tests/naive.py` 離線與實核回環自動化測試並刷新元件雜湊。
+
 ## proxyall 2.3.1 — 單檔壓縮包更新、同提交快路徑與精簡更新提示
 
 版本：`proxyall 2.3.1`。

@@ -30,11 +30,19 @@ _check_port_conflict() {
     fi
     if [[ "$proto" == "udp" ]]; then
         local hop_conflict
-        hop_conflict=$(_find_udp_hop_conflict_in_range "$port" "$port")
+        hop_conflict=$(_find_udp_hop_conflict_in_range "$port" "$port") || true
         if [ -n "$hop_conflict" ]; then
             local c_tag c_name c_range c_mode
             IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
             [ "$silent" != "true" ] && _error "UDP 端口 ${port} 落在已有 HY2 端口跳跃范围 ${c_range} 内（${c_name}, ${c_tag}, ${c_mode}）。"
+            return 0
+        fi
+        local pf_conflict
+        pf_conflict=$(_find_pf_udp_conflict_in_range "$port" "$port") || true
+        if [ -n "$pf_conflict" ]; then
+            local c_port c_name c_net c_target
+            IFS=$'\t' read -r c_port c_name c_net c_target <<< "$pf_conflict"
+            [ "$silent" != "true" ] && _error "UDP 端口 ${port} 与已有 ${c_net} 端口转发入口 ${c_port} 冲突（${c_name} -> ${c_target}）。"
             return 0
         fi
     fi
@@ -211,6 +219,7 @@ _node_tx_validate() {
             ($m.backendPort == null or $m.backendPort == $ib.listen_port) and
             ($m.core == "xray" or $m.frontedBy == "haproxy" or $m.publicPort == null or $m.publicPort == $ib.listen_port) and
             ($m.core != "xray" or ($m.share_link | type == "string" and length > 0)) and
+            ($ib.type != "naive" or $m.yaml == false) and
             ($m.clientName == null or $m.yaml == false or
               ([$proxies[] | select(.name == $m.clientName and (.port == ($m.publicPort // $ib.listen_port)))] | length == 1)))
     ' "$METADATA_FILE" >/dev/null || { _error '节点元数据与客户端导出不一致。'; return 1; }
@@ -489,6 +498,7 @@ _remove_node_from_yaml() {
 }
 _find_proxy_name() {
     local port="$1" type="$2" tag="$3" inbound metadata proxies matches count
+    [ "$type" != "naive" ] || return 0
     # yaml:false 是显式禁用，不能用 // empty（会吞掉 false）。
     metadata=$(jq -ce --arg t "$tag" '.[$t] // {}' "$METADATA_FILE") || return 1
     [ "$(jq -r '.yaml == false' <<< "$metadata")" != true ] || return 0
